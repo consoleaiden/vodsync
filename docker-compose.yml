@@ -1,0 +1,43 @@
+# 群晖 Container Manager / 通用 docker-compose 部署模板
+# 用法：把本项目放到 /volume1/docker/vodsync/ 后，Container Manager -> 项目 -> 新增 -> 使用此文件
+services:
+  vodsync:
+    # 官方发布镜像（GitHub Actions 自动构建），按需替换 <你的用户名>
+    # image: ghcr.io/<你的GitHub用户名>/vodsync:latest
+    build: .                      # 本地构建模式：保留 build，注释掉上面 image 行
+    container_name: vodsync
+    restart: unless-stopped
+    ports:
+      - "8181:8000"               # 宿主机端口:容器端口，左侧按需修改
+    volumes:
+      - /volume1/docker/vodsync/data:/app/data   # SQLite 数据库持久化目录（必须）
+    environment:
+      # ---- 数据源 ----
+      LATEST_JSON_URL: "https://mylazily.github.io/ziyuanzhan/data/latest.json"
+      ONLY_OK_SOURCES: "true"              # 只同步在线源站
+      FULL_SYNC_ON_DISCOVER: "true"        # 发现新源站立即全量同步
+      # ---- 调度 ----
+      SYNC_INTERVAL_MINUTES: "360"         # 增量同步间隔（分钟），默认 6 小时
+      SOURCE_REFRESH_INTERVAL_MINUTES: "720"  # 源站列表刷新间隔（分钟）
+      SOURCE_SYNC_CONCURRENCY: "2"         # 并行同步的源站数（NAS 性能弱建议 1-2）
+      PAGE_CONCURRENCY: "4"                # 单源站内并行抓取页数
+      REQUEST_INTERVAL_SECONDS: "0.3"      # 请求间隔，防源站封禁
+      # ---- 数据库 ----
+      # 默认 SQLite（推荐），如需 PostgreSQL 打开下行并连接外部 PG 容器：
+      # DATABASE_URL: "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync"
+      # ---- API ----
+      API_PAGE_SIZE_DEFAULT: "20"
+      API_KEY: ""                          # 留空不鉴权；设置后请求需带 X-API-Key 头
+      TZ: "Asia/Shanghai"
+
+  # ---- 可选：PostgreSQL（数据量超大或多实例共享时启用） ----
+  # postgres:
+  #   image: postgres:16-alpine
+  #   container_name: vodsync-pg
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER: vodsync
+  #     POSTGRES_PASSWORD: vodsync
+  #     POSTGRES_DB: vodsync
+  #   volumes:
+  #     - /volume1/docker/vodsync/pgdata:/var/lib/postgresql/data

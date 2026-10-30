@@ -1,0 +1,74 @@
+name: Build & Push Docker Image
+
+# 触发条件：
+#  1. 推送到 main 分支   -> 更新 latest 镜像
+#  2. 推送 v* 标签       -> 生成 1.x.x 版本镜像
+#  3. 手动触发（Actions 页面 Run workflow）
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+env:
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # 推送到 GHCR 需要
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 群晖多为 x86_64，部分机型为 ARM，故构建双架构
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 镜像标签策略：
+      #   main 分支 -> latest
+      #   v1.2.3 标签 -> 1.2.3 与 1.2
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.GHCR_IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+# ---------------------------------------------------------------------------
+# 可选：同时推送 Docker Hub —— 在 images 下追加一行即可：
+#   docker.io/<你的DockerHub用户名>/vodsync
+# 并在下面 Login 步骤之后再添加：
+#   - uses: docker/login-action@v3
+#     with:
+#       username: ${{ secrets.DOCKERHUB_USERNAME }}
+#       password: ${{ secrets.DOCKERHUB_TOKEN }}
+# （需在仓库 Settings -> Secrets and variables -> Actions 配置这两个 Secret）
+# ---------------------------------------------------------------------------
