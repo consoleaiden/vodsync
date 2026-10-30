@@ -58,6 +58,8 @@ sources = Table(
     # 单源站暂停标记：1=该源站的同步被单独暂停（不影响其他源站），0=正常
     Column("paused", Integer, default=0),
     Column("paused_at", DateTime),                        # 单源站暂停时间（便于审计/展示）
+    # 自动同步开关：1=参与定时任务与全站同步，0=排除在外（手动单站同步不受影响）
+    Column("auto_sync", Integer, default=1, server_default="1"),
     Column("last_sync_at", DateTime),                     # 最近一次成功同步时间
     Column("created_at", DateTime, server_default=func.now()),
     Column("updated_at", DateTime, server_default=func.now(), onupdate=func.now()),

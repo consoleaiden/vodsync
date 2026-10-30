@@ -294,7 +294,11 @@ vodsync/
 ├── .github/workflows/docker-image.yml   # CI：多架构镜像构建推送
 ├── Dockerfile / docker-compose.yml
 ├── .env.example
-└── docs/deploy-synology.md
+└── docs/
+    ├── API_SPEC_FOR_AI.md   # ★ 交付给 AI 的完整 API 文档（字段字典/状态语义/代码骨架/排查表）
+    ├── CLIENT_API.md        # 简明对接说明（人类速查）
+    ├── openapi.json         # OpenAPI 3.1 快照（可导入代码生成器）
+    └── deploy-synology.md   # 群晖部署
 ```
 
 ## 变更记录
@@ -357,3 +361,12 @@ vodsync/
 - 项目已发布到 GitHub：https://github.com/consoleaiden/vodsync
 - GitHub Actions 首次构建成功（amd64 + arm64 双架构），镜像公开可拉取：`ghcr.io/consoleaiden/vodsync:latest`、`ghcr.io/consoleaiden/vodsync:1.2.2`
 - `docker-compose.yml` 与群晖部署文档的镜像地址已替换为实际发布地址
+
+### v1.3.0
+- 新增**按源站的自动同步开关**（全局定时调度保留不变：每 6 小时全站增量、每 12 小时刷新源站列表）：
+  - `sources` 表新增 `auto_sync` 列（默认 1=参与），启动自动迁移旧库，状态持久化重启不丢
+  - 关闭后该源站**不参与**定时增量任务与全站同步（`sync-all` / 定时 / 增量续跑），手动单站同步不受影响
+  - 新增 API：`POST /api/v1/sources/{slug}/auto-sync?enabled=`（单站）、`POST /api/v1/sources/auto-sync?enabled=&slugs=`（批量，`slugs=all` 为全部）
+  - `/api/v1/sources`、`/api/v1/sources/{slug}` 返回 `auto_sync` 字段
+  - 面板源站列表：每行「自动」开关 + 复选框多选（全选框跨刷新保留）+ 「全部开启 / 全部暂停 / 开启所选 / 暂停所选自动同步」批量按钮
+  - 测试 `scripts/test_v130_autosync.py`（13 项：默认值/单站/批量/sync_all 过滤/续跑过滤/路由注册）

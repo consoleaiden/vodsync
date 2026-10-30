@@ -252,7 +252,7 @@ def list_sources():
                 sources.c.slug, sources.c.name, sources.c.api_url, sources.c.status,
                 sources.c.enabled, sources.c.total_videos, sources.c.watermark,
                 sources.c.last_page, sources.c.total_pages, sources.c.last_sync_at,
-                sources.c.paused, sources.c.paused_at,
+                sources.c.paused, sources.c.paused_at, sources.c.auto_sync,
             ).order_by(sources.c.id)
         ).mappings().all()
     return {
@@ -279,6 +279,8 @@ def list_sources():
                 # 单源站暂停（该源站独立于全局暂停，两者任一命中即不参与同步）
                 "paused": bool(r["paused"]),
                 "paused_at": r["paused_at"].isoformat() if r["paused_at"] else None,
+                # 自动同步开关：false 时不参与定时任务与全站同步（手动单站同步不受影响）
+                "auto_sync": bool(r["auto_sync"]),
             }
             for r in rows
         ],
@@ -418,6 +420,7 @@ def source_detail(slug: str):
             "running_seconds": (live or {}).get("elapsed_seconds"),
             "paused": bool(src["paused"]),
             "paused_at": src["paused_at"].isoformat() if src["paused_at"] else None,
+            "auto_sync": bool(src["auto_sync"]),
             "last_sync_at": src["last_sync_at"].isoformat() if src["last_sync_at"] else None,
         },
         "recent_logs": [
@@ -431,6 +434,57 @@ def source_detail(slug: str):
             }
             for lg in logs
         ],
+    }
+
+
+@router.post("/api/v1/sources/auto-sync")
+def bulk_auto_sync(
+    enabled: bool = Query(..., description="true=开启自动同步, false=暂停自动同步"),
+    slugs: str = Query("all", description="逗号分隔的源站 slug 列表；all 或留空=全部源站"),
+):
+    """
+    批量设置源站的「自动同步」开关（持久化，重启后仍生效）。
+
+    关闭后该源站不再参与定时增量任务与全站同步，但手动单站同步不受影响。
+    用法：
+      POST /api/v1/sources/auto-sync?enabled=false&slugs=all          全部暂停自动同步
+      POST /api/v1/sources/auto-sync?enabled=true&slugs=jkun,t1,bfzytv 只开启指定源站
+    """
+    from ..syncer import set_auto_sync_bulk
+
+    raw = (slugs or "").strip()
+    slug_list = None
+    if raw and raw.lower() not in ("all", "*"):
+        slug_list = [s.strip() for s in raw.split(",") if s.strip()]
+        if not slug_list:
+            slug_list = None
+        else:
+            for s in slug_list:
+                validate_slug(s)
+    n = set_auto_sync_bulk(enabled, slug_list)
+    return {
+        "code": 1,
+        "msg": f"已{'开启' if enabled else '暂停'} {n} 个源站的自动同步",
+        "updated": n,
+        "auto_sync": enabled,
+    }
+
+
+@router.post("/api/v1/sources/{slug}/auto-sync")
+def set_one_auto_sync(
+    slug: str,
+    enabled: bool = Query(..., description="true=开启自动同步, false=暂停自动同步"),
+):
+    """设置单个源站的「自动同步」开关（持久化；不影响手动单站同步）。"""
+    from ..syncer import set_source_auto_sync
+
+    src, _ = _require_table(slug)
+    set_source_auto_sync(slug, enabled)
+    return {
+        "code": 1,
+        "msg": f"源站 {src['name']} 自动同步已{'开启' if enabled else '暂停'}",
+        "slug": slug,
+        "auto_sync": enabled,
     }
 
 

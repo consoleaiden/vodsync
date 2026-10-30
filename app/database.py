@@ -75,6 +75,7 @@ def _migrate():
         ("sources", "total_pages", "INTEGER DEFAULT 0"),
         ("sources", "paused", "INTEGER DEFAULT 0"),
         ("sources", "paused_at", "TIMESTAMP"),
+        ("sources", "auto_sync", "INTEGER DEFAULT 1"),
     ]
     insp = inspect(engine)
     existing_tables = set(insp.get_table_names())

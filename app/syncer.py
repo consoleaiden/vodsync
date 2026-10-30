@@ -111,6 +111,7 @@ def refresh_sources(client: MacCmsClient = None) -> list:
                     description=(res.get("description") or "")[:500],
                     status=res.get("status") or "ok",
                     enabled=1,
+                    auto_sync=1,
                 )
             )
             new_slugs.append(slug)
@@ -157,6 +158,37 @@ def set_source_paused(slug: str, paused: bool):
 def should_stop(slug: str, mode: str) -> bool:
     """某源站在某模式下是否应停止：全局/分层暂停 或 该源站被单独暂停。"""
     return pause.is_paused(mode) or is_source_paused(slug)
+
+
+# ---------------------------------------------------------------------------
+# 自动同步开关：控制该源站是否参与「定时任务 / 全站同步」
+# （手动单站同步不受影响；状态持久化在 sources 表，重启后仍生效）
+# ---------------------------------------------------------------------------
+def set_source_auto_sync(slug: str, enabled: bool) -> None:
+    with database.engine.begin() as conn:
+        conn.execute(
+            sources.update().where(sources.c.slug == slug).values(
+                auto_sync=1 if enabled else 0
+            )
+        )
+    log.info("[%s] 自动同步 = %s", slug, "开启" if enabled else "暂停")
+
+
+def set_auto_sync_bulk(enabled: bool, slugs: list = None) -> int:
+    """
+    批量设置自动同步开关。slugs 为空/None 表示全部源站。
+    返回实际更新的源站数量。
+    """
+    stmt = sources.update().values(auto_sync=1 if enabled else 0)
+    if slugs:
+        stmt = stmt.where(sources.c.slug.in_(slugs))
+    with database.engine.begin() as conn:
+        res = conn.execute(stmt)
+    n = res.rowcount or 0
+    log.info("批量自动同步 = %s: 更新 %d 个源站%s",
+             "开启" if enabled else "暂停", n,
+             f" ({','.join(slugs[:5])}...)" if slugs and len(slugs) > 5 else "")
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -540,9 +572,12 @@ def trigger_resume(scope: str) -> list:
     with database.engine.connect() as conn:
         q = select(sources.c.slug).where(sources.c.enabled == 1, sources.c.paused == 0)
         if scope == "full":
+            # 全量续跑针对的是用户显式发起的任务，不筛自动同步开关
             q = q.where(sources.c.last_page > 0)
         elif scope == "incremental":
-            q = q.where(sources.c.watermark != "")
+            q = q.where(sources.c.watermark != "", sources.c.auto_sync == 1)
+        else:  # global
+            q = q.where(sources.c.auto_sync == 1)
         slugs = [r[0] for r in conn.execute(q).all()]
     mode = {"full": "full", "incremental": "incremental"}.get(scope, "auto")
     threading.Thread(target=_resume_worker, args=(slugs, mode), daemon=True).start()
@@ -569,12 +604,19 @@ def _resume_worker(slugs: list, mode: str):
 
 
 def sync_all(force_mode: str = "auto") -> list:
-    """并行同步所有启用的源站。"""
+    """
+    并行同步所有源站（定时任务与「全站同步」共用入口）。
+    跳过：手动暂停的站 + 自动同步已关闭的站。
+    """
     with database.engine.connect() as conn:
         slugs = [r[0] for r in conn.execute(
-            select(sources.c.slug).where(sources.c.enabled == 1, sources.c.paused == 0)
+            select(sources.c.slug).where(
+                sources.c.enabled == 1,
+                sources.c.paused == 0,
+                sources.c.auto_sync == 1,
+            )
         ).all()]
-    log.info("开始同步 %d 个源站 (模式=%s，已跳过的暂停源站不计入)", len(slugs), force_mode)
+    log.info("开始同步 %d 个源站 (模式=%s，暂停/关闭自动同步的源站已跳过)", len(slugs), force_mode)
     results = []
     with ThreadPoolExecutor(max_workers=config.SOURCE_SYNC_CONCURRENCY) as pool:
         futures = {pool.submit(sync_source, s, force_mode): s for s in slugs}

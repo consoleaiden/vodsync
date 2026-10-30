@@ -216,6 +216,11 @@
     <div class="head">
       <h2>源站同步状态</h2>
       <span class="hint" id="sourcesHint"></span>
+      <span style="flex:1"></span>
+      <button class="sm" id="btnAutoAllOn" title="所有源站参与定时自动同步">全部开启自动同步</button>
+      <button class="sm warn" id="btnAutoAllOff" title="所有源站退出定时自动同步（手动同步不受影响）">全部暂停自动同步</button>
+      <button class="sm" id="btnAutoSelOn" disabled title="仅对勾选的源站开启自动同步">开启所选</button>
+      <button class="sm warn" id="btnAutoSelOff" disabled title="仅对勾选的源站暂停自动同步">暂停所选</button>
     </div>
     <div class="body" id="sourcesBody"><div class="empty">加载中…</div></div>
   </section>
@@ -360,12 +365,26 @@ async function loadStats() {
 }
 
 // ---------------- 源站列表 ----------------
+// 多选集合跨刷新保留；pendingAuto 记录请求中的开关期望值，防止轮询覆盖
+const selectedSlugs = new Set();
+const pendingAuto = {};
+let currentSlugs = [];
+
+function updateBulkButtons(autoCount) {
+  const n = selectedSlugs.size;
+  $("#btnAutoSelOn").disabled = n === 0;
+  $("#btnAutoSelOff").disabled = n === 0;
+  const base = `共 ${currentSlugs.length} 个源站 · 自动同步 ${autoCount ?? "…"} 个`;
+  $("#sourcesHint").textContent = n ? `${base} · 已选 ${n} 个` : base;
+}
+
 async function loadSources() {
   try {
     const data = await api("/api/v1/sources");
     const list = data.list || [];
-    $("#sourcesHint").textContent = `共 ${list.length} 个源站`;
+    currentSlugs = list.map((s) => s.slug);
     if (!list.length) {
+      $("#sourcesHint").textContent = "";
       $("#sourcesBody").innerHTML = `<div class="empty">尚未发现源站，请点击「刷新源站列表」</div>`;
       return;
     }
@@ -404,7 +423,13 @@ async function loadSources() {
       } else if (s.paused) {
         pauseBtn = `<button class="sm primary" data-act="resume" data-slug="${esc(s.slug)}">继续</button>`;
       }
+      // 自动同步开关：请求进行中保持期望状态并禁用，避免轮询覆盖
+      const autoPending = Object.prototype.hasOwnProperty.call(pendingAuto, s.slug);
+      const autoOn = autoPending ? pendingAuto[s.slug] : !!s.auto_sync;
+      const autoCell = `<label class="switch" title="自动同步：定时任务与全站同步是否包含该源站（手动单站同步不受影响）">
+        <input type="checkbox" class="autoSw" data-slug="${esc(s.slug)}" ${autoOn ? "checked" : ""} ${autoPending ? "disabled" : ""}> 自动</label>`;
       return `<tr>
+        <td><input type="checkbox" class="selRow" data-slug="${esc(s.slug)}" ${selectedSlugs.has(s.slug) ? "checked" : ""}></td>
         <td>
           <div class="name">${esc(s.name)}</div>
           <div class="slugcode">${esc(s.slug)}</div>
@@ -414,6 +439,7 @@ async function loadSources() {
         <td style="min-width:130px">${prog}</td>
         <td class="muted num" style="font-size:12px">${esc(s.watermark || "-")}</td>
         <td class="muted num" style="font-size:12px">${fmtTime(s.last_sync_at)}</td>
+        <td style="white-space:nowrap">${autoCell}</td>
         <td style="white-space:nowrap">
           <button class="sm" data-act="incr" data-slug="${esc(s.slug)}">增量</button>
           <button class="sm" data-act="full" data-slug="${esc(s.slug)}">全量</button>
@@ -422,10 +448,13 @@ async function loadSources() {
         </td>
       </tr>`;
     }).join("");
+    const allSel = list.length > 0 && list.every((s) => selectedSlugs.has(s.slug));
     $("#sourcesBody").innerHTML = `<table>
       <thead><tr>
-        <th>源站</th><th>状态</th><th>已入库</th><th>全量进度</th><th>增量水位线</th><th>最后同步</th><th>操作</th>
+        <th style="width:34px" title="全选 / 取消全选"><input type="checkbox" id="selAll" ${allSel ? "checked" : ""}></th>
+        <th>源站</th><th>状态</th><th>已入库</th><th>全量进度</th><th>增量水位线</th><th>最后同步</th><th>自动同步</th><th>操作</th>
       </tr></thead><tbody>${rows}</tbody></table>`;
+    updateBulkButtons(list.filter((s) => s.auto_sync).length);
   } catch (e) { toast("源站列表加载失败：" + e.message, true); }
 }
 
@@ -490,6 +519,59 @@ async function toggleSourcePause(slug, want) {
     toast((want ? "暂停" : "继续") + "失败：" + e.message, true);
   }
 }
+
+// ---------------- 自动同步开关 ----------------
+$("#sourcesBody").addEventListener("change", async (ev) => {
+  const t = ev.target;
+  // 全选 / 取消全选
+  if (t.id === "selAll") {
+    if (t.checked) currentSlugs.forEach((s) => selectedSlugs.add(s));
+    else selectedSlugs.clear();
+    loadSources();
+    return;
+  }
+  // 单行勾选（多选）
+  if (t.classList.contains("selRow")) {
+    if (t.checked) selectedSlugs.add(t.dataset.slug);
+    else selectedSlugs.delete(t.dataset.slug);
+    // 同步表头全选框状态
+    const all = document.getElementById("selAll");
+    if (all) all.checked = currentSlugs.length > 0 && currentSlugs.every((s) => selectedSlugs.has(s));
+    updateBulkButtons();
+    return;
+  }
+  // 单站自动同步开关
+  if (t.classList.contains("autoSw")) {
+    const slug = t.dataset.slug, want = t.checked;
+    pendingAuto[slug] = want;
+    try {
+      const res = await api(`/api/v1/sources/${encodeURIComponent(slug)}/auto-sync?enabled=${want}`, { method: "POST" });
+      toast(res.msg || "已更新");
+    } catch (e) {
+      toast("设置失败：" + e.message, true);
+    } finally {
+      delete pendingAuto[slug];
+      loadSources();
+    }
+  }
+});
+
+// 批量开关自动同步：slugs 为 "all" 或 slug 数组
+async function bulkAutoSync(enabled, slugs) {
+  if (!enabled && slugs === "all" && !window.confirm("确认暂停全部源站的自动同步？之后定时任务将不再同步任何源站（手动同步不受影响）。")) return;
+  const param = slugs === "all" ? "all" : slugs.join(",");
+  try {
+    const res = await api(`/api/v1/sources/auto-sync?enabled=${enabled}&slugs=${encodeURIComponent(param)}`, { method: "POST" });
+    toast(res.msg || "已更新");
+    selectedSlugs.clear();
+    loadSources();
+  } catch (e) { toast("批量设置失败：" + e.message, true); }
+}
+
+$("#btnAutoAllOn").onclick = () => bulkAutoSync(true, "all");
+$("#btnAutoAllOff").onclick = () => bulkAutoSync(false, "all");
+$("#btnAutoSelOn").onclick = () => { if (selectedSlugs.size) bulkAutoSync(true, [...selectedSlugs]); };
+$("#btnAutoSelOff").onclick = () => { if (selectedSlugs.size) bulkAutoSync(false, [...selectedSlugs]); };
 
 async function showSourceLogs(slug) {
   try {
