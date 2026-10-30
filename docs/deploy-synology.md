@@ -13,7 +13,7 @@ File Station 中创建：`/docker/vodsync/data`（存放数据库文件）。
 **方式 A（推荐）：拉取 CI 构建的镜像**
 
 按 README 完成仓库搭建后，镜像在 GHCR：
-`ghcr.io/<你的GitHub用户名>/vodsync:latest`
+`ghcr.io/consoleaiden/vodsync:latest`（已实测公开可拉取）
 
 - 打开 Container Manager → 注册表，GHCR 镜像默认搜不到，需先 SSH 登录（见下方"SSH 登录 GHCR"），或在 GitHub Packages 页面把镜像设为 Public 后用"手动输入"方式拉取。
 
@@ -32,7 +32,7 @@ Container Manager → **项目** → **新增**：
 ```yaml
 services:
   vodsync:
-    image: ghcr.io/<你的GitHub用户名>/vodsync:latest   # 方式B本地构建则改为 build: .
+    image: ghcr.io/consoleaiden/vodsync:latest   # 方式B本地构建则改为 build: .
     container_name: vodsync
     restart: unless-stopped
     ports:
@@ -78,7 +78,7 @@ sudo -i
 mkdir -p /volume1/docker/vodsync/data
 
 # （使用 GHCR 私有镜像时先登录）
-docker login ghcr.io -u <GitHub用户名> -p <GitHub Personal Access Token>
+docker login ghcr.io -u consoleaiden -p <GitHub Personal Access Token>
 
 # 进入项目目录（已上传项目文件）启动
 cd /volume1/docker/vodsync
@@ -91,8 +91,8 @@ docker logs -f vodsync
 ### SSH 登录 GHCR 拉取私有镜像
 
 1. GitHub → Settings → Developer settings → Personal access tokens → 生成 token，勾选 `read:packages`
-2. `docker login ghcr.io -u <用户名> -p <token>`
-3. `docker pull ghcr.io/<用户名>/vodsync:latest`
+2. `docker login ghcr.io -u consoleaiden -p <token>`
+3. `docker pull ghcr.io/consoleaiden/vodsync:latest`
 
 ---
 

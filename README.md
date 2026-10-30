@@ -245,7 +245,7 @@ git commit -m "feat: vodsync 影视数据同步服务 v1.0"
 
 # 3. 关联远程并推送（替换 <你的用户名>）
 git branch -M main
-git remote add origin https://github.com/<你的用户名>/vodsync.git
+git remote add origin https://github.com/consoleaiden/vodsync.git   # 本项目已推送: https://github.com/consoleaiden/vodsync
 git push -u origin main
 
 # 4.（可选）推送版本标签触发多架构正式镜像构建
@@ -352,3 +352,8 @@ vodsync/
 - 修正：全新全量同步在取到首页总页数前 `progress` 误算为 100，现为 0；`stats.sources_syncing` 改为"真正在跑的任务数"，另加 `sources_unfinished` 表示有断点的站数
 - 单源站暂停接口返回 `was_running`，并区分提示"将在当前批次结束后停止"与"当前未在同步，暂停标记已记录"
 - 新增 `scripts/test_panel_render.js`：Node 里用 DOM 桩执行面板真实 JS，逐行断言「暂停」按钮只出现在运行中的行
+
+### v1.2.3
+- 项目已发布到 GitHub：https://github.com/consoleaiden/vodsync
+- GitHub Actions 首次构建成功（amd64 + arm64 双架构），镜像公开可拉取：`ghcr.io/consoleaiden/vodsync:latest`、`ghcr.io/consoleaiden/vodsync:1.2.2`
+- `docker-compose.yml` 与群晖部署文档的镜像地址已替换为实际发布地址

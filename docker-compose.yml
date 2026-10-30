@@ -2,9 +2,10 @@
 # 用法：把本项目放到 /volume1/docker/vodsync/ 后，Container Manager -> 项目 -> 新增 -> 使用此文件
 services:
   vodsync:
-    # 官方发布镜像（GitHub Actions 自动构建），按需替换 <你的用户名>
-    # image: ghcr.io/<你的GitHub用户名>/vodsync:latest
-    build: .                      # 本地构建模式：保留 build，注释掉上面 image 行
+    # 官方发布镜像（GitHub Actions 自动构建，双架构 amd64/arm64，公开可拉取）
+    image: ghcr.io/consoleaiden/vodsync:latest
+    # 本地构建模式：注释掉上面 image 行，改用下面 build
+    # build: .
     container_name: vodsync
     restart: unless-stopped
     ports:
