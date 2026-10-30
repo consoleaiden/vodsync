@@ -1,5 +1,7 @@
 # VodSync 客户端 API 对接文档
 
+> ⚠️ 本文是**简明对接说明**。完整交付版（含字段字典、状态语义、代码骨架、排查表）见 **[`API_SPEC_FOR_AI.md`](./API_SPEC_FOR_AI.md)** —— 交给 AI 开发客户端时请使用该文档。
+
 > 本文档面向「调用 VodSync 服务的客户端 App」（原生 App / H5 / 小程序 / 播放器 / 采集器均可）。
 > 目标：一个 AI 客户端开发者（或 AI 编程助手）拿这份文档即可完成全部对接，无需阅读服务端代码。
 
@@ -94,6 +96,8 @@
 | POST | `/api/v1/resume?scope=global\|full\|incremental` | 继续同步（自动从断点续跑） |
 | POST | `/api/v1/sources/{slug}/pause` | 暂停单个源站（独立于全局暂停） |
 | POST | `/api/v1/sources/{slug}/resume` | 继续单个源站（按 auto 续跑） |
+| POST | `/api/v1/sources/{slug}/auto-sync?enabled=` | 单源站自动同步开关（是否参与定时任务/全站同步） |
+| POST | `/api/v1/sources/auto-sync?enabled=&slugs=` | 批量自动同步开关（`slugs=all` 或逗号分隔列表） |
 | GET | `/api/v1/logs?limit=50` | 最近同步日志（跨源站） |
 | POST | `/api/v1/maintenance/recount` | 条数校准（异步执行） |
 
@@ -347,6 +351,27 @@ POST /api/v1/sources/jkun/resume     # 继续该源站（自动按 auto 续跑�
 - `resume` 会对该源站按 auto 模式续跑：有断点则续全量、有水位线则走增量
 - 管理面板源站列表每行提供「暂停 / 继续」按钮：**「暂停」只在 `running=true`（真的有任务在跑）时出现**；已暂停的站显示「继续」；空闲站不显示暂停/继续
 
+#### POST `/api/v1/sources/{slug}/auto-sync` / `/api/v1/sources/auto-sync` — 自动同步开关
+
+控制源站是否参与**自动同步**（定时增量任务、全站同步 `sync-all`、增量续跑）。与「暂停」的区别：暂停会阻断该源站的**一切**同步（含手动）；自动同步开关只影响**自动/批量**触发，手动单站同步始终可用。
+
+```bash
+POST /api/v1/sources/jkun/auto-sync?enabled=false        # 关闭单站自动同步
+POST /api/v1/sources/auto-sync?enabled=false&slugs=all   # 全部关闭
+POST /api/v1/sources/auto-sync?enabled=true&slugs=jkun,t1  # 只开启指定站
+```
+
+```json
+// 单站响应
+{ "code": 1, "msg": "源站 JKUN资源站 自动同步已暂停", "slug": "jkun", "auto_sync": false }
+// 批量响应
+{ "code": 1, "msg": "已暂停 52 个源站的自动同步", "updated": 52, "auto_sync": false }
+```
+
+- 状态持久化在 `sources.auto_sync` 列（默认 1，重启保留），`/api/v1/sources` 返回 `auto_sync`
+- **全局定时调度保留不变**（源站列表刷新 + 全站增量），只是被关闭的站不再参与
+- App 端建议：用 `/api/v1/sources` 拉列表渲染开关，勾选多行后调批量接口，单行开关直接调单站接口
+
 #### GET `/api/v1/sources`
 ```json
 { "code": 1, "list": [{
@@ -456,4 +481,4 @@ POST /api/v1/sources/jkun/resume     # 继续该源站（自动按 auto 续跑�
 
 ---
 
-*文档版本：对应服务 v1.2.2。字段如有增补，以 `/docs`（Swagger）与 `/openapi.json` 为准。*
+*文档版本：对应服务 v1.3.0。字段如有增补，以 `/docs`（Swagger）与 `/openapi.json` 为准；完整交付版见 [`API_SPEC_FOR_AI.md`](./API_SPEC_FOR_AI.md)。*
