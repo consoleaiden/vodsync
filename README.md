@@ -356,6 +356,34 @@ docker compose run --rm vodsync python -c "import socket;print(socket.gethostbyn
 > 兜底方案：如果 SQLite 里本来就没多少数据（比如只有几个站跑过），直接换 `DATABASE_URL`
 > 重新全量同步更省事 —— 迁移的收益在于**省掉百万级的重新抓取**。
 
+### 把 pgdata 搬到 SSD（可选，提升 PG 随机 IO）
+
+**不能边跑边复制，也不能用 File Station 拖拽**（会丢 uid/gid，PG 启动直接报 data directory has wrong ownership）。
+正确姿势是「干净停库 → 保权限复制 → 改挂载路径 → 重建容器 → 逐表校验」：
+
+```bash
+cd /volume2/docker/vodsync
+sudo docker compose stop vodsync postgres          # 必须停干净，不要 docker kill
+docker ps | grep -E "vodsync|postgres"              # 应为空
+
+sudo mkdir -p /volume3/ssd/vodsync/pgdata           # SSD 上的真实路径，必须在本地存储空间上
+sudo cp -a /volume2/docker/vodsync/pgdata/. /volume3/ssd/vodsync/pgdata/   # -a 保留属主/权限，或
+# sudo rsync -aHAX --numeric-ids /volume2/docker/vodsync/pgdata/ /volume3/ssd/vodsync/pgdata/
+sudo du -sh /volume2/docker/vodsync/pgdata /volume3/ssd/vodsync/pgdata     # 两份大小应一致
+
+# 改 compose 里的挂载路径，然后重建容器（改了 volume 必须 recreate 才生效）
+#   - /volume3/ssd/vodsync/pgdata:/var/lib/postgresql/data
+sudo docker compose up -d --force-recreate postgres
+docker exec vodsync-pg pg_isready -U vodsync
+```
+
+- `cp -a` 之后**不要 chown**：PG 数据目录属主必须保持原样（alpine 版是 uid 70）。若真丢了权限又没备份，只能重新 initdb。
+- **绝不能放在 SMB / NFS / iSCSI 等网络挂载上**，PG 依赖文件锁与 fsync，网络盘会随机报错甚至损坏数据。
+- SSD 若在加密共享文件夹里，务必确认**开机自动挂载**：路径不存在时 Docker 会自建空目录，PG 见到空目录会 initdb 一个新库，看起来就是「数据全没了」。
+- 旧 pgdata **先别删**，跑一周确认无误再清理（它是唯一的快速回滚点）。
+- 搬完用迁移脚本复查一遍（SQLite 与 PG 逐表比行数，最可靠的验证）：
+  `sudo docker compose run --rm vodsync python /app/scripts/migrate_sqlite_to_pg.py --target "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync" --verify`
+
 ## GitHub 仓库搭建流程（完整步骤）
 
 ```bash
