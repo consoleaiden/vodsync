@@ -247,21 +247,23 @@ GET /api/v1/{slug}?ac=detail&ids=1,2,3 # 按 ID 批量取详情
 连 `watermark`（增量水位线）和 `last_page`（全量断点）都会保留，迁完直接接着做增量。
 
 ```bash
-# 0) 先停服务，保证源库不再写入
+# 0) 先停服务，保证源库不再写入（PG 容器要已启动：解开 compose 里的 postgres 段并 up -d）
 sudo docker compose stop vodsync
 
-# 1) 看看要搬多少（不写目标库）
-docker run --rm -v /volume2/docker/vodsync/data:/data \
-  --entrypoint python ghcr.io/consoleaiden/vodsync:latest \
-  /app/scripts/migrate_sqlite_to_pg.py --source /data/vodsync.db \
-  --target "postgresql+psycopg2://vodsync:vodsync@192.168.1.10:5432/vodsync" --dry-run
+# 1) 预演：看看要搬多少（不写目标库）
+#    compose run 会复用同一网络和同一 data 卷，所以 --source 默认就指向 /app/data/vodsync.db
+sudo docker compose run --rm vodsync python /app/scripts/migrate_sqlite_to_pg.py \
+  --target "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync" --dry-run
 
-# 2) 正式迁移（可重复执行，已存在的行按主键跳过）
-#    同上命令，去掉 --dry-run
+# 2) 正式迁移（可重复执行，已存在的行按主键跳过）；同上命令去掉 --dry-run
 
 # 3) 改 DATABASE_URL 并启动
 sudo docker compose up -d
 ```
+
+> 如果 PostgreSQL 装在别的机器（不在 compose 内网），把 target 换成那台机器的地址即可，例如
+> `postgresql+psycopg2://vodsync:vodsync@192.168.1.10:5432/vodsync`；此时用
+> `docker run --rm -v /volume2/docker/vodsync/data:/data --entrypoint python ghcr.io/consoleaiden/vodsync:latest /app/scripts/migrate_sqlite_to_pg.py ...` 也行，注意 `--source /data/vodsync.db`。
 
 - 迁移内容：`sources`（源站元数据 + 水位线 + 断点 + 暂停/自动同步开关）、`sync_logs`、全部 `vod_*` 数据表
 - 脚本结束会自动校验：表是否齐全、行数是否一致、`watermark`/`last_page`/`paused`/`auto_sync` 等关键字段逐行比对
