@@ -265,6 +265,30 @@ sudo docker compose up -d
 > `postgresql+psycopg2://vodsync:vodsync@192.168.1.10:5432/vodsync`；此时用
 > `docker run --rm -v /volume2/docker/vodsync/data:/data --entrypoint python ghcr.io/consoleaiden/vodsync:latest /app/scripts/migrate_sqlite_to_pg.py ...` 也行，注意 `--source /data/vodsync.db`。
 
+### 报错 `could not translate host name "postgres"` 怎么办
+
+**这是 Docker 网络问题，不是 PG 没启动。** `docker compose run` 起的临时容器只认识「同一个 compose 项目网络」里的服务名；
+如果 `postgres` 这个容器是 `docker run --name postgres` 或另一个 compose 项目起的，名字虽然叫 postgres，但在本项目网络里没有这个 DNS 记录。
+
+```bash
+# 看 PG 挂在哪个网络（以及是否真的在跑）
+docker ps | grep -i postgres
+docker inspect -f '{{json .NetworkSettings.Networks}}' postgres
+docker network ls | grep vodsync       # 本项目默认网络名，通常 vodsync_default
+
+# 解法①（推荐，PG 不用重建、数据不动）：把 PG 接进本项目网络，并给它 postgres 这个别名
+docker network connect --alias postgres vodsync_default postgres
+
+# 自测：能打印出 IP 就说明通了
+docker compose run --rm vodsync python -c "import socket;print(socket.gethostbyname('postgres'))"
+```
+
+解法②（绕过 DNS）：PG 的 5432 已映射到宿主机时，直接用宿主机地址 ——
+`--target "postgresql+psycopg2://vodsync:vodsync@<NAS局域网IP 或 172.17.0.1>:5432/vodsync"`。
+
+解法③（最干净，适合 PG 还是空的/新建的）：解开 compose 里的 `postgres` 段，让两个服务同属一个项目网络，
+`docker compose up -d postgres` 后 `postgres:5432` 自然可解析。注意先停掉旧的同名 PG 容器（否则 5432 端口冲突）。
+
 - 迁移内容：`sources`（源站元数据 + 水位线 + 断点 + 暂停/自动同步开关）、`sync_logs`、全部 `vod_*` 数据表
 - 脚本结束会自动校验：表是否齐全、行数是否一致、`watermark`/`last_page`/`paused`/`auto_sync` 等关键字段逐行比对
 - 只想搬元数据不搬视频数据：`--only-meta`；只搬部分源站：`--tables jkun,t1`

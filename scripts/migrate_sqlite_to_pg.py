@@ -193,6 +193,64 @@ def _table_count(engine, name: str) -> int:
         return int(conn.execute(_text(f'SELECT COUNT(*) FROM "{name}"')).scalar() or 0)
 
 
+def _conn_hints(err: str, url) -> list:
+    """
+    按报错类型给排查方向。这里最容易踩的是 Docker 网络：
+    `docker compose run` 出来的容器只认识「同一个 compose 项目网络」里的服务名，
+    名字叫 postgres 的容器如果是 `docker run` 或另一个 compose 项目起的，在这个容器里就解析不到。
+    """
+    host = url.host or "<主机>"
+    text = err.lower()
+
+    if (
+        "could not translate host name" in text
+        or "name or service not known" in text
+        or "temporary failure in name resolution" in text
+        or "nodename nor servname" in text
+    ):
+        return [
+            f"容器内解析不到主机名 “{host}” —— 属于 Docker 网络问题，不是 PG 没启动。",
+            "",
+            "  先确认 PG 在跑、挂在哪个网络：",
+            "    docker ps | grep -i postgres",
+            "    docker inspect -f '{json .NetworkSettings.Networks}' <pg容器名>",
+            "    docker network ls | grep vodsync          # 本项目的默认网络名，通常 vodsync_default",
+            "",
+            "  三种解法（任选其一，推荐 ①）：",
+            "  ① 把 PG 容器接进本项目的网络，并给它一个叫 postgres 的别名（PG 不用重建、数据不动）：",
+            f"     docker network connect --alias {host} vodsync_default <pg容器名>",
+            "  ② 绕过 DNS，直接用宿主机地址（PG 的 5432 已映射到宿主机时）：",
+            "     --target \"postgresql+psycopg2://用户:密码@<NAS局域网IP或172.17.0.1>:5432/vodsync\"",
+            "  ③ 在 compose 里解开 postgres 段，让两个服务同属一个项目网络（PG 若是新建/空的，这个最干净）",
+            "",
+            "  改完先自测：docker compose run --rm vodsync python -c \"import socket;print(socket.gethostbyname('" + host + "'))\"",
+        ]
+    if "password authentication failed" in text or "no pg_hba.conf entry" in text:
+        return [
+            "账号密码或授权被拒：核对 POSTGRES_USER / POSTGRES_PASSWORD 与 URL 里的是否一致。",
+            "  密码含 @ : / 等特殊字符必须做 URL 编码（@ → %40）。",
+            "  PG 在另一台机器时，还要允许该网段连接（pg_hba.conf + listen_addresses）。",
+        ]
+    if "connection refused" in text:
+        return [
+            f"端口能被解析但没人监听：{host}:{url.port or 5432} 上没有 PG，或 PG 只监听了 127.0.0.1。",
+            "  docker ps 看 PG 容器的 PORTS 列是否映射了 5432；容器间互连不要用 127.0.0.1。",
+        ]
+    if "does not exist" in text and "database" in text:
+        return [
+            "库不存在：先在 PG 里建库（POSTGRES_DB 只在数据目录初始化时生效，改环境变量不会补建）。",
+            "  docker exec -it <pg容器名> psql -U vodsync -c 'CREATE DATABASE vodsync;'",
+        ]
+    if "timeout" in text or "timed out" in text:
+        return [
+            "连接超时：多半是网络不通或被防火墙拦了（宿主机防火墙 / 云安全组 / NAS 防火墙）。",
+            "  docker compose run 的容器内先试：nc -zv " + host + " " + str(url.port or 5432),
+        ]
+    return [
+        "通用排查：PG 容器是否在跑（docker ps）、主机名与端口是否正确、库和用户是否已建（POSTGRES_DB / POSTGRES_USER）。",
+    ]
+
+
 def check_target(target_engine):
     """目标库连通性：连不上时给出可读原因，而不是让用户看一屏 SQLAlchemy 堆栈。"""
     from sqlalchemy import text as _text
@@ -342,7 +400,11 @@ def main(argv=None) -> int:
     tgt_engine = create_engine(args.target, future=True, pool_pre_ping=True)
 
     print(f"源库  : SQLite {src_path.resolve()}")
-    print(f"目标库: {tgt_engine.url.render_as_string(hide_password=True)}")
+    _u = tgt_engine.url
+    print(
+        f"目标库: {_u.drivername}://{_u.username or '-'}@"
+        f"{_u.host or '<未填主机>'}:{_u.port or 5432}/{_u.database or '-'}"
+    )
     if args.dry_run:
         print("模式  : DRY-RUN（只统计，不写入）")
     elif args.verify:
@@ -352,13 +414,14 @@ def main(argv=None) -> int:
     err, info = check_target(tgt_engine)
     if err:
         print(f"目标库: 连接失败 —— {err}")
+        hints = _conn_hints(err, _u)
         if not args.dry_run:
-            print("\n[错误] 目标库不可用，迁移已中止。请检查：")
-            print("  1) PG 容器是否在运行：docker ps | grep postgres")
-            print("  2) 主机名/端口是否正确（compose 内网用 postgres:5432，宿主机用 IP:端口）")
-            print("  3) 库与用户是否已创建（POSTGRES_DB / POSTGRES_USER）")
+            print("\n[错误] 目标库不可用，迁移已中止。")
+        for line in hints:
+            print(("  " + line) if line else "")
+        if not args.dry_run:
             return 3
-        print("       （DRY-RUN 仍会统计源库规模）")
+        print("\n       （DRY-RUN 仍会统计源库规模）")
     else:
         print(f"        {info}")
     print()

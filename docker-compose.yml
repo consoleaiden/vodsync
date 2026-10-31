@@ -43,6 +43,9 @@ services:
 
   # ---- 可选：PostgreSQL（数据量超大或多实例共享时启用） ----
   # 切换前先迁数据，不用重新同步（详见 README「从 SQLite 迁移到 PostgreSQL」）：
+  #   注意：迁移时的 --target 用 postgres:5432 能解析的前提是 PG 与本服务在同一 compose 项目网络里；
+  #   若 PG 是单独 docker run 或另一个项目起的，会报 could not translate host name "postgres"，
+  #   修法见 README「报错 could not translate host name "postgres" 怎么办」。
   #   docker run --rm -v /volume2/docker/vodsync/data:/data --entrypoint python \
   #     ghcr.io/consoleaiden/vodsync:latest /app/scripts/migrate_sqlite_to_pg.py \
   #     --source /data/vodsync.db --target "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync" --dry-run
