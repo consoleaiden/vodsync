@@ -43,7 +43,7 @@ services:
       # 兼容项：设置后作为一枚额外有效的 API Token
       # API_KEY: ""
       # ---- API ----
-      API_PAGE_SIZE_DEFAULT: "20"
+      API_PAGE_SIZE_DEFAULT: "30"          # 每页条数：App 三列 × 10 行 = 30（上限见 API_PAGE_SIZE_MAX）
       API_KEY: ""                          # 留空不鉴权；设置后请求需带 X-API-Key 头
       TZ: "Asia/Shanghai"
     # 启用 PostgreSQL 后解开（配合 postgres 的 healthcheck，避免 vodsync 比库先起而启动失败）

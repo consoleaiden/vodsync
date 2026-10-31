@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.5.1"
+    "version": "1.5.2"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -938,7 +938,7 @@
               "maximum": 100,
               "minimum": 1,
               "description": "每页条数",
-              "default": 20,
+              "default": 30,
               "title": "Page Size"
             },
             "description": "每页条数"
@@ -1075,9 +1075,11 @@
               "type": "integer",
               "maximum": 100,
               "minimum": 1,
-              "default": 20,
+              "description": "每页条数（默认取 API_PAGE_SIZE_DEFAULT，上限取 API_PAGE_SIZE_MAX）",
+              "default": 30,
               "title": "Page Size"
-            }
+            },
+            "description": "每页条数（默认取 API_PAGE_SIZE_DEFAULT，上限取 API_PAGE_SIZE_MAX）"
           },
           {
             "name": "per_source_limit",
@@ -1197,7 +1199,7 @@
               "maximum": 100,
               "minimum": 1,
               "description": "每页条数",
-              "default": 20,
+              "default": 30,
               "title": "Page Size"
             },
             "description": "每页条数"

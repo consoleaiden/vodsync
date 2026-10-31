@@ -1011,7 +1011,10 @@ def aggregate_search(
     source: str = Query("", description="限定源站 slug，逗号分隔；留空=搜索全部源站"),
     type_name: str = Query("", description="按分类名称过滤"),
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    page_size: int = Query(
+        config.API_PAGE_SIZE_DEFAULT, ge=1, le=config.API_PAGE_SIZE_MAX,
+        description="每页条数（默认取 API_PAGE_SIZE_DEFAULT，上限取 API_PAGE_SIZE_MAX）",
+    ),
     per_source_limit: int = Query(
         200, ge=10, le=1000,
         description="每个源站最多返回多少条候选（控制单表单次扫描开销）",

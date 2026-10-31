@@ -95,7 +95,9 @@ PROXY_PREF_TTL_MINUTES = int(os.environ.get("PROXY_PREF_TTL_MINUTES", "30"))
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
-API_PAGE_SIZE_DEFAULT = int(os.environ.get("API_PAGE_SIZE_DEFAULT", "20"))
+# 每页条数默认值：30 是「三列宫格 × 10 行」的整数倍，App 列表用它一页正好整行，
+# 不会出现最后一页只剩 1~2 格 + 空白的观感问题。上限 100 是为了避免单次响应过大。
+API_PAGE_SIZE_DEFAULT = int(os.environ.get("API_PAGE_SIZE_DEFAULT", "30"))
 API_PAGE_SIZE_MAX = int(os.environ.get("API_PAGE_SIZE_MAX", "100"))
 
 # API 访问密钥（可选）。设置后，所有接口需要在 Header 携带 X-API-Key: <key> 或 ?apikey=<key>

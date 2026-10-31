@@ -63,7 +63,7 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 |---|---|---|
 | `source` | videos / categories / search | 源站标识（slug），**逗号分隔可多源合并**；留空 = 全部源站。slug 从 `/source` 或 `/api/v1/sources` 获取，仅允许 `a-z 0-9 _` |
 | `page` / `pg` | 列表类 | 页码，从 1 开始 |
-| `page_size` | 列表类 | 每页条数，默认 20，上限见 `/docs`（默认 ≤100） |
+| `page_size` | 列表类 | 每页条数，默认 30（`API_PAGE_SIZE_DEFAULT`），上限 100（`API_PAGE_SIZE_MAX`）；三列宫格建议 30 |
 
 ### 1.4 时间格式
 
@@ -243,7 +243,7 @@ GET /api/v1/search?wd=三体&source=jkun,t1         # 限定源站（更快）
 GET /api/v1/search?wd=三体&type_name=电影&page=1
 ```
 
-**参数**：`wd` 必填（1-64 字）；`source`、`type_name` 可选；`page`、`page_size`(≤100)；`per_source_limit`（每源站候选上限，默认 200，一般不用动）。
+**参数**：`wd` 必填（1-64 字）；`source`、`type_name` 可选；`page`、`page_size`（默认 30，≤100）；`per_source_limit`（每源站候选上限，默认 200，一般不用动）。
 
 **响应**：
 
