@@ -71,7 +71,12 @@ def _parse_dt(value: str):
 
 
 def _coerce(value, column, stats):
-    """把一行里的值转成目标库可接受的类型（时间字符串 -> datetime，超长字符串截断）。"""
+    """
+    把一行里的值转成目标库可接受的类型：
+      - 时间字符串 -> datetime
+      - 去掉 NUL 字节（PostgreSQL 的 text 不接受 \x00，SQLite 允许）
+      - 超长字符串按列长度截断（SQLite 不校验 varchar 长度，PG 会直接报错）
+    """
     if value is None:
         return None
     if isinstance(column.type, DateTime) and isinstance(value, str):
@@ -79,8 +84,11 @@ def _coerce(value, column, stats):
         if parsed is None:
             stats["bad_time"] += 1
         return parsed
-    if isinstance(column.type, String) and isinstance(value, str):
-        limit = column.type.length
+    if isinstance(value, str):
+        if "\x00" in value:
+            stats["nul"] += 1
+            value = value.replace("\x00", "")
+        limit = getattr(column.type, "length", None)
         if limit and len(value) > limit:
             stats["truncated"] += 1
             return value[:limit]
@@ -133,19 +141,22 @@ def _iter_batches(src_conn, table, batch: int, columns=None):
 
 
 def copy_table(src_conn, tgt_engine, table, batch: int, replace: bool, dry_run: bool,
-               src_columns=None):
+               src_columns=None, total_hint: int = 0):
     """
     搬一张表，返回写入行数。幂等，可重复执行。
 
     src_columns: 源库实际存在的列（旧库可能缺新列，例如没有 auto_sync），
                  只搬两边都有的列，缺失列交给目标库默认值。
+    total_hint:  源表行数，仅用于大表打印进度（百万行级不打印会以为卡死）。
     """
-    stats = {"bad_time": 0, "truncated": 0}
+    stats = {"bad_time": 0, "truncated": 0, "nul": 0}
     target_cols = [c.name for c in table.columns]
     if src_columns:
         target_cols = [c for c in target_cols if c in src_columns]
     written = 0
     stmt, _ = _insert_stmt(table, tgt_engine, replace)
+    show_progress = total_hint >= 50000
+    next_mark = 25
 
     for rows in _iter_batches(src_conn, table, batch, target_cols):
         payload = [
@@ -160,10 +171,18 @@ def copy_table(src_conn, tgt_engine, table, batch: int, replace: bool, dry_run: 
             conn.execute(stmt, payload)
         written += len(payload)
 
+        if show_progress and total_hint:
+            pct = written * 100 // total_hint
+            if pct >= next_mark:
+                print(f"         … {next_mark}% ({written:,}/{total_hint:,} 行)")
+                next_mark += 25
+
     if stats["truncated"]:
         print(f"      ! 有 {stats['truncated']} 个字段超出列长度，已截断")
     if stats["bad_time"]:
         print(f"      ! 有 {stats['bad_time']} 个时间字段无法解析，已置为 NULL")
+    if stats["nul"]:
+        print(f"      ! 有 {stats['nul']} 个字段含 NUL 字节，已剔除（PG 的 text 不接受）")
     return written
 
 
@@ -172,6 +191,54 @@ def _table_count(engine, name: str) -> int:
 
     with engine.connect() as conn:
         return int(conn.execute(_text(f'SELECT COUNT(*) FROM "{name}"')).scalar() or 0)
+
+
+def check_target(target_engine):
+    """目标库连通性：连不上时给出可读原因，而不是让用户看一屏 SQLAlchemy 堆栈。"""
+    from sqlalchemy import text as _text
+
+    try:
+        with target_engine.connect() as conn:
+            conn.execute(_text("SELECT 1"))
+            if target_engine.dialect.name != "postgresql":
+                return None, f"{target_engine.dialect.name} 可连接"
+            version = conn.execute(_text("SELECT version()")).scalar()
+            size = conn.execute(
+                _text("SELECT pg_size_pretty(pg_database_size(current_database()))")
+            ).scalar()
+            return None, f"{str(version).split(',')[0]}  当前库大小 {size}"
+    except Exception as exc:  # noqa: BLE001
+        return str(exc).strip().splitlines()[0][:300], ""
+
+
+def create_table_only(engine, table) -> bool:
+    """
+    建表但**不建索引**：百万行先插数据再建索引，比边插边维护 B-tree 快数倍。
+    返回是否真的新建了表。
+    """
+    from sqlalchemy.schema import CreateTable
+
+    if inspect(engine).has_table(table.name):
+        return False
+    with engine.begin() as conn:
+        conn.execute(CreateTable(table))
+    return True
+
+
+def create_indexes(engine, tables) -> int:
+    """数据写完后统一建索引（幂等：已存在则跳过）。"""
+    created = 0
+    for table in tables:
+        for idx in table.indexes:
+            before = set()
+            try:
+                before = {i["name"] for i in inspect(engine).get_indexes(table.name)}
+            except Exception:  # noqa: BLE001
+                pass
+            idx.create(engine, checkfirst=True)
+            if idx.name not in before:
+                created += 1
+    return created
 
 
 def _reset_pg_sequences(target_engine, tables):
@@ -280,6 +347,20 @@ def main(argv=None) -> int:
         print("模式  : DRY-RUN（只统计，不写入）")
     elif args.verify:
         print("模式  : 仅校验（不迁移）")
+
+    # 连通性先探一次：dry-run 只警告，正式迁移连不上就没必要往下走
+    err, info = check_target(tgt_engine)
+    if err:
+        print(f"目标库: 连接失败 —— {err}")
+        if not args.dry_run:
+            print("\n[错误] 目标库不可用，迁移已中止。请检查：")
+            print("  1) PG 容器是否在运行：docker ps | grep postgres")
+            print("  2) 主机名/端口是否正确（compose 内网用 postgres:5432，宿主机用 IP:端口）")
+            print("  3) 库与用户是否已创建（POSTGRES_DB / POSTGRES_USER）")
+            return 3
+        print("       （DRY-RUN 仍会统计源库规模）")
+    else:
+        print(f"        {info}")
     print()
 
     only = [s for s in args.tables.split(",") if s.strip()] if args.tables else None
@@ -302,14 +383,14 @@ def main(argv=None) -> int:
             print("注意：--only-meta 只搬元数据，视频数据需要各站重新全量同步")
         return 0
 
-    # ---- 建表：只建本次要迁的表（元数据表 + 过滤后的 vod_*）----
+    # ---- 建表：只建本次要迁的表（元数据表 + 过滤后的 vod_*），索引留到最后 ----
     if write_mode:
-        print("建表：")
+        print("建表（索引留到数据写完后统一创建）：")
         for name in META_TABLES:
-            META_DEFS[name].create(tgt_engine, checkfirst=True)
+            create_table_only(tgt_engine, META_DEFS[name])
         print("  · sources / sync_logs 已就绪")
         for table in plan[len(META_TABLES):]:
-            table.create(tgt_engine, checkfirst=True)
+            create_table_only(tgt_engine, table)
         if vod_tables:
             print(f"  · {len(vod_tables)} 张 vod_* 表已就绪")
         print()
@@ -330,7 +411,7 @@ def main(argv=None) -> int:
                 src_cols = {c["name"] for c in inspect(src_engine).get_columns(table.name)}
                 t0 = time.time()
                 n = copy_table(src_conn, tgt_engine, table, args.batch, args.replace, False,
-                               src_columns=src_cols)
+                               src_columns=src_cols, total_hint=n_src)
                 total += n
                 rate = n / max(time.time() - t0, 1e-6)
                 print(f"  [{idx:>2}/{len(plan)}] {table.name:<24} {n:>8} 行  "
@@ -339,6 +420,20 @@ def main(argv=None) -> int:
         elapsed = time.time() - started
         print()
         print(f"完成：{len(plan)} 张表 / {total:,} 行，用时 {elapsed:.1f}s")
+
+        # ---- 数据写完再建索引（比边插边维护 B-tree 快数倍）----
+        print()
+        print("建索引：")
+        t_idx = time.time()
+        n_idx = create_indexes(tgt_engine, plan)
+        print(f"  · 新建 {n_idx} 个索引，用时 {time.time() - t_idx:.1f}s")
+        if tgt_engine.dialect.name == "postgresql":
+            try:
+                with tgt_engine.begin() as conn:
+                    conn.exec_driver_sql("ANALYZE")
+                print("  · 已执行 ANALYZE（更新统计信息，查询计划更准）")
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ! ANALYZE 跳过（不影响数据）：{exc}")
 
     # ---- 校验（迁移后总是校验一遍，几分钟的活别留隐患）----
     print()

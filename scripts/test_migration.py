@@ -118,6 +118,9 @@ def build_source(path):
             {"vod_id": 3, "type_id": 3, "type_name": "剧集", "name": "带引号'与\"双引号\"",
              "pic": "", "remarks": "", "content": "含换行\n的简介", "play_url": "x",
              "vod_time": "2026-10-28 00:00:00"},
+            # SQLite 允许、PostgreSQL 拒绝的 NUL 字节
+            {"vod_id": 4, "type_id": 4, "type_name": "其他", "name": "含NUL", "pic": "",
+             "remarks": "", "content": "简介\x00里有NUL", "play_url": "", "vod_time": ""},
         ])
     eng.dispose()
     return url
@@ -187,6 +190,10 @@ def main():
             check("含引号名称保真", r3["name"] == "带引号'与\"双引号\"", repr(r3["name"]))
             check("含换行简介保真", r3["content"] == "含换行\n的简介", repr(r3["content"]))
             check("synced_at 是 datetime", isinstance(r3["synced_at"], datetime), type(r3["synced_at"]))
+            r4 = c.execute(select(tb).where(tb.c.vod_id == 4)).mappings().first()
+            check("NUL 字节已剔除（PG 不接受 \\x00）",
+                  "\x00" not in (r4["content"] or "") and r4["content"] == "简介里有NUL",
+                  repr(r4["content"]))
 
         print("[5] 幂等：重复执行不产生重复行")
         before = count(tgt_eng, "vod_alpha")
@@ -241,6 +248,17 @@ def main():
         e4 = create_engine(f"sqlite:///{tgt4}", future=True)
         n4 = set(inspect(e4).get_table_names())
         check("只建了 vod_beta", "vod_beta" in n4 and "vod_alpha" not in n4, str(sorted(n4)))
+
+        print("[11] 索引在数据写完后创建")
+        idx_names = {i["name"] for i in inspect(tgt_eng).get_indexes("vod_alpha")}
+        for want in ("idx_alpha_type", "idx_alpha_time", "idx_alpha_name"):
+            check(f"{want} 已创建", want in idx_names, str(sorted(idx_names)))
+
+        print("[12] 目标库不可达时明确报错（退出码 3）")
+        code6, out6 = run_quiet(mig.main, ["--source", src,
+                                          "--target", "sqlite:///" + os.path.join(tmp, "nodir", "x.db")])
+        check("不可达退出码 3", code6 == 3, f"exit={code6}")
+        check("给出排查清单", "PG 容器是否在运行" in out6, out6[-160:].replace("\n", " "))
 
         src_eng.dispose()
         tgt_eng.dispose()
