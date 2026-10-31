@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · VodSync 管理面板</title>
+<style>
+  * { box-sizing: border-box; }
+  :root {
+    --bg: #f5f7fa; --card: #fff; --line: #e3e8ef; --text: #1f2937;
+    --muted: #6b7280; --accent: #2563eb; --bad: #dc2626;
+  }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    display: flex; align-items: center; justify-content: center; padding: 20px;
+  }
+  .box {
+    width: 100%; max-width: 360px; background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 26px 24px 22px; box-shadow: 0 6px 24px rgba(15, 23, 42, .06);
+  }
+  h1 { font-size: 17px; margin: 0 0 4px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 12.5px; margin-bottom: 18px; }
+  label { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+  input[type=password] {
+    width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
+    font-size: 14px; outline: none; transition: border-color .15s;
+  }
+  input[type=password]:focus { border-color: var(--accent); }
+  button {
+    width: 100%; margin-top: 16px; padding: 10px 12px; border: 0; border-radius: 8px;
+    background: var(--accent); color: #fff; font-size: 14px; font-weight: 550; cursor: pointer;
+  }
+  button:disabled { opacity: .6; cursor: default; }
+  .err { color: var(--bad); font-size: 12.5px; margin-top: 10px; min-height: 18px; }
+  .tip { color: var(--muted); font-size: 12px; margin-top: 16px; line-height: 1.7; }
+  code { background: #f3f4f6; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<form class="box" id="form">
+  <h1>VodSync 管理面板</h1>
+  <div class="sub">请输入管理密码后继续</div>
+  <label for="pw">管理密码</label>
+  <input type="password" id="pw" name="password" autocomplete="current-password" autofocus required>
+  <button type="submit" id="btn">登录</button>
+  <div class="err" id="err"></div>
+  <div class="tip">
+    首次使用默认密码 <code>666666</code>，登录后请到「设置」里修改。<br>
+    连续输错会临时锁定，稍后再试即可。
+  </div>
+</form>
+<script>
+const form = document.getElementById("form");
+const pw = document.getElementById("pw");
+const err = document.getElementById("err");
+const btn = document.getElementById("btn");
+const next = new URLSearchParams(location.search).get("next") || "/";
+
+function fail(msg) { err.textContent = msg; btn.disabled = false; btn.textContent = "登录"; }
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  err.textContent = "";
+  btn.disabled = true; btn.textContent = "登录中…";
+  try {
+    const res = await fetch("/api/v1/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: pw.value }),
+    });
+    if (res.ok) { location.href = next; return; }
+    let detail = "登录失败";
+    try { detail = (await res.json()).detail || detail; } catch (e2) {}
+    fail(detail);
+    pw.select();
+  } catch (e2) {
+    fail("网络错误：" + e2.message);
+  }
+});
+
+// 未启用鉴权时没必要停在这一页
+fetch("/api/v1/auth/state").then(r => r.json()).then(s => {
+  if (s && s.enabled === false) location.href = "/";
+  else if (s && s.logged_in) location.href = next;
+}).catch(() => {});
+</script>
+</body>
+</html>

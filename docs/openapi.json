@@ -3,9 +3,185 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.4.1"
+    "version": "1.5.0"
   },
   "paths": {
+    "/api/v1/auth/login": {
+      "post": {
+        "summary": "管理面板登录",
+        "operationId": "auth_login_api_v1_auth_login_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/logout": {
+      "post": {
+        "summary": "退出登录",
+        "operationId": "auth_logout_api_v1_auth_logout_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/state": {
+      "get": {
+        "summary": "鉴权状态（登录页/面板启动时用）",
+        "operationId": "auth_state_api_v1_auth_state_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/password": {
+      "post": {
+        "summary": "修改管理面板密码",
+        "operationId": "auth_change_password_api_v1_auth_password_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/settings": {
+      "post": {
+        "summary": "启用/关闭授权访问",
+        "operationId": "auth_settings_api_v1_auth_settings_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/token": {
+      "get": {
+        "summary": "查看 API Token（需登录）",
+        "operationId": "auth_get_token_api_v1_auth_token_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "重置 API Token（旧 Token 立即失效）",
+        "operationId": "auth_rotate_token_api_v1_auth_token_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/categories": {
       "get": {
         "summary": "Categories",
@@ -23,26 +199,6 @@
               "title": "Source"
             },
             "description": "源站 slug，逗号分隔多源；留空=全部源站合并"
-          },
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
           }
         ],
         "responses": {
@@ -72,44 +228,12 @@
         "summary": "Healthz",
         "description": "健康检查 / 存活探针。\n\n关键点：数据库繁忙时**不返回 5xx**。容器健康检查只看 HTTP 状态码，\n若这里因为连接池排队而报 500/超时，Docker 会把一个其实还在正常干活的容器判定为不健康\n并反复重启（v1.4.0 在 NAS 上就表现为\"容器崩溃\"）。因此这里始终 200，\n用 db 字段表达数据库是否可用。",
         "operationId": "healthz_healthz_get",
-        "parameters": [
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
               }
             }
           }
@@ -121,44 +245,12 @@
         "summary": "List Sources",
         "description": "所有源站及本地同步状态。\n\n字段口径（易混淆，特意分开）：\n  running       此刻是否有同步任务在跑（只有 true 才应该提供「暂停」操作）\n  running_mode  正在跑的类型：full / incremental\n  running_seconds 本次已运行秒数\n  syncing       全量同步是否「未跑完」（有断点），不代表正在跑，仅用于展示进度条\n  synced        是否同步过（无水位线、无数据、无断点 = false，进度恒为 0）\n  paused        该源站是否被单独暂停（持久化）",
         "operationId": "list_sources_api_v1_sources_get",
-        "parameters": [
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
               }
             }
           }
@@ -194,26 +286,6 @@
               "title": "Only Ready"
             },
             "description": "仅返回本地已有数据的源站"
-          },
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
           }
         ],
         "responses": {
@@ -243,44 +315,12 @@
         "summary": "Stats",
         "description": "管理面板概览数据：源站数、总条数、同步中数量、今日入库量、暂停状态、最近错误。",
         "operationId": "stats_api_v1_stats_get",
-        "parameters": [
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
               }
             }
           }
@@ -299,26 +339,6 @@
             "schema": {
               "type": "string",
               "title": "Slug"
-            }
-          },
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
             }
           }
         ],
@@ -372,26 +392,6 @@
               "title": "Slugs"
             },
             "description": "逗号分隔的源站 slug 列表；all 或留空=全部源站"
-          },
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
           }
         ],
         "responses": {
@@ -441,26 +441,6 @@
               "title": "Enabled"
             },
             "description": "true=开启自动同步, false=暂停自动同步"
-          },
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
           }
         ],
         "responses": {
@@ -499,26 +479,6 @@
               "type": "string",
               "title": "Slug"
             }
-          },
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
           }
         ],
         "responses": {
@@ -556,26 +516,6 @@
             "schema": {
               "type": "string",
               "title": "Slug"
-            }
-          },
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
             }
           }
         ],
@@ -618,26 +558,6 @@
               "title": "Full Sync"
             },
             "description": "发现新源站后是否立即全量同步"
-          },
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
           }
         ],
         "responses": {
@@ -687,26 +607,6 @@
               "default": "auto",
               "title": "Mode"
             }
-          },
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
           }
         ],
         "responses": {
@@ -747,26 +647,6 @@
               "default": "auto",
               "title": "Mode"
             }
-          },
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
           }
         ],
         "responses": {
@@ -796,44 +676,12 @@
         "summary": "Recount",
         "description": "重算各源站本地条数（同步中断后校准面板数据）。",
         "operationId": "recount_api_v1_maintenance_recount_post",
-        "parameters": [
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
               }
             }
           }
@@ -845,44 +693,12 @@
         "summary": "Pause Status",
         "description": "同步暂停状态（三层级：global / full / incremental）。",
         "operationId": "pause_status_api_v1_pause_get",
-        "parameters": [
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
               }
             }
           }
@@ -916,26 +732,6 @@
               "title": "Reason"
             },
             "description": "可选备注（目前仅记录在服务日志）"
-          },
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
           }
         ],
         "responses": {
@@ -977,26 +773,6 @@
               "title": "Scope"
             },
             "description": "继续范围：global / full / incremental"
-          },
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
           }
         ],
         "responses": {
@@ -1036,26 +812,6 @@
               "minimum": 1,
               "default": 50,
               "title": "Limit"
-            }
-          },
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
             }
           }
         ],
@@ -1161,16 +917,6 @@
             "description": "按 ID 批量取详情（逗号分隔），返回含播放地址"
           },
           {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
             "name": "page",
             "in": "query",
             "required": false,
@@ -1196,16 +942,6 @@
               "title": "Page Size"
             },
             "description": "每页条数"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
           }
         ],
         "responses": {
@@ -1252,26 +988,6 @@
             "schema": {
               "type": "integer",
               "title": "Vod Id"
-            }
-          },
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
             }
           }
         ],
@@ -1376,26 +1092,6 @@
               "title": "Per Source Limit"
             },
             "description": "每个源站最多返回多少条候选（控制单表单次扫描开销）"
-          },
-          {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
           }
         ],
         "responses": {
@@ -1480,16 +1176,6 @@
             }
           },
           {
-            "name": "apikey",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Apikey"
-            }
-          },
-          {
             "name": "page",
             "in": "query",
             "required": false,
@@ -1515,16 +1201,6 @@
               "title": "Page Size"
             },
             "description": "每页条数"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "X-Api-Key"
-            }
           }
         ],
         "responses": {

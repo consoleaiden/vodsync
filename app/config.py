@@ -99,4 +99,22 @@ API_PAGE_SIZE_DEFAULT = int(os.environ.get("API_PAGE_SIZE_DEFAULT", "20"))
 API_PAGE_SIZE_MAX = int(os.environ.get("API_PAGE_SIZE_MAX", "100"))
 
 # API 访问密钥（可选）。设置后，所有接口需要在 Header 携带 X-API-Key: <key> 或 ?apikey=<key>
+# v1.5.0 起改由「访问控制」统一管理（面板里可生成/重置 Token），此项仍兼容：
+# 设置了就作为一枚额外有效的 Token，适合不想改客户端的环境变量部署。
 API_KEY = os.environ.get("API_KEY", "").strip()
+
+# ---------------------------------------------------------------------------
+# 访问控制（v1.5.0）
+#
+# - 面板：需要登录密码才能进入，登录后可在「设置」改密码、开关鉴权、生成 Token
+# - API ：启用后必须带 Authorization: Bearer <token>（或 X-API-Key / ?token=）
+# 上面的值只是**首次初始化时的种子**，之后以数据库 settings 表为准（面板可改）。
+# ---------------------------------------------------------------------------
+AUTH_ENABLED = os.environ.get("AUTH_ENABLED", "true").lower() == "true"
+# 首次启动写入的管理面板密码（务必登录后改掉）
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "666666").strip() or "666666"
+# 登录会话有效期（天）
+SESSION_TTL_DAYS = int(os.environ.get("SESSION_TTL_DAYS", "7"))
+# 登录失败锁定：连续失败 N 次锁 M 分钟（防六位默认密码被爆破）
+LOGIN_MAX_FAILS = int(os.environ.get("LOGIN_MAX_FAILS", "5"))
+LOGIN_LOCK_MINUTES = int(os.environ.get("LOGIN_LOCK_MINUTES", "5"))

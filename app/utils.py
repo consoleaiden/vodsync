@@ -1,10 +1,11 @@
 """
-工具函数：播放地址解析、API Key 校验、分页参数处理。
+工具函数：播放地址解析、分页参数处理。
+
+注：API Key 校验 v1.5.0 起统一收敛到 app/auth.py（支持多 Token、会话、开关）。
 """
-import hmac
 import re
 
-from fastapi import Header, HTTPException, Query
+from fastapi import HTTPException, Query
 
 from . import config
 
@@ -33,18 +34,6 @@ def parse_play_url(raw: str) -> list:
         if episodes:
             result.append({"name": f"线路{i + 1}", "episodes": episodes})
     return result
-
-
-def check_api_key(
-    x_api_key: str = Header(default=""),
-    apikey: str = Query(default=""),
-):
-    """可选的全局 API Key 鉴权：设置 API_KEY 环境变量后生效。"""
-    if not config.API_KEY:
-        return
-    supplied = x_api_key or apikey
-    if not supplied or not hmac.compare_digest(supplied, config.API_KEY):
-        raise HTTPException(status_code=401, detail="无效的 API Key")
 
 
 def page_params(

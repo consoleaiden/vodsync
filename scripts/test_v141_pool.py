@@ -31,6 +31,7 @@ os.environ["SOURCE_SYNC_CONCURRENCY"] = "2"
 os.environ["DB_POOL_SIZE"] = "10"
 os.environ["DB_MAX_OVERFLOW"] = "20"
 os.environ["DB_POOL_TIMEOUT"] = "10"
+os.environ["AUTH_ENABLED"] = "false"   # 测试只关心业务逻辑，关掉鉴权
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

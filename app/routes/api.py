@@ -12,16 +12,123 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+
 from sqlalchemy import func, select, text
 
-from .. import config, database
+from .. import auth, config, database
 from ..models import build_vod_table, sources, sync_logs
 from ..syncer import ensure_table, refresh_sources, sync_all, sync_source
-from ..utils import check_api_key, page_params, parse_play_url, validate_slug
+from ..utils import page_params, parse_play_url, validate_slug
 
 log = logging.getLogger("vodsync.api")
-router = APIRouter(dependencies=[Depends(check_api_key)])
+# 鉴权统一由 main.py 的 _auth_guard 中间件处理（Token / 会话 cookie / 开关），
+# 这里不再挂路由级依赖；/api/v1/auth/* 中的 login 与 state 由中间件按白名单放行。
+router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# 访问控制：登录 / 登出 / 改密码 / 开关 / Token
+# ---------------------------------------------------------------------------
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    return (fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "unknown"))
+
+
+def _set_session_cookie(response: Response) -> None:
+    response.set_cookie(
+        auth.COOKIE,
+        auth.make_session(),
+        max_age=config.SESSION_TTL_DAYS * 86400,
+        httponly=True,       # JS 读不到，降低 XSS 窃取风险
+        samesite="lax",
+        path="/",
+    )
+
+
+@router.post("/api/v1/auth/login", summary="管理面板登录")
+def auth_login(payload: dict, request: Request, response: Response):
+    ip = _client_ip(request)
+    wait = auth.login_lock_seconds(ip)
+    if wait:
+        raise HTTPException(
+            status_code=429,
+            detail=f"尝试次数过多，请 {wait} 秒后再试",
+            headers={"Retry-After": str(wait)},
+        )
+
+    if not auth.verify_password((payload or {}).get("password", "")):
+        left = auth.note_login_fail(ip)
+        time.sleep(0.25)   # 拖慢脚本爆破
+        detail = "密码错误" if left else f"密码错误次数过多，请 {config.LOGIN_LOCK_MINUTES} 分钟后再试"
+        raise HTTPException(status_code=401, detail=detail)
+
+    auth.reset_login_fail(ip)
+    _set_session_cookie(response)
+    return {"ok": True, "enabled": auth.is_enabled()}
+
+
+@router.post("/api/v1/auth/logout", summary="退出登录")
+def auth_logout(response: Response):
+    response.delete_cookie(auth.COOKIE, path="/")
+    return {"ok": True}
+
+
+@router.get("/api/v1/auth/state", summary="鉴权状态（登录页/面板启动时用）")
+def auth_state(request: Request):
+    return {
+        "enabled": auth.is_enabled(),
+        "logged_in": auth.has_session(request) or not auth.is_enabled(),
+        "has_token": bool(auth.get_token()),
+        "token_hint": auth.token_hint(),
+        "password_changed_at": auth.password_changed_at(),
+        "token_created_at": auth.token_created_at(),
+    }
+
+
+@router.post("/api/v1/auth/password", summary="修改管理面板密码")
+def auth_change_password(payload: dict, response: Response):
+    payload = payload or {}
+    old, new = payload.get("old", ""), payload.get("new", "")
+    if not auth.verify_password(old):
+        raise HTTPException(status_code=400, detail="当前密码不正确")
+    if len(new or "") < 6:
+        raise HTTPException(status_code=400, detail="新密码至少 6 位")
+    if new == old:
+        raise HTTPException(status_code=400, detail="新密码不能与当前密码相同")
+    auth.set_password(new)
+    _set_session_cookie(response)   # 密码指纹变了，旧会话失效，这里补发新会话
+    log.info("管理面板密码已修改")
+    return {"ok": True}
+
+
+@router.post("/api/v1/auth/settings", summary="启用/关闭授权访问")
+def auth_settings(payload: dict):
+    enabled = bool((payload or {}).get("enabled"))
+    was = auth.is_enabled()
+    auth.set_enabled(enabled)
+    token = None
+    if enabled and not was:
+        # 关闭期间任何人都能拿到旧 Token，启用时换一枚新的，避免"开着的门配着旧钥匙"
+        token = auth.rotate_token()
+    log.info("访问控制已%s", "启用" if enabled else "关闭")
+    return {"ok": True, "enabled": enabled, "token": token}
+
+
+@router.get("/api/v1/auth/token", summary="查看 API Token（需登录）")
+def auth_get_token():
+    return {
+        "token": auth.get_token(),
+        "created_at": auth.token_created_at(),
+    }
+
+
+@router.post("/api/v1/auth/token", summary="重置 API Token（旧 Token 立即失效）")
+def auth_rotate_token():
+    return {
+        "token": auth.rotate_token(),
+        "created_at": auth.token_created_at(),
+    }
 
 
 # ---------------------------------------------------------------------------

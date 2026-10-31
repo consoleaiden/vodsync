@@ -145,6 +145,8 @@
   <span class="spacer"></span>
   <label class="switch"><input type="checkbox" id="autoRefresh" checked> 每 5 秒自动刷新</label>
   <button class="sm" id="btnReload">立即刷新</button>
+  <button class="sm" id="btnSettings">⚙ 设置</button>
+  <button class="sm" id="btnLogout" style="display:none">退出登录</button>
 </header>
 
 <main>
@@ -271,12 +273,10 @@ async function api(path, opts = {}) {
   if (k) headers["X-API-Key"] = k;
   const res = await fetch(path, Object.assign({}, opts, { headers }));
   if (res.status === 401) {
-    const input = window.prompt("该服务已启用 API Key，请输入访问密钥：", k);
-    if (input) {
-      localStorage.setItem("vodsync_key", input.trim());
-      return api(path, opts);
-    }
-    throw new Error("未授权（缺少 API Key）");
+    // 会话过期或未登录：直接去登录页，登录后回到当前页面
+    const next = encodeURIComponent(location.pathname + location.search);
+    location.href = "/login?next=" + next;
+    throw new Error("登录状态已失效，正在跳转登录页…");
   }
   if (!res.ok) {
     let detail = res.statusText;
@@ -717,6 +717,151 @@ function openModal(title, bodyHtml) {
   document.body.appendChild(mask);
 }
 
+// ---------------- 访问控制（v1.5.0：密码登录 + API Token） ----------------
+let authState = { enabled: false, logged_in: true, has_token: false, token_hint: "" };
+
+async function loadAuthState() {
+  try {
+    authState = await api("/api/v1/auth/state");
+  } catch (e) {
+    return;
+  }
+  $("#btnLogout").style.display = authState.enabled ? "" : "none";
+}
+
+const INPUT_CSS = "width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;outline:none";
+
+function _jsonPost(path, body) {
+  return api(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+}
+
+function openSettings() {
+  const mask = document.createElement("div");
+  mask.className = "modal-mask";
+  mask.innerHTML = `
+  <div class="modal" style="width:min(560px,100%)">
+    <h3>访问控制</h3>
+    <div class="kv">面板登录密码 · API Token · 是否启用授权</div>
+
+    <div style="display:flex;align-items:center;gap:10px;margin:16px 0 6px">
+      <label class="switch" style="font-size:13px;color:var(--text)">
+        <input type="checkbox" id="swAuth"> 启用授权访问
+      </label>
+      <span class="badge" id="swState">-</span>
+    </div>
+    <div style="color:var(--muted);font-size:12px;line-height:1.75">
+      开启后：面板需登录；API 必须携带
+      <code>Authorization: Bearer &lt;token&gt;</code>（也支持 <code>X-API-Key</code> 头或 <code>?token=</code> 参数）。
+      开启的瞬间会自动更换 Token —— 关闭期间谁都能取到旧 Token，换掉才安全。
+    </div>
+
+    <hr style="border:none;border-top:1px solid var(--line);margin:16px 0">
+    <div style="font-weight:600;font-size:13px;margin-bottom:8px">API Token</div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input id="tokVal" readonly placeholder="（未生成）"
+             style="${INPUT_CSS};font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">
+      <button class="sm" id="btnCopy">复制</button>
+      <button class="sm warn" id="btnRotate">重新生成</button>
+    </div>
+    <div style="color:var(--muted);font-size:12px;margin-top:6px" id="tokMeta"></div>
+
+    <hr style="border:none;border-top:1px solid var(--line);margin:16px 0">
+    <div style="font-weight:600;font-size:13px;margin-bottom:8px">修改管理密码</div>
+    <div style="display:grid;gap:8px">
+      <input id="pwOld" type="password" autocomplete="current-password" placeholder="当前密码" style="${INPUT_CSS}">
+      <input id="pwNew" type="password" autocomplete="new-password" placeholder="新密码（至少 6 位）" style="${INPUT_CSS}">
+      <input id="pwNew2" type="password" autocomplete="new-password" placeholder="确认新密码" style="${INPUT_CSS}">
+      <div><button class="primary" id="btnPw">保存新密码</button></div>
+    </div>
+
+    <div style="margin-top:18px;text-align:right"><button data-close>关闭</button></div>
+  </div>`;
+  document.body.appendChild(mask);
+  mask.addEventListener("click", (e) => {
+    if (e.target === mask || e.target.hasAttribute("data-close")) mask.remove();
+  });
+
+  const q = (sel) => mask.querySelector(sel);
+  const tokVal = q("#tokVal");
+  const sw = q("#swAuth");
+  const stateBadge = q("#swState");
+
+  sw.checked = !!authState.enabled;
+  stateBadge.textContent = authState.enabled ? "已启用" : "未启用";
+  stateBadge.className = "badge " + (authState.enabled ? "ok" : "mute");
+
+  api("/api/v1/auth/token").then((t) => {
+    tokVal.value = t.token || "";
+    q("#tokMeta").textContent = t.created_at ? "生成于 " + t.created_at : "";
+  }).catch(() => {});
+
+  sw.addEventListener("change", async () => {
+    sw.disabled = true;
+    try {
+      const r = await _jsonPost("/api/v1/auth/settings", { enabled: sw.checked });
+      authState.enabled = r.enabled;
+      stateBadge.textContent = r.enabled ? "已启用" : "未启用";
+      stateBadge.className = "badge " + (r.enabled ? "ok" : "mute");
+      $("#btnLogout").style.display = r.enabled ? "" : "none";
+      if (r.token) tokVal.value = r.token;
+      toast(r.enabled ? "已启用授权访问（Token 已自动更换）" : "已关闭授权访问：接口不再校验 Token");
+    } catch (e) {
+      sw.checked = !sw.checked;
+      toast(e.message, true);
+    } finally {
+      sw.disabled = false;
+    }
+  });
+
+  q("#btnCopy").addEventListener("click", async () => {
+    if (!tokVal.value) return toast("还没有 Token", true);
+    try {
+      await navigator.clipboard.writeText(tokVal.value);
+      toast("Token 已复制");
+    } catch (e) {
+      tokVal.select();
+      document.execCommand("copy");
+      toast("Token 已复制");
+    }
+  });
+
+  q("#btnRotate").addEventListener("click", async () => {
+    if (!confirm("重新生成后旧 Token 立即失效，已配置的客户端需要同步更新。继续？")) return;
+    try {
+      const r = await _jsonPost("/api/v1/auth/token", {});
+      tokVal.value = r.token;
+      q("#tokMeta").textContent = r.created_at ? "生成于 " + r.created_at : "";
+      toast("已生成新 Token");
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  q("#btnPw").addEventListener("click", async () => {
+    const oldPw = q("#pwOld").value, a = q("#pwNew").value, b = q("#pwNew2").value;
+    if (!oldPw) return toast("请输入当前密码", true);
+    if (a.length < 6) return toast("新密码至少 6 位", true);
+    if (a !== b) return toast("两次输入的新密码不一致", true);
+    try {
+      await _jsonPost("/api/v1/auth/password", { old: oldPw, new: a });
+      q("#pwOld").value = q("#pwNew").value = q("#pwNew2").value = "";
+      toast("密码已修改，其他设备上的登录已失效");
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+}
+
+$("#btnSettings").addEventListener("click", openSettings);
+$("#btnLogout").addEventListener("click", async () => {
+  try { await _jsonPost("/api/v1/auth/logout", {}); } catch (e) {}
+  location.href = authState.enabled ? "/login" : "/";
+});
+
 // ---------------- 刷新循环 ----------------
 let timer = null;
 async function refreshAll() {
@@ -730,8 +875,16 @@ function schedule() {
 }
 $("#autoRefresh").addEventListener("change", schedule);
 
-refreshAll();
-schedule();
+async function boot() {
+  await loadAuthState();
+  if (authState.enabled && !authState.logged_in) {
+    location.replace("/login?next=" + encodeURIComponent(location.pathname + location.search));
+    return;
+  }
+  await refreshAll();
+  schedule();
+}
+boot();
 </script>
 </body>
 </html>

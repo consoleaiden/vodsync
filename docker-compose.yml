@@ -36,6 +36,12 @@ services:
       # ---- 数据库 ----
       # 默认 SQLite（推荐），如需 PostgreSQL：迁移完成后再解开下行
       # DATABASE_URL: "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync"
+      # ---- 访问控制（v1.5.0）：面板登录 + API Token ----
+      AUTH_ENABLED: "true"                 # 首次启动写入数据库，之后在面板「⚙ 设置」里改
+      ADMIN_PASSWORD: "666666"             # 首次启动的面板密码，登录后请改掉
+      SESSION_TTL_DAYS: "7"                # 登录会话有效期（天）
+      # 兼容项：设置后作为一枚额外有效的 API Token
+      # API_KEY: ""
       # ---- API ----
       API_PAGE_SIZE_DEFAULT: "20"
       API_KEY: ""                          # 留空不鉴权；设置后请求需带 X-API-Key 头

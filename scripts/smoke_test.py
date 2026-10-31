@@ -4,6 +4,7 @@ import os
 # 必须在导入 app 之前设置：避免测试期间触发全量同步
 os.environ["FULL_SYNC_ON_DISCOVER"] = "false"
 os.environ["DATA_DIR"] = os.path.join(os.path.dirname(__file__), "..", "data-test")
+os.environ["AUTH_ENABLED"] = "false"   # 测试只关心业务逻辑，关掉鉴权
 
 import sys
 import time

@@ -12,7 +12,7 @@
 - **Web 管理面板**：浏览器看同步进度、手动触发同步、跨源聚合搜索，单文件零依赖
 - **聚合搜索**：跨全部源站按名称并行搜索（线程池 + 内存归并），单源失败隔离
 - **中转代理降级**：源站直连不可达/被风控时，自动按顺序切到 API 中转代理取数（可配多个，成功后记忆 30 分钟）
-- **可选鉴权**：设置 `API_KEY` 后所有接口需携带 `X-API-Key`
+- **访问控制**：面板密码登录（默认 `666666`）+ API Token，可一键开关；Token 可在面板生成/重置
 - **多数据库**：默认 SQLite（WAL），一行环境变量切换 PostgreSQL
 
 ## 技术选型说明
@@ -57,7 +57,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 面板每 5 秒自动刷新（可关闭），页面切换后台时自动暂停，避免占资源。
 
-> 若设置了 `API_KEY`，面板首次请求会弹窗要求输入密钥，输入后保存在浏览器 localStorage。
+> 面板默认需要密码登录（默认 `666666`）。登录后右上「⚙ 设置」可改密码、复制/重置 API Token、开关访问控制。
 
 ## API 一览
 
@@ -218,6 +218,47 @@ GET /api/v1/{slug}?ac=detail&ids=1,2,3 # 按 ID 批量取详情
 }
 ```
 
+## 访问控制（v1.5.0）
+
+服务默认开启访问控制，两层：
+
+| 层 | 保护对象 | 凭证 |
+|---|---|---|
+| 面板登录 | `/` 面板页面、`/docs` | 管理密码（默认 `666666`，存在 `settings` 表里，PBKDF2 哈希） |
+| API Token | 全部 `/api/v1/*`（`/healthz` 与 `/api/v1/auth/*` 除外） | `vs_` 开头的 Token，请求头 `Authorization: Bearer <token>` |
+
+三处入口：
+
+```bash
+# 1) 面板：浏览器打开 http://<IP>:8181/ → 输入密码 → 右上「⚙ 设置」
+#    可改密码、复制 Token、重新生成 Token、开关访问控制
+
+# 2) 命令行拿 Token
+curl -c ck.txt -X POST http://<IP>:8181/api/v1/auth/login \
+     -H 'Content-Type: application/json' -d '{"password":"666666"}'
+curl -b ck.txt http://<IP>:8181/api/v1/auth/token
+
+# 3) 用 Token 调接口
+curl -H "Authorization: Bearer vs_xxx..." "http://<IP>:8181/api/v1/videos?source=jkun&page=1"
+curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方便加请求头时
+```
+
+要点：
+
+- **开关**：面板「设置」里关闭后，`/api/v1/*` 不再校验 Token（面板也免登录）；重新开启时**自动更换 Token**
+  —— 关闭期间谁都能读到旧 Token，不换等于没关。
+- **改密码**：所有设备上的旧登录会话立即失效（会话签名里带密码指纹），当前页面会自动续期。
+- **防爆破**：连续输错 5 次锁定 5 分钟（按 IP 计），六位默认密码不至于被脚本刷开。
+- **忘记密码**：删掉数据库里的那行密码哈希再重启，即恢复成 `ADMIN_PASSWORD`（默认 `666666`）：
+  ```bash
+  # SQLite
+  docker compose stop vodsync && sqlite3 data/vodsync.db "delete from settings where key='admin_password_hash'"
+  # PostgreSQL
+  docker exec vodsync-pg psql -U vodsync -d vodsync -c "delete from settings where key='admin_password_hash'"
+  docker compose up -d
+  ```
+- 兼容：`API_KEY` 环境变量仍可作为一枚额外 Token 使用（老客户端不必改配置就能继续跑，只要它带的 Key 与之一致）。
+
 ## 配置项（环境变量）
 
 完整列表见 [.env.example](.env.example)，关键项：
@@ -238,7 +279,11 @@ GET /api/v1/{slug}?ac=detail&ids=1,2,3 # 按 ID 批量取详情
 | `DB_POOL_TIMEOUT` | 10 | 等连接的秒数，超时返回 503（不是 500） |
 | `SEARCH_CONCURRENCY` | 4 | 聚合搜索的并行度（每线程占一个连接） |
 | `DATABASE_URL` | SQLite | 切 PostgreSQL：`postgresql+psycopg2://user:pass@host:5432/db` |
-| `API_KEY` | 空 | 设置后接口需带 `X-API-Key` 头 |
+| `AUTH_ENABLED` | true | 访问控制初始开关（首次启动写入数据库，之后以面板设置为准） |
+| `ADMIN_PASSWORD` | 666666 | 首次启动的管理面板密码，登录后请改掉 |
+| `SESSION_TTL_DAYS` | 7 | 面板登录会话有效期（天） |
+| `LOGIN_MAX_FAILS` / `LOGIN_LOCK_MINUTES` | 5 / 5 | 连续登录失败锁定策略 |
+| `API_KEY` | 空 | 兼容项：设置后作为一枚额外有效的 Token |
 | `ONLY_OK_SOURCES` | true | 只同步在线源站 |
 
 ## 从 SQLite 迁移到 PostgreSQL（不需要重新同步）
@@ -571,3 +616,17 @@ vodsync/
   - 迁移后自动校验：表齐全性、行数一致、关键字段逐行比对
 - 镜像内包含迁移脚本，可直接 `docker run --entrypoint python .../migrate_sqlite_to_pg.py`
 - 测试：`scripts/test_migration.py`（42 项：跨批翻页、字段保真、幂等、替换、过滤、dry-run、错误提示）
+
+### v1.5.0
+- 新增**访问控制**：面板密码登录 + API Token，防止接口被公网滥用
+  - `settings` 表（key/value，启动自动建）：`auth_enabled` / `admin_password_hash` / `api_token` / `session_secret`
+  - 面板登录：默认密码 `666666`，PBKDF2-SHA256（20 万轮 + 随机盐），HttpOnly 签名会话 cookie（默认 7 天）
+  - 改密码后所有旧会话立即失效（签名携带密码指纹）；连续失败 5 次锁 5 分钟
+  - API Token：`Authorization: Bearer` / `X-API-Key` / `?token=` 三种带法；面板可复制、重置
+  - 开关：可随时关闭（`enabled=false` 时接口不校验），重新开启时自动更换 Token
+  - `/healthz` 与 `/api/v1/auth/*` 永远免鉴权；`/` 未登录时 303 跳 `/login`
+  - 兼容旧的 `API_KEY` 环境变量（作为额外 Token）
+- 新增接口：`POST /api/v1/auth/{login,logout,password,settings,token}`、`GET /api/v1/auth/{state,token}`
+- 新增页面：`/login`（登录页），面板右上「⚙ 设置」抽屉（改密码 / Token / 开关 / 退出登录）
+- 测试：`scripts/test_v150_auth.py`（40 项：默认密码、三种 Token 带法、登录跳转、锁定、改密失效、开关换 Token、开放重定向防护）
+- 版本号 1.4.2 → 1.5.0

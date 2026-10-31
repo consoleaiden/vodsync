@@ -17,18 +17,22 @@
 | 编码 | UTF-8。中文参数务必 URL 编码（浏览器/fetch 自动处理；命令行用 `--data-urlencode`） |
 | OpenAPI | 服务自带机器可读规范：`GET /openapi.json`（Swagger UI 在 `/docs`），AI 工具可直接据此生成客户端代码 |
 
-### 1.1 鉴权（可选）
+### 1.1 鉴权（v1.5.0 起：API Token）
 
-服务端设置环境变量 `API_KEY` 后，**所有接口**都需要鉴权，两种传递方式任选：
+服务端默认启用访问控制：除 `GET /healthz` 与 `/api/v1/auth/*` 外，所有接口都要带 Token，三种带法任选：
 
 ```
-请求头:  X-API-Key: <你的KEY>
-或参数:  ?apikey=<你的KEY>      （适合无法自定义请求头的场景，如 <img>、播放器内核）
+请求头:  Authorization: Bearer vs_xxxxx      ← 推荐
+请求头:  X-API-Key: vs_xxxxx                 ← 兼容旧客户端
+或参数:  ?token=vs_xxxxx                     ← 无法自定义请求头的场景（<img>、播放器内核）
 ```
 
-未设置 `API_KEY` 时无需鉴权。鉴权失败返回 `401 {"detail":"无效的 API Key"}`。
+Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token；或调 `GET /api/v1/auth/token`（需登录会话）。
 
-> 判断是否启用鉴权：调 `GET /healthz`，返回 200 即当前无需 Key；返回 401 说明已启用。
+鉴权失败返回 `401 {"detail":"未授权：请求头需携带 Authorization: Bearer <token>..."}`。
+
+> 判断是否启用鉴权：调 `GET /api/v1/auth/state`，`{"enabled":true}` 即已启用。
+> `/healthz` **永远返回 200**（容器健康检查用），不能用它判断鉴权状态。
 
 ### 1.2 统一响应结构
 
@@ -279,7 +283,7 @@ GET /api/v1/jkun?ac=list&wd=三体     # 搜索
 ### 3.7 管理接口详情
 
 #### GET `/healthz`
-`{"status":"ok","time":"..."}`；已启用 API Key 时同样需带 Key（可用它探测鉴权状态）。
+`{"status":"ok","time":"..."}`；**免鉴权**（容器健康检查用），不反映业务状态。
 
 #### GET `/api/v1/stats`
 ```json
@@ -481,4 +485,4 @@ POST /api/v1/sources/auto-sync?enabled=true&slugs=jkun,t1  # 只开启指定站
 
 ---
 
-*文档版本：对应服务 v1.4.1。字段如有增补，以 `/docs`（Swagger）与 `/openapi.json` 为准；完整交付版见 [`API_SPEC_FOR_AI.md`](./API_SPEC_FOR_AI.md)。*
+*文档版本：对应服务 v1.5.0。字段如有增补，以 `/docs`（Swagger）与 `/openapi.json` 为准；完整交付版见 [`API_SPEC_FOR_AI.md`](./API_SPEC_FOR_AI.md)。*

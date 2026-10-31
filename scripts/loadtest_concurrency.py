@@ -86,6 +86,7 @@ def main():
     # ---- 建库 + 注册 N_SOURCES 个指向桩源站的源站 ----
     os.environ["DATA_DIR"] = data_dir
     os.environ["FULL_SYNC_ON_DISCOVER"] = "false"
+os.environ["AUTH_ENABLED"] = "false"   # 测试只关心业务逻辑，关掉鉴权
     from app import database, syncer
     from app.models import sources
 

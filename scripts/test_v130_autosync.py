@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="vodsync-test-")
 os.environ["DATABASE_URL"] = "sqlite:///" + os.path.join(os.environ["DATA_DIR"], "test.db")
+os.environ["AUTH_ENABLED"] = "false"   # 测试只关心业务逻辑，关掉鉴权
 
 passed = failed = 0
 

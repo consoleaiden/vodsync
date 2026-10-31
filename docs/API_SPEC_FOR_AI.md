@@ -3,7 +3,7 @@
 > **本文档的用途**：把 VodSync 服务作为后端，交由 AI（或 AI 编程助手）开发客户端 App。
 > 文档自包含：只读本文即可完成全部对接，**不需要**阅读服务端源码。
 >
-> 对应服务版本：**v1.4.1** ｜ 文档版本：`2026-10-31` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.5.0** ｜ 文档版本：`2026-10-31` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 **目录**
 
@@ -13,7 +13,7 @@
 | [1](#1-服务能提供什么) | 服务能力概览 |
 | [2](#2-通用约定) | 鉴权 / 响应格式 / 错误码 / 分页 / 编码 |
 | [3](#3-数据模型字段字典) | 数据模型与字段字典 |
-| [4](#4-接口参考) | 22 个接口逐一说明 |
+| [4](#4-接口参考) | 29 个接口逐一说明 |
 | [5](#5-状态语义与推荐-ui最容易做错的部分) | 状态语义与推荐 UI（running / syncing / paused / auto_sync） |
 | [6](#6-端到端流程可直接交给-ai-实现) | 端到端流程（观影 App / 管理 App） |
 | [7](#7-客户端代码骨架) | 客户端代码骨架（TS / Kotlin / Flutter / Swift） |
@@ -60,26 +60,45 @@ VodSync 聚合了上游多个「苹果 CMS（MacCMS）」资源站的影视数�
 
 ## 2. 通用约定
 
-### 2.1 鉴权（可选）
+### 2.1 鉴权（v1.5.0 起：登录密码 + API Token）
 
-服务端若设置了环境变量 `API_KEY`，**所有接口**（含 `/healthz`）都需要携带密钥，二选一：
+服务端默认启用访问控制。**客户端只需要一枚 API Token**：除了 `/healthz` 和 `/api/v1/auth/*`，
+所有接口都必须带上它，三种带法任选其一：
 
 ```http
-X-API-Key: <你的KEY>
+Authorization: Bearer vs_xxxxxxxxxxxxxxxxxxxxxxxxxxxx      # 推荐
 ```
+```http
+X-API-Key: vs_xxxxxxxxxxxxxxxxxxxxxxxxxxxx                 # 兼容旧客户端
 ```
-?apikey=<你的KEY>          # 适合不能自定义请求头的场景（<img>、播放器内核、iframe）
+```http
+?token=vs_xxxxxxxxxxxxxxxxxxxxxxxxxxxx                     # 不能自定义请求头的场景（<img>、播放器内核）
 ```
 
-未设置 `API_KEY` 时无需鉴权。判断方式：
+**Token 从哪来**（部署方一次性给出，客户端存本地配置即可）：
+
+1. 浏览器打开管理面板 → 右上「⚙ 设置」→ 复制「API Token」；
+2. 或者用接口取（需要面板登录会话）：
 
 ```bash
-curl -i http://<host>:8000/healthz     # 200 → 未启用鉴权；401 → 已启用
+curl -c ck.txt -X POST http://<host>:8181/api/v1/auth/login \
+     -H 'Content-Type: application/json' -d '{"password":"666666"}'
+curl -b ck.txt http://<host>:8181/api/v1/auth/token
+# {"token":"vs_...","created_at":"2026-10-31T16:19:14"}
 ```
 
-鉴权失败：`401 {"detail":"无效的 API Key"}`。
+**判断服务端当前有没有开鉴权**（`/healthz` 永远 200，不能用它判断）：
 
-> **安全提醒**：管理接口与数据接口共用同一把 Key，没有独立权限体系。App 面向公网时，管理接口应放到反代鉴权之后，不要把 Key 打进客户端安装包。
+```bash
+curl -s http://<host>:8181/api/v1/auth/state
+# {"enabled":true,"logged_in":false,"has_token":true,"token_hint":"vs_HYgS…u51c",...}
+```
+
+鉴权失败：`401 {"detail":"未授权：请求头需携带 Authorization: Bearer <token>..."}`。
+面板里关闭访问控制后，`enabled=false`，此时不带 Token 也能调通。
+
+> **安全提醒**：数据接口与管理接口共用同一枚 Token，没有分权。App 面向公网时，把写接口
+> （触发同步 / 暂停 / 刷新源站）放在反向代理鉴权之后；Token 不要打进公开发布的安装包——它能被提取。
 
 ### 2.2 统一响应与错误
 
@@ -105,7 +124,7 @@ curl -i http://<host>:8000/healthz     # 200 → 未启用鉴权；401 → 已�
 |---|---|---|
 | 200 | 成功 | — |
 | 400 | 参数语义错误 | `ids` 非数字、`slug` 非法、搜索关键词为空 |
-| 401 | 缺少/错误 API Key | 服务端已启用鉴权 |
+| 401 | 未授权：Token 缺失 / 错误 / 已被重置 | 服务端启用了访问控制（`/api/v1/auth/state` 查 `enabled`） |
 | 404 | 资源不存在 | 源站不存在、视频未入库、源站尚未同步数据、ids 全部未命中 |
 | 422 | 参数校验失败（类型/范围） | `page=0`、`page_size=1000`、`scope` 取值不在枚举内 |
 | 503 | 服务临时过载（**可重试**） | 数据库连接池排队超时 / 数据库写锁忙。响应带 `Retry-After: 5` |
@@ -214,7 +233,7 @@ type PlayLine = {
 
 | # | 方法 | 路径 | 分类 | 用途 |
 |---|---|---|---|---|
-| 1 | GET | `/healthz` | 基础 | 健康检查 / 探测是否需要 Key |
+| 1 | GET | `/healthz` | 基础 | 健康检查（免鉴权，恒 200） |
 | 2 | GET | `/source` | 数据 | 源站清单（App 初始化） |
 | 3 | GET | `/api/v1/categories` | 数据 | 分类清单 |
 | 4 | GET | `/api/v1/videos` | 数据 | 列表 / 分类浏览 / 批量详情 |
@@ -236,6 +255,16 @@ type PlayLine = {
 | 20 | POST | `/api/v1/sources/auto-sync` | 管理 | 批量自动同步开关 |
 | 21 | GET | `/api/v1/logs` | 管理 | 最近同步日志 |
 | 22 | POST | `/api/v1/maintenance/recount` | 管理 | 条数校准 |
+| 23 | POST | `/api/v1/auth/login` | 鉴权 | 面板登录（换会话 cookie） |
+| 24 | POST | `/api/v1/auth/logout` | 鉴权 | 退出登录 |
+| 25 | GET | `/api/v1/auth/state` | 鉴权 | 是否启用鉴权 / 是否已登录（免鉴权） |
+| 26 | POST | `/api/v1/auth/password` | 鉴权 | 修改面板密码 |
+| 27 | POST | `/api/v1/auth/settings` | 鉴权 | 开关访问控制（开启时自动换 Token） |
+| 28 | GET | `/api/v1/auth/token` | 鉴权 | 读取当前 Token（需登录） |
+| 29 | POST | `/api/v1/auth/token` | 鉴权 | 重置 Token（旧 Token 立即失效） |
+
+> 第 23–29 项是**管理面板自己用的**，客户端 App 只需要 Token（见 2.1），不必实现这些接口。
+> `/api/v1/auth/login` 与 `/api/v1/auth/state` 免鉴权，其余四项需要登录会话 cookie。
 
 ---
 
@@ -871,7 +900,7 @@ POST /api/v1/sources/auto-sync?enabled=true&slugs=jkun,t1 # 指定多站开启
 
 ```ts
 const BASE = "http://192.168.1.10:8000";           // 由配置注入
-const KEY = "";                                    // 服务端未启用鉴权时留空
+const TOKEN = "vs_xxxxxxxxxxxxxxxxxxxxxxxxxxxx";   // 面板「⚙ 设置」里复制；关闭鉴权时可为空
 
 type Params = Record<string, string | number | boolean | undefined>;
 
@@ -882,7 +911,7 @@ async function request<T>(path: string, params: Params = {}, init: RequestInit =
   }
   const url = `${BASE}${path}${qs.toString() ? `?${qs}` : ""}`;
   const headers: Record<string, string> = { ...(init.headers as any) };
-  if (KEY) headers["X-API-Key"] = KEY;
+  if (TOKEN) headers["Authorization"] = `Bearer ${TOKEN}`;
   const res = await fetch(url, { ...init, headers });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
@@ -950,11 +979,13 @@ interface VodSyncApi {
     suspend fun search(@Query("wd") wd: String, @Query("page") page: Int = 1): SearchResponse
 }
 
-// OkHttp 拦截器统一加鉴权头
-class AuthInterceptor(private val key: String) : Interceptor {
+// OkHttp 拦截器统一加鉴权头（v1.5.0 起用 Bearer Token）
+class AuthInterceptor(private val token: String) : Interceptor {
     override fun intercept(chain: Interceptor.Chain): Response =
-        if (key.isEmpty()) chain.proceed(chain.request())
-        else chain.proceed(chain.request().newBuilder().addHeader("X-API-Key", key).build())
+        if (token.isEmpty()) chain.proceed(chain.request())
+        else chain.proceed(
+            chain.request().newBuilder().addHeader("Authorization", "Bearer $token").build()
+        )
 }
 ```
 
@@ -963,7 +994,7 @@ class AuthInterceptor(private val key: String) : Interceptor {
 ```dart
 final dio = Dio(BaseOptions(
   baseUrl: "http://192.168.1.10:8000",
-  headers: {"X-API-Key": ""},   // 未启用鉴权时留空
+  headers: {"Authorization": "Bearer <你的Token>"},   // 关闭鉴权时可留空
   connectTimeout: const Duration(seconds: 10),
   receiveTimeout: const Duration(seconds: 30),
 ));
@@ -999,7 +1030,7 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
         .init(name: "page_size", value: "20")
     ]
     var req = URLRequest(url: comps.url!)
-    req.setValue("", forHTTPHeaderField: "X-API-Key")   // 未启用鉴权时不设置
+    req.setValue("Bearer <你的Token>", forHTTPHeaderField: "Authorization")
     let (data, resp) = try await URLSession.shared.data(for: req)
     guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
         throw URLError(.badServerResponse)
@@ -1064,7 +1095,11 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `API_KEY` | 空 | 设置后全站启用鉴权 |
+| `AUTH_ENABLED` | true | 首次启动写入数据库的初始开关（之后以面板设置为准） |
+| `ADMIN_PASSWORD` | 666666 | 首次启动的管理面板密码（登录后请改掉） |
+| `SESSION_TTL_DAYS` | 7 | 面板登录会话有效期（天） |
+| `LOGIN_MAX_FAILS` / `LOGIN_LOCK_MINUTES` | 5 / 5 | 连续登录失败 N 次锁 M 分钟 |
+| `API_KEY` | 空 | 兼容项：设置后作为一枚额外有效的 Token |
 | `API_PAGE_SIZE_DEFAULT` / `API_PAGE_SIZE_MAX` | 20 / 100 | 分页默认值与上限（客户端可从这里读取实际值） |
 | `SYNC_INTERVAL_MINUTES` | 360 | 定时增量间隔（分钟） |
 | `SOURCE_REFRESH_INTERVAL_MINUTES` | 720 | 源站列表刷新间隔（分钟） |

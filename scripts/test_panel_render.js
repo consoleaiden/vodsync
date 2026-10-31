@@ -34,6 +34,15 @@ global.document = {
   querySelector: (sel) => el(sel), querySelectorAll: () => [],
 };
 global.window = { confirm: () => false, prompt: () => "", location: {}, addEventListener() {} };
+// v1.5.0 起面板会用 location 做登录跳转，桩里补上（避免 "location is not defined"）
+global.location = {
+  pathname: "/", search: "", href: "/", hash: "",
+  replace(u) { this.href = u; },
+  assign(u) { this.href = u; },
+  reload() {},
+};
+global.window.location = global.location;
+global.navigator = { clipboard: { writeText: async () => {} } };
 global.localStorage = { getItem: () => "", setItem: () => {} };
 const realFetch = global.fetch;
 global.fetch = (url, opts) => realFetch(BASE + url, opts);
