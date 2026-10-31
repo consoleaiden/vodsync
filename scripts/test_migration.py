@@ -26,7 +26,7 @@ from datetime import datetime
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from sqlalchemy import create_engine, func, inspect, select  # noqa: E402
+from sqlalchemy import create_engine, func, inspect, select, text  # noqa: E402
 
 from app.models import META, build_vod_table, sources, sync_logs  # noqa: E402
 
@@ -258,11 +258,40 @@ def main():
         code6, out6 = run_quiet(mig.main, ["--source", src,
                                           "--target", "sqlite:///" + os.path.join(tmp, "nodir", "x.db")])
         check("不可达退出码 3", code6 == 3, f"exit={code6}")
-        check("给出排查清单", "PG 容器是否在运行" in out6, out6[-160:].replace("\n", " "))
+        check("给出排查清单", "docker ps" in out6 and "通用排查" in out6,
+              out6[-160:].replace("\n", " "))
+
+        print("[13] --repair 补齐中断的迁移（模拟 SSH 断线）")
+        tgt5 = os.path.join(tmp, "tgt5.db")
+        tgt5_url = f"sqlite:///{tgt5}"
+        run_quiet(mig.main, ["--source", src, "--target", tgt5_url, "--batch", "100"])
+        e5 = create_engine(tgt5_url, future=True)
+        # 破坏现场：alpha 只留前 120 行（模拟迁到一半断线），beta 全清空
+        with e5.begin() as c:
+            c.execute(text("DELETE FROM vod_alpha WHERE vod_id > 10119"))
+            c.execute(text("DELETE FROM vod_beta"))
+        check("破坏后 alpha = 120 行", count(e5, "vod_alpha") == 120, count(e5, "vod_alpha"))
+
+        code7, out7 = run_quiet(mig.main, ["--source", src, "--target", tgt5_url,
+                                           "--batch", "100", "--repair"])
+        check("repair 退出码 0", code7 == 0, f"exit={code7}\n{out7[-500:]}")
+        check("repair 后 alpha = 500", count(e5, "vod_alpha") == 500, count(e5, "vod_alpha"))
+        check("repair 后 beta = 4", count(e5, "vod_beta") == 4, count(e5, "vod_beta"))
+        check("repair 有「全部一致」", "全部一致" in out7, out7[-200:].replace("\n", " "))
+        check("repair 报告补了 2 张表", "补齐 2 张表" in out7, out7[-600:].replace("\n", " "))
+
+        # 再跑一次：没有差异时应直接说明「无需补齐」，且不改动数据
+        code8, out8 = run_quiet(mig.main, ["--source", src, "--target", tgt5_url, "--repair"])
+        check("二次 repair 退出码 0", code8 == 0, f"exit={code8}")
+        check("二次 repair 提示无需补齐", "无需补齐" in out8, out8[-200:].replace("\n", " "))
+        check("二次 repair 未改行数", count(e5, "vod_alpha") == 500)
+
+        check("repair 与 --verify 互斥", run_quiet(
+            mig.main, ["--source", src, "--target", tgt5_url, "--repair", "--verify"])[0] == 2)
 
         src_eng.dispose()
         tgt_eng.dispose()
-        for e in (e2, e4):
+        for e in (e2, e4, e5):
             e.dispose()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

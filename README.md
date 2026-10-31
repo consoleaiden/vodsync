@@ -289,9 +289,17 @@ sudo docker compose run --rm vodsync python /app/scripts/migrate_sqlite_to_pg.py
 
 # 2) 正式迁移（可重复执行，已存在的行按主键跳过）；同上命令去掉 --dry-run
 
+# 2.5) 迁移中途断了（SSH 掉线 / Ctrl+C / 容器重启）：一条命令补齐
+sudo docker compose run --rm vodsync python /app/scripts/migrate_sqlite_to_pg.py \
+  --target "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync" --repair
+
 # 3) 改 DATABASE_URL 并启动
 sudo docker compose up -d
 ```
+
+`--repair` 做三件事：逐表对比 SQLite 与 PG 的行数 → 只对缺数据的表重跑一遍（每批一个事务 + 主键冲突跳过，
+所以可反复执行、不会重复写入）→ 补建索引并重置序列，再整体复查一遍。中断过的迁移尤其需要它，
+因为「建索引」是所有数据写完后才做的，断在中途等于**一张索引都没建**（PG 查询会慢到不可用）。
 
 > 如果 PostgreSQL 装在别的机器（不在 compose 内网），把 target 换成那台机器的地址即可，例如
 > `postgresql+psycopg2://vodsync:vodsync@192.168.1.10:5432/vodsync`；此时用

@@ -22,12 +22,18 @@ SQLite -> PostgreSQL 数据迁移（vod-sync）
   # 3) 校验（行数 + 关键字段逐行比对）
   python scripts/migrate_sqlite_to_pg.py --target "..." --verify
 
+  # 4) 迁移被中断（SSH 断线 / Ctrl+C / 容器重启）：一条命令补齐
+  python scripts/migrate_sqlite_to_pg.py --target "..." --repair
+  #    对比两侧行数 → 只对缺数据的表重跑（主键冲突自动跳过）→ 补建索引 → 复查
+
 常用选项：
   --source PATH     源 SQLite 文件（默认 $DATA_DIR/vodsync.db，退化为 data/vodsync.db）
   --only-meta       只搬 sources / sync_logs（视频数据不搬，之后各站自行全量同步）
   --tables a,b      只搬指定的 vod 表（写 slug，如 jkun,t1）
   --batch N         每批读取/写入行数（默认 2000）
   --replace         目标已有同主键时用源库覆盖（默认跳过，保证幂等）
+  --verify          只校验不写入
+  --repair          校验 + 补齐缺失数据（断点续传，可反复执行）
 """
 import argparse
 import os
@@ -328,6 +334,11 @@ def discover_vod_tables(src_engine, only=None):
     return sorted(names)
 
 
+# 迁移后逐行比对的关键字段（决定能不能直接接着增量）
+SAMPLE_FIELDS = ("watermark", "last_page", "total_pages", "paused", "auto_sync",
+                 "total_videos", "last_sync_at", "enabled", "status")
+
+
 def verify(src_engine, tgt_engine, table_names, sample_fields):
     """校验：表是否都在、行数是否一致、sources 关键字段是否逐行一致。"""
     problems = []
@@ -373,6 +384,76 @@ def verify(src_engine, tgt_engine, table_names, sample_fields):
     return problems
 
 
+def _repair(src_engine, tgt_engine, plan, names, args) -> int:
+    """
+    断点续传：只补缺数据的表。
+
+    为什么能这么干：copy_table 每批一个事务、插入用 ON CONFLICT DO NOTHING，
+    所以「已存在的行自动跳过、缺失的行补进去」，重复执行不会产生重复数据。
+    SSH 断线 / Ctrl+C / 容器重启导致的中断，重跑一遍差异表即可。
+    """
+    tmap = {t.name: t for t in plan}
+
+    print("步骤 1/3 对比行数：")
+    diffs = []
+    for n in names:
+        a = _table_count(src_engine, n)
+        has = inspect(tgt_engine).has_table(n)
+        b = _table_count(tgt_engine, n) if has else 0
+        mark = "OK " if a == b else "差异"
+        note = "" if has else "  (目标缺表)"
+        extra = "  (目标多出 %d 行，源库可能删过数据)" % (b - a) if b > a else ""
+        print(f"  [{mark}] {n:<24} 源 {a:>8} / 目标 {b:>8}{note}{extra}")
+        if a != b:
+            diffs.append((n, a, b, has))
+
+    if not diffs:
+        print("\n行数全部一致，无需补齐。")
+    else:
+        print(f"\n步骤 2/3 补齐 {len(diffs)} 张表（每批一个事务，中途再断也能重跑）：")
+        scanned = 0
+        with src_engine.connect() as src_conn:
+            for idx, (name, a, b, has) in enumerate(diffs, 1):
+                table = tmap[name]
+                if not has:
+                    create_table_only(tgt_engine, table)
+                src_cols = {c["name"] for c in inspect(src_engine).get_columns(name)}
+                t0 = time.time()
+                n = copy_table(src_conn, tgt_engine, table, args.batch, args.replace, False,
+                               src_columns=src_cols, total_hint=a)
+                scanned += n
+                now = _table_count(tgt_engine, name)
+                gap = a - now
+                state = "✓" if gap <= 0 else f"仍缺 {gap:,}"
+                print(f"  [{idx}/{len(diffs)}] {name:<24} 缺 {max(a - b, 0):>7,} → 扫描 {n:>7,} 行，"
+                      f"现有 {now:>7,}/{a:<7,} {state}  {time.time() - t0:4.1f}s")
+        print(f"\n  共扫描 {scanned:,} 行（已存在的按主键跳过，不会重复写入）")
+
+    # 中断的迁移往往没走到「建索引 / 重置序列」这一步，这里一并补齐（都是幂等的）
+    print("\n补建索引 / 重置序列：")
+    print(f"  · 新建 {create_indexes(tgt_engine, plan)} 个索引")
+    _reset_pg_sequences(tgt_engine, [META_DEFS[n] for n in META_TABLES])
+    if tgt_engine.dialect.name == "postgresql":
+        try:
+            with tgt_engine.begin() as conn:
+                conn.exec_driver_sql("ANALYZE")
+            print("  · 已执行 ANALYZE")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ! ANALYZE 跳过（不影响数据）：{exc}")
+
+    print("\n步骤 3/3 复查：")
+    problems = verify(src_engine, tgt_engine, names, SAMPLE_FIELDS)
+    if problems:
+        print(f"\n仍有 {len(problems)} 个问题：")
+        for p in problems[:20]:
+            print("  -", p)
+        print("\n若提示「目标多出 N 行」，说明源库删过数据，本脚本不会删除目标行；")
+        print("需要完全对齐时可先清空对应表再跑一次 --repair（或在 PG 里按主键删除）。")
+        return 1
+    print("  全部一致 ✓")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="SQLite -> PostgreSQL 数据迁移（保留水位线与断点）")
@@ -384,7 +465,13 @@ def main(argv=None) -> int:
     ap.add_argument("--replace", action="store_true", help="主键冲突时用源库覆盖（默认跳过）")
     ap.add_argument("--dry-run", action="store_true", help="只统计不写入")
     ap.add_argument("--verify", action="store_true", help="只校验（不迁移），用于迁移后复查")
+    ap.add_argument("--repair", action="store_true",
+                    help="校验并补齐缺失数据：只对行数不一致的表重跑（断点续传，可反复执行）")
     args = ap.parse_args(argv)
+
+    if args.repair and (args.verify or args.dry_run):
+        print("[错误] --repair 会写数据，不能与 --verify / --dry-run 同时使用")
+        return 2
 
     src_path = Path(args.source or (Path(os.environ.get("DATA_DIR", "data")) / "vodsync.db"))
     if not src_path.exists():
@@ -401,14 +488,19 @@ def main(argv=None) -> int:
 
     print(f"源库  : SQLite {src_path.resolve()}")
     _u = tgt_engine.url
-    print(
-        f"目标库: {_u.drivername}://{_u.username or '-'}@"
-        f"{_u.host or '<未填主机>'}:{_u.port or 5432}/{_u.database or '-'}"
-    )
+    if _u.drivername.startswith("sqlite"):
+        print(f"目标库: SQLite {_u.database}")
+    else:
+        print(
+            f"目标库: {_u.drivername}://{_u.username or '-'}@"
+            f"{_u.host or '<未填主机>'}:{_u.port or 5432}/{_u.database or '-'}"
+        )
     if args.dry_run:
         print("模式  : DRY-RUN（只统计，不写入）")
     elif args.verify:
         print("模式  : 仅校验（不迁移）")
+    elif args.repair:
+        print("模式  : 断点续传（对比行数，只补缺失数据）")
 
     # 连通性先探一次：dry-run 只警告，正式迁移连不上就没必要往下走
     err, info = check_target(tgt_engine)
@@ -445,6 +537,12 @@ def main(argv=None) -> int:
         if args.only_meta:
             print("注意：--only-meta 只搬元数据，视频数据需要各站重新全量同步")
         return 0
+
+    # ---- 断点续传：对比行数，只补差异表 ----
+    if args.repair:
+        print("续传范围：", f"{len(all_names)} 张表" + (f"（--tables 过滤后）" if only else ""))
+        print()
+        return _repair(src_engine, tgt_engine, plan, all_names, args)
 
     # ---- 建表：只建本次要迁的表（元数据表 + 过滤后的 vod_*），索引留到最后 ----
     if write_mode:
@@ -503,8 +601,7 @@ def main(argv=None) -> int:
     print("校验：")
     problems = verify(
         src_engine, tgt_engine, all_names,
-        sample_fields=("watermark", "last_page", "total_pages", "paused", "auto_sync",
-                       "total_videos", "last_sync_at", "enabled", "status"),
+        sample_fields=SAMPLE_FIELDS,
     )
     if problems:
         print(f"\n发现 {len(problems)} 个问题：")
