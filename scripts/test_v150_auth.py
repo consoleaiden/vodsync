@@ -66,6 +66,12 @@ def main():
     check("?token= 参数", client.get(f"/api/v1/stats?token={token}").status_code == 200)
     check("错误 Token 401", client.get("/api/v1/stats", headers={"Authorization": "Bearer vs_wrong"}).status_code == 401)
     check("/healthz 免鉴权", client.get("/healthz").status_code == 200)
+    # /source 是 JSON 接口但不在 /api/ 前缀下，必须同样认 Token（否则 App 拿不到源站清单）
+    check("/source 认 Token", client.get("/source", headers={"Authorization": f"Bearer {token}"}).status_code == 200,
+          client.get("/source", headers={"Authorization": f"Bearer {token}"}).status_code)
+    check("/source 无凭证 401", client.get("/source").status_code == 401)
+    check("双空格 Bearer 也认", client.get("/api/v1/stats", headers={"Authorization": f"Bearer  {token}"}).status_code == 200)
+    check("无空格 Bearer 不认", client.get("/api/v1/stats", headers={"Authorization": f"Bearer{token}"}).status_code == 401)
 
     print("[3] 面板登录")
     r = client.get("/", follow_redirects=False, headers={"Accept": "text/html"})

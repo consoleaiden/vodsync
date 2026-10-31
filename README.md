@@ -470,7 +470,7 @@ git push origin v1.0.0
 
 详见 [docs/deploy-synology.md](docs/deploy-synology.md)。
 
-**客户端 App 对接**：完整的接口文档（含参数表、响应示例、App 实现流程、常见坑）见 **[docs/CLIENT_API.md](docs/CLIENT_API.md)** —— 专为 AI 客户端开发准备，一份文档即可完成对接；机器可读规范直接导入 `http://<host>:8000/openapi.json`。
+**客户端 App 对接**：完整的接口文档（含参数表、响应示例、App 实现流程、常见坑）见 **[docs/CLIENT_API.md](docs/CLIENT_API.md)**；给已有 App **加 API Token** 的施工单见 **[docs/APP_TOKEN_UPGRADE.md](docs/APP_TOKEN_UPGRADE.md)**（整篇丢给 AI 即可）；机器可读规范直接导入 `http://<host>:8000/openapi.json`。
 
 ## 常见坑
 
@@ -507,6 +507,7 @@ vodsync/
 └── docs/
     ├── API_SPEC_FOR_AI.md   # ★ 交付给 AI 的完整 API 文档（字段字典/状态语义/代码骨架/排查表）
     ├── CLIENT_API.md        # 简明对接说明（人类速查）
+    ├── APP_TOKEN_UPGRADE.md # ★ 给 App 加 API Token 的升级施工单（交给 AI 执行）
     ├── openapi.json         # OpenAPI 3.1 快照（可导入代码生成器）
     └── deploy-synology.md   # 群晖部署
 ```
@@ -630,3 +631,10 @@ vodsync/
 - 新增页面：`/login`（登录页），面板右上「⚙ 设置」抽屉（改密码 / Token / 开关 / 退出登录）
 - 测试：`scripts/test_v150_auth.py`（40 项：默认密码、三种 Token 带法、登录跳转、锁定、改密失效、开关换 Token、开放重定向防护）
 - 版本号 1.4.2 → 1.5.0
+
+### v1.5.1
+- 修复：`/source`（源站清单 JSON）不带 `/api/` 前缀，此前只带 Token 的客户端会被拦成
+  `401 请先登录管理面板`，现在与其它接口一致认 Token
+- 新增 **`docs/APP_TOKEN_UPGRADE.md`** —— 交给 AI 给 App 加 Token 的施工单（含各平台拦截器代码、401 处理策略、自测清单）
+- 测试：鉴权用例补 4 项（`/source` 认 Token、双空格 Bearer、无空格 Bearer 拒绝），共 44 项
+- 版本号 1.5.0 → 1.5.1

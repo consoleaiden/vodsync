@@ -252,9 +252,18 @@ PUBLIC_PATHS = {
     "/favicon.ico",
 }
 
+# 返回 JSON 的接口路径。中间件对它们走「Token 或会话」判定。
+# 注意 `/source`（源站清单）不在 /api/ 前缀下，但同样是对外 API ——
+# 漏掉它会让只带 Token 的客户端收到 401「请先登录管理面板」。
+API_PATHS = ("/source",)
+
 
 def is_public(path: str) -> bool:
     return path in PUBLIC_PATHS or path.startswith("/static/")
+
+
+def is_api_path(path: str) -> bool:
+    return path.startswith("/api/") or path in API_PATHS
 
 
 # ---------------------------------------------------------------------------

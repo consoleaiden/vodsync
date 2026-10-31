@@ -31,7 +31,7 @@ app = FastAPI(
         "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，"
         "并对外提供统一的视频列表/详情 API（source 参数区分源站）。"
     ),
-    version="1.5.0",
+    version="1.5.1",
 )
 
 app.include_router(router)
@@ -57,7 +57,7 @@ async def _auth_guard(request: Request, call_next):
     if request.method == "OPTIONS" or not auth.is_enabled() or auth.is_public(path):
         return await call_next(request)
 
-    if path.startswith("/api/"):
+    if auth.is_api_path(path):
         if auth.request_authorized(request):
             return await call_next(request)
         return JSONResponse(
