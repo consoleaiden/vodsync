@@ -42,6 +42,10 @@ services:
       TZ: "Asia/Shanghai"
 
   # ---- 可选：PostgreSQL（数据量超大或多实例共享时启用） ----
+  # 切换前先迁数据，不用重新同步（详见 README「从 SQLite 迁移到 PostgreSQL」）：
+  #   docker run --rm -v /volume2/docker/vodsync/data:/data --entrypoint python \
+  #     ghcr.io/consoleaiden/vodsync:latest /app/scripts/migrate_sqlite_to_pg.py \
+  #     --source /data/vodsync.db --target "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync" --dry-run
   # postgres:
   #   image: postgres:16-alpine
   #   container_name: vodsync-pg

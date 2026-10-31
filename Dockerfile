@@ -14,6 +14,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 再拷贝代码
 COPY app ./app
+# 迁移脚本随镜像发布：切换 PostgreSQL 时可 docker run --entrypoint python 直接执行
+COPY scripts/migrate_sqlite_to_pg.py ./scripts/migrate_sqlite_to_pg.py
 
 # 数据目录（SQLite 数据库文件落在这里，必须挂载持久化）
 ENV DATA_DIR=/app/data

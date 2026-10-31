@@ -241,6 +241,38 @@ GET /api/v1/{slug}?ac=detail&ids=1,2,3 # 按 ID 批量取详情
 | `API_KEY` | 空 | 设置后接口需带 `X-API-Key` 头 |
 | `ONLY_OK_SOURCES` | true | 只同步在线源站 |
 
+## 从 SQLite 迁移到 PostgreSQL（不需要重新同步）
+
+换成 PostgreSQL 后新库是空的。**不用把所有源站重新抓一遍** —— 用迁移脚本把 SQLite 里的数据整体搬过去即可，
+连 `watermark`（增量水位线）和 `last_page`（全量断点）都会保留，迁完直接接着做增量。
+
+```bash
+# 0) 先停服务，保证源库不再写入
+sudo docker compose stop vodsync
+
+# 1) 看看要搬多少（不写目标库）
+docker run --rm -v /volume2/docker/vodsync/data:/data \
+  --entrypoint python ghcr.io/consoleaiden/vodsync:latest \
+  /app/scripts/migrate_sqlite_to_pg.py --source /data/vodsync.db \
+  --target "postgresql+psycopg2://vodsync:vodsync@192.168.1.10:5432/vodsync" --dry-run
+
+# 2) 正式迁移（可重复执行，已存在的行按主键跳过）
+#    同上命令，去掉 --dry-run
+
+# 3) 改 DATABASE_URL 并启动
+sudo docker compose up -d
+```
+
+- 迁移内容：`sources`（源站元数据 + 水位线 + 断点 + 暂停/自动同步开关）、`sync_logs`、全部 `vod_*` 数据表
+- 脚本结束会自动校验：表是否齐全、行数是否一致、`watermark`/`last_page`/`paused`/`auto_sync` 等关键字段逐行比对
+- 只想搬视频数据不搬开关状态，或只搬部分源站：`--only-meta`（只搬元数据）/ `--tables jkun,t1`
+- 想要源库覆盖目标库（重跑迁移修正脏数据）：`--replace`
+- 速度约 1~3 万行/秒，百万行级大约几分钟
+- 迁移完成后 PG 下写事务不再需要进程内串行，可把 `SOURCE_SYNC_CONCURRENCY` 从 2 调到 4~6
+
+> 兜底方案：如果 SQLite 里本来就没多少数据（比如只有几个站跑过），直接换 `DATABASE_URL`
+> 重新全量同步更省事 —— 迁移的收益在于**省掉百万级的重新抓取**。
+
 ## GitHub 仓库搭建流程（完整步骤）
 
 ```bash
@@ -411,3 +443,12 @@ vodsync/
   - **503 语义**：连接池排队超时 / `database is locked` 统一返回 `503` + `Retry-After: 5`，不再是 500 堆栈
   - 聚合搜索并行度收敛为 `SEARCH_CONCURRENCY`（默认 4，原来固定 8，每线程各占一个连接）
 - 测试：新增 `scripts/test_v141_pool.py`（17 项：池参数、无泄漏、并发闸门峰值、防重入、并发写、池满时 healthz、断点保存）与 `scripts/loadtest_concurrency.py`（端到端：12 源站同时全量，实测峰值并发 2、探活 0 失败、连接池归零、720 条数据全部入库）
+
+### v1.4.2
+- 新增 `scripts/migrate_sqlite_to_pg.py`：SQLite → PostgreSQL 数据迁移，**切库不需要重新同步**
+  - 迁移 `sources` / `sync_logs` / 全部 `vod_*` 表，保留 `watermark`（增量水位线）与 `last_page`（全量断点），迁完直接续增量
+  - 幂等（重复执行按主键跳过）、每批一个事务（中断可续跑）、PG 下自动对齐 SERIAL 序列
+  - `--dry-run` 预估规模、`--only-meta` 只搬元数据、`--tables` 指定源站、`--replace` 覆盖、`--verify` 只校验
+  - 迁移后自动校验：表齐全性、行数一致、关键字段逐行比对
+- 镜像内包含迁移脚本，可直接 `docker run --entrypoint python .../migrate_sqlite_to_pg.py`
+- 测试：`scripts/test_migration.py`（42 项：跨批翻页、字段保真、幂等、替换、过滤、dry-run、错误提示）
