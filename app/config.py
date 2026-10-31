@@ -54,6 +54,30 @@ INCR_CHECK_MISSING = os.environ.get("INCR_CHECK_MISSING", "false").lower() == "t
 CHECKPOINT_EVERY_PAGES = int(os.environ.get("CHECKPOINT_EVERY_PAGES", "5"))
 
 # ---------------------------------------------------------------------------
+# 中转代理：上游源站不可直连时的降级通道
+#
+# 代理约定：{proxy}?url=<urlencode(目标地址)>
+#   例：https://pz.v88.qzz.io/?url=https%3A%2F%2Fapi.example.com%2Fapi.php%3Fac%3Dlist
+# 策略：直连优先 → 失败自动按顺序切代理；某源站走代理成功后记忆 30 分钟，
+#      期间直接走该代理（避免每次先等直连超时），到期后重新尝试直连。
+# ---------------------------------------------------------------------------
+PROXY_ENABLED = os.environ.get("PROXY_ENABLED", "true").lower() == "true"
+PROXY_URLS = [
+    u.strip()
+    for u in os.environ.get(
+        "PROXY_URLS",
+        "https://pz.v88.qzz.io/,https://mconfig.viptv.work/",
+    ).split(",")
+    if u.strip()
+]
+# 走代理时的单请求超时（秒）
+PROXY_TIMEOUT = int(os.environ.get("PROXY_TIMEOUT", "20"))
+# 每个代理的最大并发请求数（避免把中转服务压垮）
+PROXY_CONCURRENCY = int(os.environ.get("PROXY_CONCURRENCY", "4"))
+# "该源站需走代理"的记忆有效期（分钟），到期重新尝试直连
+PROXY_PREF_TTL_MINUTES = int(os.environ.get("PROXY_PREF_TTL_MINUTES", "30"))
+
+# ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
 API_PAGE_SIZE_DEFAULT = int(os.environ.get("API_PAGE_SIZE_DEFAULT", "20"))

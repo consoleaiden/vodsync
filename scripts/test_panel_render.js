@@ -87,6 +87,22 @@ async function main() {
       errs.push(`${s.slug} 已暂停但未渲染「继续」按钮`);
     }
   });
+  // 从未同步的站（synced=false 且不在跑）：不得显示「已完成」，应显示「从未同步」且进度 0%
+  list.forEach((s, i) => {
+    if (!s.synced && !s.running) {
+      const row = bodyRows[i];
+      if (row.includes("已完成")) errs.push(`${s.slug} 未同步却渲染了「已完成」`);
+      if (!row.includes("从未同步")) errs.push(`${s.slug} 未同步但未标注「从未同步」`);
+      if (!row.includes("0%")) errs.push(`${s.slug} 未同步但进度不是 0%`);
+      if (s.progress !== 0) errs.push(`${s.slug} 接口 progress=${s.progress}，应为 0`);
+    }
+  });
+  // 已同步完成的站：应显示「已完成」或其断点进度，不得显示「从未同步」
+  list.forEach((s, i) => {
+    if (s.synced && !s.running && !s.syncing && !s.paused && !bodyRows[i].includes("已完成")) {
+      errs.push(`${s.slug} 已同步完成但未渲染「已完成」`);
+    }
+  });
 
   if (errs.length) {
     console.log("\nFAIL:");

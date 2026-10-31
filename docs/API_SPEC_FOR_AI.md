@@ -505,6 +505,12 @@ GET /api/v1/jkun?ac=list&wd=三体&page=1&page_size=20
   "today_updated": 880,
   "today_tasks": 14,
   "pause": { "global": false, "full": false, "incremental": false, "updated_at": {} },
+  "proxy": {
+    "enabled": true,
+    "urls": ["https://pz.v88.qzz.io/", "https://mconfig.viptv.work/"],
+    "preferred_hosts": { "bfzyapi.com": { "proxy": "https://pz.v88.qzz.io/", "age_seconds": 120.5 } },
+    "direct_success": 128, "proxy_success": 46, "route_fail": 0
+  },
   "last_error": { "slug": "t1", "error": "timeout", "at": "2026-10-30T14:00:00" },
   "server_time": "2026-10-30T16:09:54.229931"
 }
@@ -532,6 +538,7 @@ GET /api/v1/jkun?ac=list&wd=三体&page=1&page_size=20
     "running": false,
     "running_mode": null,
     "running_seconds": null,
+    "synced": true,
     "progress": 1.8,
     "last_page": 120,
     "total_pages": 6710,
@@ -549,10 +556,11 @@ GET /api/v1/jkun?ac=list&wd=三体&page=1&page_size=20
 |---|---|---|
 | `running` | **此刻**真的有同步任务在跑 | 显示进度条 +「暂停」按钮 |
 | `syncing` | 全量同步历史上有断点、未跑完（**不代表正在跑**） | 显示「断点 N/M 页 · 未在同步」 |
+| `synced` | 是否同步过（水位线 / 已入库 / 有断点，任一成立即 true） | `false` → 显示「未同步」，**不要显示「已完成」** |
 | `paused` | 单源站被单独暂停（持久化） | 显示「本站暂停」徽标 +「继续」按钮 |
 | `auto_sync` | 是否参与定时任务/全站同步（`false` 时不自动同步） | 显示「自动同步」开关状态 |
 
-- `progress`：全量进度 0–100；已完成=100；刚开跑尚未取到总页数=0。
+- `progress`：全量进度 0–100；**从未同步（`synced=false`）= 0**；已完成=100；刚开跑尚未取到总页数=0。
 - `running_mode`：`full` / `incremental`；未运行为 `null`。
 - `running_seconds`：本次已运行秒数；未运行为 `null`。
 
@@ -1003,6 +1011,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 | 12 | `page_size=500` 报 422 | 服务端上限 100，超限直接拒绝 | 改用 `page_size=100` 分页；上限可由部署方用 `API_PAGE_SIZE_MAX` 调整 |
 | 13 | 422 且 `detail` 是数组 | FastAPI 参数校验失败 | 按 `detail[0].loc` 定位参数名 |
 | 14 | 管理操作返回成功但没进度 | 异步受理 | 轮询 `/api/v1/sources` 的 `running` / `progress` |
+| 15 | 某源站一直同步失败 | 直连被墙/被风控 | 服务端会自动切中转代理；查看 `/api/v1/stats` 的 `proxy` 段确认是否走代理 |
+| 16 | 未同步的站显示「已完成」 | v1.4.0 前的进度口径 bug | 升级后按 `synced` 字段判断：`false` 一律显示「未同步」 |
 
 ---
 
@@ -1023,13 +1033,18 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 | `SYNC_INTERVAL_MINUTES` | 360 | 定时增量间隔（分钟） |
 | `SOURCE_REFRESH_INTERVAL_MINUTES` | 720 | 源站列表刷新间隔（分钟） |
 | `SOURCE_SYNC_CONCURRENCY` / `PAGE_CONCURRENCY` | 2 / 4 | 同步并发度 |
+| `PROXY_ENABLED` / `PROXY_URLS` | true / 2 个内置代理 | 直连失败后自动走中转代理（`{proxy}?url=<urlencode(目标)>`） |
+| `PROXY_PREF_TTL_MINUTES` | 30 | "该源站需走代理"的记忆时长 |
 | `DATABASE_URL` | 本地 SQLite | 可切 PostgreSQL |
+
+> 中转代理是**服务端行为**，对客户端完全透明：App 调用的接口路径、字段、状态码都不变，只是原本拿不到数据的源站现在能同步成功。
 
 ### 10.3 版本与字段稳定性
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.3.0（当前） | 新增 `auto_sync` 字段与单站/批量自动同步开关接口 |
+| v1.4.0（当前） | 服务端新增中转代理降级（源站不可达自动走代理）；新增 `synced` 字段，修正未同步站进度误显示 100 |
+| v1.3.0 | 新增 `auto_sync` 字段与单站/批量自动同步开关接口 |
 | v1.2.2 | 新增 `running` / `running_mode` / `running_seconds`，修正"暂停按钮误显示" |
 | v1.2.1 | 新增单源站暂停/继续接口与 `paused` / `paused_at` |
 | v1.2.0 | 新增三层级暂停（global/full/incremental） |

@@ -220,6 +220,36 @@ def healthz():
     return {"status": "ok", "time": datetime.now().isoformat()}
 
 
+def _is_synced(row) -> bool:
+    """
+    该源站是否"同步过"：有水位线 / 已入库 / 有断点，任一成立即视为同步过。
+    三者皆无 = 从未开始同步（进度应为 0，不能显示"已完成"）。
+    """
+    return bool(row["watermark"]) or (row["total_videos"] or 0) > 0 or (row["last_page"] or 0) > 0
+
+
+def compute_progress(row, live: dict = None) -> float:
+    """
+    全量同步进度百分比（0-100）。
+
+    口径（按顺序判定）：
+      1. 从未同步过（无水位线、无数据、无断点）→ 0
+      2. 有断点且有总页数 → 断点占比
+      3. 有断点但暂无总页数 → 0（刚拿到断点，尚未读到总页数）
+      4. 正在跑全量且还没到第一个检查点 → 0
+      5. 其余（已同步过且无断点）→ 100（已完成）
+    """
+    if not _is_synced(row):
+        return 0.0
+    if row["last_page"] and row["total_pages"]:
+        return round(row["last_page"] * 100 / row["total_pages"], 1)
+    if row["last_page"]:
+        return 0.0
+    if live and live.get("mode") == "full":
+        return 0.0
+    return 100.0
+
+
 @router.get("/api/v1/sources")
 def list_sources():
     """
@@ -230,21 +260,12 @@ def list_sources():
       running_mode  正在跑的类型：full / incremental
       running_seconds 本次已运行秒数
       syncing       全量同步是否「未跑完」（有断点），不代表正在跑，仅用于展示进度条
+      synced        是否同步过（无水位线、无数据、无断点 = false，进度恒为 0）
       paused        该源站是否被单独暂停（持久化）
     """
     from .. import syncer
 
     running = syncer.running_snapshot()
-
-    def _progress(row, live) -> float:
-        """全量进度百分比：有断点按断点算；已完成=100；刚开始还没拿到总页数=0。"""
-        if row["last_page"] and row["total_pages"]:
-            return round(row["last_page"] * 100 / row["total_pages"], 1)
-        if row["last_page"]:
-            return 0.0
-        if live and live.get("mode") == "full":
-            return 0.0          # 正在跑全量但还没到第一个检查点
-        return 100.0            # 没有断点且不在跑 → 视为已完成
 
     with database.engine.connect() as conn:
         rows = conn.execute(
@@ -271,8 +292,10 @@ def list_sources():
                 "running": r["slug"] in running,
                 "running_mode": running.get(r["slug"], {}).get("mode"),
                 "running_seconds": running.get(r["slug"], {}).get("elapsed_seconds"),
-                # 全量同步进度（0-100）；已完成 100，刚开始跑未拿到总页数为 0
-                "progress": _progress(r, running.get(r["slug"])),
+                # 是否同步过：false 表示从未开始，前端应显示「未同步」而非「已完成」
+                "synced": _is_synced(r),
+                # 全量同步进度（0-100）；从未同步=0，已完成=100
+                "progress": compute_progress(r, running.get(r["slug"])),
                 "last_page": r["last_page"],
                 "total_pages": r["total_pages"],
                 "last_sync_at": r["last_sync_at"].isoformat() if r["last_sync_at"] else None,
@@ -352,6 +375,7 @@ def stats():
     from sqlalchemy import and_
 
     from .. import pause, syncer
+    from ..maccms import proxy_snapshot
 
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     with database.engine.connect() as conn:
@@ -389,6 +413,8 @@ def stats():
         "today_updated": int(today_rows[1]),
         "today_tasks": int(today_rows[2]),
         "pause": pause.snapshot(),   # 同步暂停状态（面板顶栏开关用）
+        # 中转代理运行态：是否启用、走代理的源站、成功/失败计数（排障用）
+        "proxy": proxy_snapshot(),
         "last_error": (
             {"slug": last_error[0], "error": last_error[1],
              "at": last_error[2].isoformat() if last_error[2] else None}
@@ -421,6 +447,7 @@ def source_detail(slug: str):
             "paused": bool(src["paused"]),
             "paused_at": src["paused_at"].isoformat() if src["paused_at"] else None,
             "auto_sync": bool(src["auto_sync"]),
+            "synced": _is_synced(src),
             "last_sync_at": src["last_sync_at"].isoformat() if src["last_sync_at"] else None,
         },
         "recent_logs": [

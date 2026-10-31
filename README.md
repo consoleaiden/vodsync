@@ -11,6 +11,7 @@
 - **双接口风格**：REST API（`?source=` 区分源站）+ 苹果 CMS 兼容 API（`?ac=list|detail`），现有播放器/采集器可直接对接
 - **Web 管理面板**：浏览器看同步进度、手动触发同步、跨源聚合搜索，单文件零依赖
 - **聚合搜索**：跨全部源站按名称并行搜索（线程池 + 内存归并），单源失败隔离
+- **中转代理降级**：源站直连不可达/被风控时，自动按顺序切到 API 中转代理取数（可配多个，成功后记忆 30 分钟）
 - **可选鉴权**：设置 `API_KEY` 后所有接口需携带 `X-API-Key`
 - **多数据库**：默认 SQLite（WAL），一行环境变量切换 PostgreSQL
 
@@ -228,6 +229,10 @@ GET /api/v1/{slug}?ac=detail&ids=1,2,3 # 按 ID 批量取详情
 | `SOURCE_SYNC_CONCURRENCY` | 2 | 并行同步的源站数（NAS 建议 1-2） |
 | `PAGE_CONCURRENCY` | 4 | 单源站内并行抓取页数 |
 | `REQUEST_INTERVAL_SECONDS` | 0.2 | 请求间隔，防源站封禁 |
+| `PROXY_ENABLED` | true | 直连失败后是否自动走中转代理 |
+| `PROXY_URLS` | 2 个内置地址 | 中转代理列表（逗号分隔），格式 `{proxy}?url=<urlencode(目标地址)>` |
+| `PROXY_PREF_TTL_MINUTES` | 30 | "该源站需走代理"的记忆时长，到期重试直连 |
+| `PROXY_CONCURRENCY` | 4 | 每个代理的最大并发请求数 |
 | `DATABASE_URL` | SQLite | 切 PostgreSQL：`postgresql+psycopg2://user:pass@host:5432/db` |
 | `API_KEY` | 空 | 设置后接口需带 `X-API-Key` 头 |
 | `ONLY_OK_SOURCES` | true | 只同步在线源站 |
@@ -370,3 +375,16 @@ vodsync/
   - `/api/v1/sources`、`/api/v1/sources/{slug}` 返回 `auto_sync` 字段
   - 面板源站列表：每行「自动」开关 + 复选框多选（全选框跨刷新保留）+ 「全部开启 / 全部暂停 / 开启所选 / 暂停所选自动同步」批量按钮
   - 测试 `scripts/test_v130_autosync.py`（13 项：默认值/单站/批量/sync_all 过滤/续跑过滤/路由注册）
+
+### v1.4.0
+- 新增**中转代理降级通道**：源站直连不可达/被风控时，自动按顺序切到 API 中转代理拉取数据
+  - 请求格式 `{proxy}?url=<urlencode(目标地址)>`，默认内置 `https://pz.v88.qzz.io/`、`https://mconfig.viptv.work/`，可用 `PROXY_URLS` 覆盖
+  - 路由策略：直连优先 → 失败自动切代理；连接失败/超时/403/429/451 立即切换（不做无意义重试），5xx 与 JSON 解析失败在当前路由重试后再切换
+  - **代理偏好记忆**：某源站走代理成功后记住 30 分钟（`PROXY_PREF_TTL_MINUTES`），期间直接走代理避免每次先等直连超时；直连恢复后自动清除记忆
+  - 每个代理由信号量限制并发（`PROXY_CONCURRENCY`，默认 4），避免打挂中转服务
+  - `/api/v1/stats` 新增 `proxy` 段（是否启用、代理列表、当前走代理的源站、成功/失败计数）；面板操作区显示代理状态
+- 修复：**未同步过的源站进度误显示「已完成」**
+  - 根因：进度计算把"没有断点且不在跑"一律判为 100，未区分"从未同步"
+  - 修复：新增 `synced` 判定（水位线 / 已入库 / 有断点 任一成立才算同步过），从未同步时进度恒为 0
+  - `/api/v1/sources`、`/api/v1/sources/{slug}` 新增 `synced` 字段；面板对未同步站显示 `0%` +「从未同步 · 可点「增量」开始」
+- 测试：新增 `scripts/test_v140_proxy_progress.py`（19 项：URL 编码、直连不可达/403 自动切代理、记忆与 TTL、代理关闭即报错、进度口径）；`scripts/test_panel_render.js` 增加"未同步不得显示已完成"断言

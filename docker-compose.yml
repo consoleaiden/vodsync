@@ -23,6 +23,11 @@ services:
       SOURCE_SYNC_CONCURRENCY: "2"         # 并行同步的源站数（NAS 性能弱建议 1-2）
       PAGE_CONCURRENCY: "4"                # 单源站内并行抓取页数
       REQUEST_INTERVAL_SECONDS: "0.3"      # 请求间隔，防源站封禁
+      # ---- 中转代理（源站直连失败时自动降级）----
+      PROXY_ENABLED: "true"
+      PROXY_URLS: "https://pz.v88.qzz.io/,https://mconfig.viptv.work/"
+      PROXY_PREF_TTL_MINUTES: "30"         # 走代理成功的源站，多久后重试直连
+      PROXY_CONCURRENCY: "4"               # 每个代理的并发上限
       # ---- 数据库 ----
       # 默认 SQLite（推荐），如需 PostgreSQL 打开下行并连接外部 PG 容器：
       # DATABASE_URL: "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync"
