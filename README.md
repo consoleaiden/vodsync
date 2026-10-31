@@ -247,7 +247,7 @@ GET /api/v1/{slug}?ac=detail&ids=1,2,3 # 按 ID 批量取详情
 连 `watermark`（增量水位线）和 `last_page`（全量断点）都会保留，迁完直接接着做增量。
 
 ```bash
-# 0) 先停服务，保证源库不再写入（PG 容器要已启动：解开 compose 里的 postgres 段并 up -d）
+# 0) 先停服务，保证源库不再写入（PG 容器要先起好，两种起法见下方"一条命令起 PG"）
 sudo docker compose stop vodsync
 
 # 1) 预演：看看要搬多少（不写目标库）
@@ -264,6 +264,26 @@ sudo docker compose up -d
 > 如果 PostgreSQL 装在别的机器（不在 compose 内网），把 target 换成那台机器的地址即可，例如
 > `postgresql+psycopg2://vodsync:vodsync@192.168.1.10:5432/vodsync`；此时用
 > `docker run --rm -v /volume2/docker/vodsync/data:/data --entrypoint python ghcr.io/consoleaiden/vodsync:latest /app/scripts/migrate_sqlite_to_pg.py ...` 也行，注意 `--source /data/vodsync.db`。
+
+**不想改 compose 的话，一条命令就能起 PG**（挂到本项目网络并带 `postgres` 别名，迁移命令和 `DATABASE_URL` 都不用改）：
+
+```bash
+# 先确认真没有 PG：docker ps | grep -i postgres 无输出、docker inspect postgres 报 No such object
+mkdir -p /volume2/docker/vodsync/pgdata        # 与 data 卷同级，按实际路径改
+docker run -d --name vodsync-pg --restart unless-stopped \
+  --network vodsync_default --network-alias postgres \
+  -e POSTGRES_USER=vodsync -e POSTGRES_PASSWORD=vodsync -e POSTGRES_DB=vodsync \
+  -e TZ=Asia/Shanghai \
+  -v /volume2/docker/vodsync/pgdata:/var/lib/postgresql/data \
+  postgres:16-alpine
+
+# 等日志出现 "database system is ready to accept connections" 再迁移
+docker logs -f vodsync-pg
+docker exec vodsync-pg pg_isready -U vodsync
+```
+
+> `vodsync_default` 是 compose 项目默认网络名（`<项目名>_default`），用 `docker network ls | grep vodsync` 核对。
+> 若改用 compose 起 PG，记住两者 `container_name` 都是 `vodsync-pg`，需要先 `docker rm -f vodsync-pg` 再 `up -d`。
 
 ### 报错 `could not translate host name "postgres"` 怎么办
 
