@@ -3,7 +3,7 @@
 > **本文档的用途**：把 VodSync 服务作为后端，交由 AI（或 AI 编程助手）开发客户端 App。
 > 文档自包含：只读本文即可完成全部对接，**不需要**阅读服务端源码。
 >
-> 对应服务版本：**v1.3.0** ｜ 文档版本：`2026-10-30` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.4.1** ｜ 文档版本：`2026-10-31` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 **目录**
 
@@ -108,9 +108,14 @@ curl -i http://<host>:8000/healthz     # 200 → 未启用鉴权；401 → 已�
 | 401 | 缺少/错误 API Key | 服务端已启用鉴权 |
 | 404 | 资源不存在 | 源站不存在、视频未入库、源站尚未同步数据、ids 全部未命中 |
 | 422 | 参数校验失败（类型/范围） | `page=0`、`page_size=1000`、`scope` 取值不在枚举内 |
-| 500 | 服务端异常 | 数据库/上游异常 |
+| 503 | 服务临时过载（**可重试**） | 数据库连接池排队超时 / 数据库写锁忙。响应带 `Retry-After: 5` |
+| 500 | 服务端异常 | 其它未预期异常 |
 
 **404 的 `detail` 通常带补救建议**（比如提示改用搜索接口确认 `vod_id`），可直接展示给用户或用于日志。
+
+**503 的处理约定（v1.4.1 起）**：这不是"接口坏了"，而是服务端同步负载过高时的背压信号。
+客户端应读取 `Retry-After`（秒）后指数退避重试 1–3 次，期间可展示"服务繁忙，重试中"。
+
 
 ### 2.3 分页
 
@@ -237,10 +242,21 @@ type PlayLine = {
 ### 4.1 GET `/healthz`
 
 ```json
-{ "status": "ok", "time": "2026-10-30T16:09:53.527655" }
+{ "status": "ok", "db": true, "time": "2026-10-30T16:09:53.527655" }
 ```
 
 用途：服务可用性探测 + 判断是否启用 API Key（见 2.1）。
+
+**重要（v1.4.1 起）**：即使数据库繁忙，本接口**仍返回 200**，此时 `status` 为 `"degraded"`、`db` 为 `false`。
+Docker/K8s 健康检查只看状态码，若这里因数据库排队返回 5xx，编排系统会把一个还在正常干活的容器判定为不健康并重启（v1.4.0 的真实故障）。
+因此：
+
+| 场景 | HTTP | `status` | `db` |
+|---|---|---|---|
+| 一切正常 | 200 | `ok` | `true` |
+| 数据库繁忙/暂不可用 | 200 | `degraded` | `false` |
+
+App 端不要把 `degraded` 当"服务已死"，应降级提示并退避重试；只有网络层失败（连不上）才视为服务不可用。
 
 ---
 
@@ -512,12 +528,16 @@ GET /api/v1/jkun?ac=list&wd=三体&page=1&page_size=20
     "direct_success": 128, "proxy_success": 46, "route_fail": 0
   },
   "last_error": { "slug": "t1", "error": "timeout", "at": "2026-10-30T14:00:00" },
+  "db_pool": { "size": 10, "checked_out": 0, "overflow": -10, "max_overflow": 20, "pool_timeout": 10 },
+  "sync_load": { "running": 0, "queued": 0, "limit": 2 },
   "server_time": "2026-10-30T16:09:54.229931"
 }
 ```
 
 - `last_error` 可能为 `null`。
 - `pause` 结构同 `GET /api/v1/pause`（见 4.14）。
+- `sync_load`（v1.4.1）：服务端同步并发闸门的运行态 —— `running` 正在跑、`queued` 已排队等待名额、`limit` 上限（`SOURCE_SYNC_CONCURRENCY`）。管理端可据此提示"还有 N 个任务在排队"。
+- `db_pool`（v1.4.1）：数据库连接池水位。`checked_out` 持续接近 `size + max_overflow` 表示负载过高，此时接口会返回 503（见 2.2）。
 
 ---
 
@@ -538,6 +558,7 @@ GET /api/v1/jkun?ac=list&wd=三体&page=1&page_size=20
     "running": false,
     "running_mode": null,
     "running_seconds": null,
+    "queued": false,
     "synced": true,
     "progress": 1.8,
     "last_page": 120,
@@ -559,10 +580,12 @@ GET /api/v1/jkun?ac=list&wd=三体&page=1&page_size=20
 | `synced` | 是否同步过（水位线 / 已入库 / 有断点，任一成立即 true） | `false` → 显示「未同步」，**不要显示「已完成」** |
 | `paused` | 单源站被单独暂停（持久化） | 显示「本站暂停」徽标 +「继续」按钮 |
 | `auto_sync` | 是否参与定时任务/全站同步（`false` 时不自动同步） | 显示「自动同步」开关状态 |
+| `queued` | 已提交但还在等并发名额（v1.4.1） | 显示「排队中」，此时不要重复提交 |
 
 - `progress`：全量进度 0–100；**从未同步（`synced=false`）= 0**；已完成=100；刚开跑尚未取到总页数=0。
 - `running_mode`：`full` / `incremental`；未运行为 `null`。
 - `running_seconds`：本次已运行秒数；未运行为 `null`。
+- **并发上限**：服务端同一时刻最多跑 `SOURCE_SYNC_CONCURRENCY` 个源站同步（默认 2），超出的进入排队（`queued=true`）。这是正常的背压机制，不是故障。
 
 ---
 
@@ -611,10 +634,20 @@ GET /api/v1/jkun?ac=list&wd=三体&page=1&page_size=20
 - `incremental`：只拉更新
 
 ```json
-{ "code": 1, "msg": "同步任务已受理: jkun mode=auto" }
+{ "code": 1, "status": "accepted", "msg": "同步任务已受理: jkun mode=auto" }
 ```
 
-异步受理；`slug` 不存在 → 404；正在被全局/单站暂停时任务直接返回 `status: "paused"` 并记日志。
+同一源站已在排队/运行时再次提交，**不会重复跑**，而是返回：
+
+```json
+{ "code": 1, "status": "already_running", "msg": "jkun 已有同步任务在排队或执行中，本次未重复提交" }
+```
+
+异步受理；`slug` 不存在 → 404；正在被全局/单站暂停时，任务记为 `paused` 并写同步日志。
+
+**并发与排队**：服务端同一时刻最多执行 `SOURCE_SYNC_CONCURRENCY` 个源站同步（默认 2），超出的排队等待（不占数据库连接）。
+所以连续触发 10 个源站不会把服务打挂，只会排队；管理端应展示排队状态而不是重复点击。
+
 
 ---
 
@@ -1013,6 +1046,9 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 | 14 | 管理操作返回成功但没进度 | 异步受理 | 轮询 `/api/v1/sources` 的 `running` / `progress` |
 | 15 | 某源站一直同步失败 | 直连被墙/被风控 | 服务端会自动切中转代理；查看 `/api/v1/stats` 的 `proxy` 段确认是否走代理 |
 | 16 | 未同步的站显示「已完成」 | v1.4.0 前的进度口径 bug | 升级后按 `synced` 字段判断：`false` 一律显示「未同步」 |
+| 17 | 接口返回 **503**（带 `Retry-After`） | 服务端连接池/写锁繁忙（同步负载高） | **不是接口坏了**，按 `Retry-After` 退避重试；`/api/v1/stats` 的 `sync_load`、`db_pool` 可看压力 |
+| 18 | `/healthz` 返回 200 但 `status=degraded` | 数据库暂不可用（v1.4.1 行为，避免容器被误判不健康） | 按 `db=false` 提示"服务繁忙"，不要当服务已死 |
+| 19 | 提交同步后该站显示「排队中」 | 达到全局并发上限（`SOURCE_SYNC_CONCURRENCY`） | 正常排队，等待即可；不要重复提交（会返回 `already_running`） |
 
 ---
 
@@ -1032,7 +1068,9 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 | `API_PAGE_SIZE_DEFAULT` / `API_PAGE_SIZE_MAX` | 20 / 100 | 分页默认值与上限（客户端可从这里读取实际值） |
 | `SYNC_INTERVAL_MINUTES` | 360 | 定时增量间隔（分钟） |
 | `SOURCE_REFRESH_INTERVAL_MINUTES` | 720 | 源站列表刷新间隔（分钟） |
-| `SOURCE_SYNC_CONCURRENCY` / `PAGE_CONCURRENCY` | 2 / 4 | 同步并发度 |
+| `SOURCE_SYNC_CONCURRENCY` / `PAGE_CONCURRENCY` | 2 / 4 | 同步并发度（前者是全局并发闸门，超出排队） |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` / `DB_POOL_TIMEOUT` | 10 / 20 / 10 | 连接池大小与等连接超时（超时接口返回 503） |
+| `SEARCH_CONCURRENCY` | 4 | 聚合搜索并行度 |
 | `PROXY_ENABLED` / `PROXY_URLS` | true / 2 个内置代理 | 直连失败后自动走中转代理（`{proxy}?url=<urlencode(目标)>`） |
 | `PROXY_PREF_TTL_MINUTES` | 30 | "该源站需走代理"的记忆时长 |
 | `DATABASE_URL` | 本地 SQLite | 可切 PostgreSQL |
@@ -1043,7 +1081,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.4.0（当前） | 服务端新增中转代理降级（源站不可达自动走代理）；新增 `synced` 字段，修正未同步站进度误显示 100 |
+| v1.4.1（当前） | 服务端稳定性修复：同步并发闸门（超出排队）、同源站防重入、连接池可配、`/healthz` 池满时仍 200 + `degraded`、过载统一 503；新增 `queued`、`db_pool`、`sync_load` 字段 |
+| v1.4.0 | 服务端新增中转代理降级（源站不可达自动走代理）；新增 `synced` 字段，修正未同步站进度误显示 100 |
 | v1.3.0 | 新增 `auto_sync` 字段与单站/批量自动同步开关接口 |
 | v1.2.2 | 新增 `running` / `running_mode` / `running_seconds`，修正"暂停按钮误显示" |
 | v1.2.1 | 新增单源站暂停/继续接口与 `paused` / `paused_at` |

@@ -215,9 +215,27 @@ def categories(
 # ---------------------------------------------------------------------------
 @router.get("/healthz")
 def healthz():
-    with database.engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
-    return {"status": "ok", "time": datetime.now().isoformat()}
+    """
+    健康检查 / 存活探针。
+
+    关键点：数据库繁忙时**不返回 5xx**。容器健康检查只看 HTTP 状态码，
+    若这里因为连接池排队而报 500/超时，Docker 会把一个其实还在正常干活的容器判定为不健康
+    并反复重启（v1.4.0 在 NAS 上就表现为"容器崩溃"）。因此这里始终 200，
+    用 db 字段表达数据库是否可用。
+    """
+    now = datetime.now().isoformat()
+    try:
+        with database.engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {"status": "ok", "db": True, "time": now}
+    except Exception as e:
+        log.warning("/healthz 数据库暂不可用: %s", e)
+        return {
+            "status": "degraded",
+            "db": False,
+            "detail": str(e)[:200],
+            "time": now,
+        }
 
 
 def _is_synced(row) -> bool:
@@ -266,6 +284,7 @@ def list_sources():
     from .. import syncer
 
     running = syncer.running_snapshot()
+    queued = syncer.queued_slugs()
 
     with database.engine.connect() as conn:
         rows = conn.execute(
@@ -292,6 +311,8 @@ def list_sources():
                 "running": r["slug"] in running,
                 "running_mode": running.get(r["slug"], {}).get("mode"),
                 "running_seconds": running.get(r["slug"], {}).get("elapsed_seconds"),
+                # 已排队等待并发名额（还没开始跑）：前端可显示「排队中」
+                "queued": r["slug"] in queued,
                 # 是否同步过：false 表示从未开始，前端应显示「未同步」而非「已完成」
                 "synced": _is_synced(r),
                 # 全量同步进度（0-100）；从未同步=0，已完成=100
@@ -415,6 +436,9 @@ def stats():
         "pause": pause.snapshot(),   # 同步暂停状态（面板顶栏开关用）
         # 中转代理运行态：是否启用、走代理的源站、成功/失败计数（排障用）
         "proxy": proxy_snapshot(),
+        # 数据库连接池 + 同步负载（判断"是不是又堆任务了"最直接的两个指标）
+        "db_pool": database.pool_status(),
+        "sync_load": syncer.sync_load(),
         "last_error": (
             {"slug": last_error[0], "error": last_error[1],
              "at": last_error[2].isoformat() if last_error[2] else None}
@@ -586,10 +610,22 @@ def _bg_sync_new(slugs: list):
 
 @router.post("/api/v1/sync/{slug}")
 def trigger_sync(slug: str, mode: str = Query(default="auto", pattern="^(auto|full|incremental)$")):
-    """手动触发单源站同步（后台执行，立即返回任务受理结果）。"""
-    _require_table(slug) if slug != "*" else None
-    threading.Thread(target=sync_source, args=(validate_slug(slug), mode), daemon=True).start()
-    return {"code": 1, "msg": f"同步任务已受理: {slug} mode={mode}"}
+    """
+    手动触发单源站同步（后台执行，立即返回受理结果）。
+
+    并发受全局闸门（SOURCE_SYNC_CONCURRENCY）限制：名额已满时任务进入排队，
+    同一源站已在排队/运行时不会重复提交（返回 status=already_running）。
+    """
+    from .. import syncer
+
+    if slug != "*":
+        _require_table(slug)
+    slug = validate_slug(slug) if slug != "*" else "*"
+    if syncer.is_busy(slug):
+        return {"code": 1, "status": "already_running",
+                "msg": f"{slug} 已有同步任务在排队或执行中，本次未重复提交"}
+    threading.Thread(target=sync_source, args=(slug, mode), daemon=True).start()
+    return {"code": 1, "status": "accepted", "msg": f"同步任务已受理: {slug} mode={mode}"}
 
 
 @router.post("/api/v1/sync-all")
@@ -806,17 +842,20 @@ def video_list(
         raise HTTPException(status_code=404, detail="指定源站均无数据")
 
     merged = union_all(*union_parts).subquery()
-    total = database.engine.connect().execute(
-        select(func.count()).select_from(merged), params
-    ).scalar() or 0
-    pagecount = (total + page_size - 1) // page_size
-    rows = database.engine.connect().execute(
-        select(merged)
-        .order_by(literal_column("vod_time").desc(), literal_column("vod_id").desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size),
-        params,
-    ).mappings().all()
+    # 注意：必须用 with 归还连接。之前写成 engine.connect().execute(...) 直接丢弃对象，
+    # 连接靠 GC 回收（不确定何时发生），高频调用时会把连接池悄悄占满（v1.4.1 修复）。
+    with database.engine.connect() as conn:
+        total = conn.execute(
+            select(func.count()).select_from(merged), params
+        ).scalar() or 0
+        pagecount = (total + page_size - 1) // page_size
+        rows = conn.execute(
+            select(merged)
+            .order_by(literal_column("vod_time").desc(), literal_column("vod_id").desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size),
+            params,
+        ).mappings().all()
 
     return {
         "code": 1,
@@ -942,7 +981,7 @@ def aggregate_search(
     collected: list = []
     failed: list = []
     truncated_sources: list = []
-    workers = min(8, len(slugs))
+    workers = max(1, min(config.SEARCH_CONCURRENCY, len(slugs)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(search_one, s): s for s in slugs}
         for fut in as_completed(futures):

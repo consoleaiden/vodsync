@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.4.0"
+    "version": "1.4.1"
   },
   "paths": {
     "/api/v1/categories": {
@@ -70,6 +70,7 @@
     "/healthz": {
       "get": {
         "summary": "Healthz",
+        "description": "健康检查 / 存活探针。\n\n关键点：数据库繁忙时**不返回 5xx**。容器健康检查只看 HTTP 状态码，\n若这里因为连接池排队而报 500/超时，Docker 会把一个其实还在正常干活的容器判定为不健康\n并反复重启（v1.4.0 在 NAS 上就表现为\"容器崩溃\"）。因此这里始终 200，\n用 db 字段表达数据库是否可用。",
         "operationId": "healthz_healthz_get",
         "parameters": [
           {
@@ -664,7 +665,7 @@
     "/api/v1/sync/{slug}": {
       "post": {
         "summary": "Trigger Sync",
-        "description": "手动触发单源站同步（后台执行，立即返回任务受理结果）。",
+        "description": "手动触发单源站同步（后台执行，立即返回受理结果）。\n\n并发受全局闸门（SOURCE_SYNC_CONCURRENCY）限制：名额已满时任务进入排队，\n同一源站已在排队/运行时不会重复提交（返回 status=already_running）。",
         "operationId": "trigger_sync_api_v1_sync__slug__post",
         "parameters": [
           {

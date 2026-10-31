@@ -33,6 +33,59 @@ log = logging.getLogger("vodsync.syncer")
 _running: dict[str, dict] = {}
 _running_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# 全局并发闸门（v1.4.1 修复连接池耗尽的关键）
+#
+# 为什么需要：面板上连点十几个「全量」时，每次请求各起一个线程，没有任何上限。
+# SQLite 只允许一个写者，十几个写线程会互相等锁，每个等锁线程占着一个连接池连接，
+# 池满后连 /healthz、面板刷新都 30s 超时 → 表现为整个服务"挂了"。
+# 这里用一个信号量把「同时真正在跑的源站同步」限制在 SOURCE_SYNC_CONCURRENCY 个，
+# 其余排队等待（排队不占数据库连接）。
+# ---------------------------------------------------------------------------
+_sync_slots: threading.BoundedSemaphore = None
+_sync_slots_lock = threading.Lock()
+
+# 已排队或正在跑的源站：同一个源站不允许被并发触发两次（否则同表双写）
+_pending: set[str] = set()
+
+
+def _slots() -> threading.BoundedSemaphore:
+    """惰性创建并发闸门（读取时用最新配置，便于测试与环境变量覆盖）。"""
+    global _sync_slots
+    with _sync_slots_lock:
+        if _sync_slots is None:
+            _sync_slots = threading.BoundedSemaphore(max(1, config.SOURCE_SYNC_CONCURRENCY))
+        return _sync_slots
+
+
+def reset_sync_slots(size: int = None):
+    """重建并发闸门（测试 / 运行时调整并发时使用）。"""
+    global _sync_slots
+    with _sync_slots_lock:
+        _sync_slots = threading.BoundedSemaphore(max(1, size or config.SOURCE_SYNC_CONCURRENCY))
+    return _sync_slots
+
+
+def sync_load() -> dict:
+    """当前同步负载：正在跑 / 排队中。供面板与 /stats 展示。"""
+    with _running_lock:
+        running = len(_running)
+        queued = max(0, len(_pending) - running)
+    return {"running": running, "queued": queued, "limit": max(1, config.SOURCE_SYNC_CONCURRENCY)}
+
+
+def queued_slugs() -> set:
+    """已排队但还没轮到执行的源站（并发闸门外的等待者）。"""
+    with _running_lock:
+        return set(_pending) - set(_running)
+
+
+def is_busy(slug: str) -> bool:
+    """该源站是否已在排队或运行中（用于避免重复提交）。"""
+    with _running_lock:
+        return slug in _pending
+
+
 
 def mark_running(slug: str, mode: str):
     """登记某源站开始同步。"""
@@ -83,7 +136,7 @@ def refresh_sources(client: MacCmsClient = None) -> list:
 
     resources = data.get("resources") or []
     new_slugs = []
-    with database.engine.begin() as conn:
+    with database.write_txn() as conn:
         for res in resources:
             api_url = (res.get("api") or "").strip()
             name = (res.get("name") or "").strip()
@@ -146,7 +199,7 @@ def is_source_paused(slug: str) -> bool:
 
 def set_source_paused(slug: str, paused: bool):
     """设置单源站暂停标记（持久化在 sources 表，重启后仍生效）。"""
-    with database.engine.begin() as conn:
+    with database.write_txn() as conn:
         conn.execute(
             sources.update()
             .where(sources.c.slug == slug)
@@ -165,7 +218,7 @@ def should_stop(slug: str, mode: str) -> bool:
 # （手动单站同步不受影响；状态持久化在 sources 表，重启后仍生效）
 # ---------------------------------------------------------------------------
 def set_source_auto_sync(slug: str, enabled: bool) -> None:
-    with database.engine.begin() as conn:
+    with database.write_txn() as conn:
         conn.execute(
             sources.update().where(sources.c.slug == slug).values(
                 auto_sync=1 if enabled else 0
@@ -182,7 +235,7 @@ def set_auto_sync_bulk(enabled: bool, slugs: list = None) -> int:
     stmt = sources.update().values(auto_sync=1 if enabled else 0)
     if slugs:
         stmt = stmt.where(sources.c.slug.in_(slugs))
-    with database.engine.begin() as conn:
+    with database.write_txn() as conn:
         res = conn.execute(stmt)
     n = res.rowcount or 0
     log.info("批量自动同步 = %s: 更新 %d 个源站%s",
@@ -208,7 +261,7 @@ def upsert_batch(slug: str, rows: list) -> tuple:
     # 先查询本批中已存在的 id，用于统计 inserted/updated
     ids = [r["vod_id"] for r in rows]
     existing = set()
-    with database.engine.begin() as conn:
+    with database.write_txn() as conn:
         for i in range(0, len(ids), 500):
             chunk = ids[i : i + 500]
             found = conn.execute(
@@ -268,7 +321,7 @@ def full_sync(slug: str, client: MacCmsClient) -> dict:
     pagecount = int(first.get("pagecount") or 0)
     total = int(first.get("total") or 0)
     # 记录总页数，供管理面板显示进度（断点续传时也保持有效）
-    with database.engine.begin() as conn:
+    with database.write_txn() as conn:
         conn.execute(
             sources.update().where(sources.c.slug == slug).values(total_pages=pagecount)
         )
@@ -333,19 +386,34 @@ def full_sync(slug: str, client: MacCmsClient) -> dict:
     return stats
 
 
+def _table_count(table) -> int:
+    """
+    单独用读连接统计行数。
+
+    为什么不放在写事务里：count(*) 要扫整棵表（十万~百万行，几百毫秒），
+    放进写事务就等于「持写锁做全表扫描」，其他源站的写全部排队，是连接池被占满的帮凶。
+    WAL 下读不阻塞写，所以独立读连接拿数更划算（数字最多滞后一次检查点）。
+    """
+    try:
+        with database.engine.connect() as conn:
+            return conn.execute(select(func.count()).select_from(table)).scalar() or 0
+    except Exception as e:  # 统计失败不影响断点保存
+        log.warning("统计 %s 条数失败: %s", table.name, e)
+        return None
+
+
 def _save_checkpoint(slug: str, page: int):
     """
     保存全量同步断点，同时刷新本库条数。
     为什么在这里算条数：全量同步可能持续数小时，若不刷新，管理面板会一直显示 0 条。
     """
-    with database.engine.begin() as conn:
-        table = build_vod_table(slug)
-        count = conn.execute(select(func.count()).select_from(table)).scalar() or 0
-        conn.execute(
-            sources.update()
-            .where(sources.c.slug == slug)
-            .values(last_page=page, total_videos=count, last_sync_at=datetime.now())
-        )
+    table = build_vod_table(slug)
+    count = _table_count(table)
+    values = {"last_page": page, "last_sync_at": datetime.now()}
+    if count is not None:
+        values["total_videos"] = count
+    with database.write_txn() as conn:
+        conn.execute(sources.update().where(sources.c.slug == slug).values(**values))
 
 
 def refresh_counts(slug: str = None) -> int:
@@ -364,8 +432,10 @@ def refresh_counts(slug: str = None) -> int:
             table = build_vod_table(s)
             if not database.table_exists(table.name):
                 continue
-            with database.engine.begin() as conn:
-                count = conn.execute(select(func.count()).select_from(table)).scalar() or 0
+            count = _table_count(table)
+            if count is None:
+                continue
+            with database.write_txn() as conn:
                 conn.execute(
                     sources.update().where(sources.c.slug == s).values(total_videos=count)
                 )
@@ -378,10 +448,11 @@ def refresh_counts(slug: str = None) -> int:
 
 def _finish_full(slug: str, class_map: dict):
     """全量完成后：清断点、写入水位线为库内最大 vod_time、刷新条数。"""
-    with database.engine.begin() as conn:
-        table = build_vod_table(slug)
+    table = build_vod_table(slug)
+    with database.engine.connect() as conn:
         max_time = conn.execute(select(func.max(table.c.vod_time))).scalar() or ""
-        count = conn.execute(select(func.count()).select_from(table)).scalar() or 0
+    count = _table_count(table)
+    with database.write_txn() as conn:
         conn.execute(
             sources.update()
             .where(sources.c.slug == slug)
@@ -389,11 +460,11 @@ def _finish_full(slug: str, class_map: dict):
                 last_page=0,
                 total_pages=0,
                 watermark=max_time[:19],
-                total_videos=count,
+                total_videos=count if count is not None else 0,
                 last_sync_at=datetime.now(),
             )
         )
-    log.info("[%s] 水位线=%s 本库条数=%d", slug, max_time, count)
+    log.info("[%s] 水位线=%s 本库条数=%s", slug, max_time, count)
 
 
 # ---------------------------------------------------------------------------
@@ -508,14 +579,13 @@ def incremental_sync(slug: str, client: MacCmsClient) -> dict:
 
 def _mark_synced(slug: str, watermark: str, _index_size: int):
     """同步成功后：更新水位线/时间，并刷新本地总条数。"""
-    with database.engine.begin() as conn:
-        table = build_vod_table(slug)
-        count = conn.execute(select(func.count()).select_from(table)).scalar() or 0
-        conn.execute(
-            sources.update()
-            .where(sources.c.slug == slug)
-            .values(watermark=watermark[:19], total_videos=count, last_sync_at=datetime.now())
-        )
+    table = build_vod_table(slug)
+    count = _table_count(table)
+    values = {"watermark": watermark[:19], "last_sync_at": datetime.now()}
+    if count is not None:
+        values["total_videos"] = count
+    with database.write_txn() as conn:
+        conn.execute(sources.update().where(sources.c.slug == slug).values(**values))
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +595,11 @@ def sync_source(slug: str, mode: str = "auto") -> dict:
     """
     同步单个源站。
     mode: auto（无水位线则全量，否则增量）/ full / incremental
+
+    两道保护（v1.4.1）：
+    1. 同一源站不允许并发触发 —— 面板连点两下不会变成两个线程双写同一张表；
+    2. 全局并发闸门 —— 同时真正在跑的源站不超过 SOURCE_SYNC_CONCURRENCY 个，
+       其余排队（排队不占数据库连接，避免把连接池占满）。
     """
     with database.engine.connect() as conn:
         src = get_source(conn, slug)
@@ -538,25 +613,38 @@ def sync_source(slug: str, mode: str = "auto") -> dict:
         log.info("[%s] 同步被暂停控制拦截 (mode=%s)", slug, mode)
         return {"slug": slug, "mode": mode, "status": "paused"}
 
-    log_id = _start_log(slug, mode)
-    client = MacCmsClient()
-    mark_running(slug, mode)          # 进入运行态：此后该源站才允许「暂停」
+    # ---- 防重入：同一源站已在排队/运行中，直接返回 ----
+    with _running_lock:
+        if slug in _pending:
+            log.info("[%s] 已有同步任务在执行，跳过本次触发 (mode=%s)", slug, mode)
+            return {"slug": slug, "mode": mode, "status": "already_running"}
+        _pending.add(slug)
+
     try:
-        ensure_table(slug)
-        if mode == "full":
-            stats = full_sync(slug, client)
-        else:
-            stats = incremental_sync(slug, client)
-        _finish_log(log_id, "paused" if stats.get("paused") else "success", stats)
-        return {"slug": slug, "mode": mode,
-                "status": "paused" if stats.get("paused") else "success", **stats}
-    except Exception as e:
-        log.exception("[%s] 同步失败", slug)
-        _finish_log(log_id, "failed", {"error": str(e)})
-        return {"slug": slug, "mode": mode, "status": "failed", "error": str(e)}
+        # ---- 并发闸门：排队等待，不占数据库连接 ----
+        with _slots():
+            log_id = _start_log(slug, mode)
+            client = MacCmsClient()
+            mark_running(slug, mode)      # 进入运行态：此后该源站才允许「暂停」
+            try:
+                ensure_table(slug)
+                if mode == "full":
+                    stats = full_sync(slug, client)
+                else:
+                    stats = incremental_sync(slug, client)
+                _finish_log(log_id, "paused" if stats.get("paused") else "success", stats)
+                return {"slug": slug, "mode": mode,
+                        "status": "paused" if stats.get("paused") else "success", **stats}
+            except Exception as e:
+                log.exception("[%s] 同步失败", slug)
+                _finish_log(log_id, "failed", {"error": str(e)})
+                return {"slug": slug, "mode": mode, "status": "failed", "error": str(e)}
+            finally:
+                mark_stopped(slug)        # 退出运行态
+                client.close()
     finally:
-        mark_stopped(slug)            # 退出运行态
-        client.close()
+        with _running_lock:
+            _pending.discard(slug)
 
 
 def trigger_resume(scope: str) -> list:
@@ -631,7 +719,7 @@ def sync_all(force_mode: str = "auto") -> list:
 
 
 def _start_log(slug: str, mode: str) -> int:
-    with database.engine.begin() as conn:
+    with database.write_txn() as conn:
         res = conn.execute(
             sync_logs.insert().values(slug=slug, mode=mode, status="running")
         )
@@ -639,7 +727,7 @@ def _start_log(slug: str, mode: str) -> int:
 
 
 def _finish_log(log_id: int, status: str, stats: dict):
-    with database.engine.begin() as conn:
+    with database.write_txn() as conn:
         conn.execute(
             sync_logs.update()
             .where(sync_logs.c.id == log_id)

@@ -54,6 +54,21 @@ INCR_CHECK_MISSING = os.environ.get("INCR_CHECK_MISSING", "false").lower() == "t
 CHECKPOINT_EVERY_PAGES = int(os.environ.get("CHECKPOINT_EVERY_PAGES", "5"))
 
 # ---------------------------------------------------------------------------
+# 数据库连接池
+#
+# 背景：SQLite 只允许一个写者，并发写会互相等锁；每个等锁的线程都占着一个池连接，
+#      池被占满后所有请求（含 /healthz）都会 30s 超时报错。经验：
+#      「限并发写」比「放大连接池」有效，下面的池大小只作为安全余量。
+# ---------------------------------------------------------------------------
+DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "10"))
+DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "20"))
+# 等连接的超时（秒）。小于 SQLite busy_timeout，宁可快速失败也不长时间挂住请求
+DB_POOL_TIMEOUT = int(os.environ.get("DB_POOL_TIMEOUT", "10"))
+
+# 聚合搜索的并行度（每个线程各占一个数据库连接）
+SEARCH_CONCURRENCY = int(os.environ.get("SEARCH_CONCURRENCY", "4"))
+
+# ---------------------------------------------------------------------------
 # 中转代理：上游源站不可直连时的降级通道
 #
 # 代理约定：{proxy}?url=<urlencode(目标地址)>

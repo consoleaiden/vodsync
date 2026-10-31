@@ -481,4 +481,4 @@ POST /api/v1/sources/auto-sync?enabled=true&slugs=jkun,t1  # 只开启指定站
 
 ---
 
-*文档版本：对应服务 v1.3.0。字段如有增补，以 `/docs`（Swagger）与 `/openapi.json` 为准；完整交付版见 [`API_SPEC_FOR_AI.md`](./API_SPEC_FOR_AI.md)。*
+*文档版本：对应服务 v1.4.1。字段如有增补，以 `/docs`（Swagger）与 `/openapi.json` 为准；完整交付版见 [`API_SPEC_FOR_AI.md`](./API_SPEC_FOR_AI.md)。*

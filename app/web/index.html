@@ -446,7 +446,7 @@ async function loadSources() {
           <div class="name">${esc(s.name)}</div>
           <div class="slugcode">${esc(s.slug)}</div>
         </td>
-        <td>${s.status === "ok" ? '<span class="badge ok">在线</span>' : '<span class="badge bad">离线</span>'}${s.paused ? ' <span class="badge warn">本站暂停</span>' : ""}</td>
+        <td>${s.status === "ok" ? '<span class="badge ok">在线</span>' : '<span class="badge bad">离线</span>'}${s.paused ? ' <span class="badge warn">本站暂停</span>' : ""}${s.queued ? ' <span class="badge mute">排队中</span>' : ""}</td>
         <td class="num">${fmtNum(s.total_videos)}</td>
         <td style="min-width:130px">${prog}</td>
         <td class="muted num" style="font-size:12px">${esc(s.watermark || "-")}</td>
@@ -504,8 +504,12 @@ async function loadLogs() {
 // ---------------- 操作 ----------------
 async function triggerSync(slug, mode) {
   try {
-    await api(`/api/v1/sync/${encodeURIComponent(slug)}?mode=${mode}`, { method: "POST" });
-    toast(`${slug} 已提交${mode === "full" ? "全量" : "增量"}同步任务`);
+    const res = await api(`/api/v1/sync/${encodeURIComponent(slug)}?mode=${mode}`, { method: "POST" });
+    if (res.status === "already_running") {
+      toast(`${slug} 已有同步任务在执行，本次未重复提交`);
+    } else {
+      toast(`${slug} 已提交${mode === "full" ? "全量" : "增量"}同步任务（并发已满时会排队）`);
+    }
     setTimeout(refreshAll, 1200);
   } catch (e) { toast("提交失败：" + e.message, true); }
 }

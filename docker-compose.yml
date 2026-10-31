@@ -20,9 +20,14 @@ services:
       # ---- 调度 ----
       SYNC_INTERVAL_MINUTES: "360"         # 增量同步间隔（分钟），默认 6 小时
       SOURCE_REFRESH_INTERVAL_MINUTES: "720"  # 源站列表刷新间隔（分钟）
-      SOURCE_SYNC_CONCURRENCY: "2"         # 并行同步的源站数（NAS 性能弱建议 1-2）
+      SOURCE_SYNC_CONCURRENCY: "2"         # 同时真正在跑的源站同步数上限（超出排队；NAS 建议 1-2）
       PAGE_CONCURRENCY: "4"                # 单源站内并行抓取页数
       REQUEST_INTERVAL_SECONDS: "0.3"      # 请求间隔，防源站封禁
+      # ---- 数据库连接池（连接池耗尽会导致接口 500/503，见 README 常见坑第 7 条）----
+      DB_POOL_SIZE: "10"
+      DB_MAX_OVERFLOW: "20"
+      DB_POOL_TIMEOUT: "10"                # 等连接超时（秒），超时返回 503 让客户端退避
+      SEARCH_CONCURRENCY: "4"              # 聚合搜索并行度
       # ---- 中转代理（源站直连失败时自动降级）----
       PROXY_ENABLED: "true"
       PROXY_URLS: "https://pz.v88.qzz.io/,https://mconfig.viptv.work/"

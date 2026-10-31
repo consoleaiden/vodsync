@@ -8,9 +8,10 @@ import logging
 import os
 import threading
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from sqlalchemy.exc import OperationalError, TimeoutError as SADBTimeoutError
 
 from . import config, database
 from .routes.api import router
@@ -29,10 +30,40 @@ app = FastAPI(
         "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，"
         "并对外提供统一的视频列表/详情 API（source 参数区分源站）。"
     ),
-    version="1.4.0",
+    version="1.4.1",
 )
 
 app.include_router(router)
+
+
+# ---------------------------------------------------------------------------
+# 数据库繁忙时的统一响应
+#
+# 连接池排队超时（TimeoutError）或 SQLite 写锁超时（OperationalError: database is locked）
+# 属于"服务临时过载"，不是代码 bug。返回 503 + 明确提示，让客户端知道该退避重试，
+# 而不是抛 500 让面板/App 显示一堆堆栈。
+# ---------------------------------------------------------------------------
+@app.exception_handler(SADBTimeoutError)
+def _db_pool_timeout_handler(request: Request, exc: SADBTimeoutError):  # noqa: ANN001
+    log.error("数据库连接池等待超时: %s %s", request.url.path, exc)
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "服务繁忙：数据库连接池已满，请稍后重试（可减少同时运行的全量同步数量）",
+            "code": 0,
+        },
+        headers={"Retry-After": "5"},
+    )
+
+
+@app.exception_handler(OperationalError)
+def _db_operational_handler(request: Request, exc: OperationalError):  # noqa: ANN001
+    log.error("数据库操作失败: %s %s", request.url.path, exc)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "数据库繁忙或暂不可用，请稍后重试", "code": 0},
+        headers={"Retry-After": "5"},
+    )
 
 # 客户端开发支持：放行浏览器跨域调用（H5 / Web App 直接可调；原生 App 不受影响）
 # 可通过环境变量 CORS_ORIGINS 限制来源，逗号分隔；默认允许全部。

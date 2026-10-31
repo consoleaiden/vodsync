@@ -226,13 +226,17 @@ GET /api/v1/{slug}?ac=detail&ids=1,2,3 # 按 ID 批量取详情
 |---|---|---|
 | `SYNC_INTERVAL_MINUTES` | 360 | 增量同步间隔（分钟） |
 | `SOURCE_REFRESH_INTERVAL_MINUTES` | 720 | 源站列表刷新间隔 |
-| `SOURCE_SYNC_CONCURRENCY` | 2 | 并行同步的源站数（NAS 建议 1-2） |
+| `SOURCE_SYNC_CONCURRENCY` | 2 | **同时真正在跑的源站同步数上限**（全局闸门，排队不占资源；NAS 建议 1-2） |
 | `PAGE_CONCURRENCY` | 4 | 单源站内并行抓取页数 |
 | `REQUEST_INTERVAL_SECONDS` | 0.2 | 请求间隔，防源站封禁 |
 | `PROXY_ENABLED` | true | 直连失败后是否自动走中转代理 |
 | `PROXY_URLS` | 2 个内置地址 | 中转代理列表（逗号分隔），格式 `{proxy}?url=<urlencode(目标地址)>` |
 | `PROXY_PREF_TTL_MINUTES` | 30 | "该源站需走代理"的记忆时长，到期重试直连 |
 | `PROXY_CONCURRENCY` | 4 | 每个代理的最大并发请求数 |
+| `DB_POOL_SIZE` | 10 | 数据库连接池常驻连接数 |
+| `DB_MAX_OVERFLOW` | 20 | 连接池峰值溢出连接数 |
+| `DB_POOL_TIMEOUT` | 10 | 等连接的秒数，超时返回 503（不是 500） |
+| `SEARCH_CONCURRENCY` | 4 | 聚合搜索的并行度（每线程占一个连接） |
 | `DATABASE_URL` | SQLite | 切 PostgreSQL：`postgresql+psycopg2://user:pass@host:5432/db` |
 | `API_KEY` | 空 | 设置后接口需带 `X-API-Key` 头 |
 | `ONLY_OK_SOURCES` | true | 只同步在线源站 |
@@ -280,6 +284,11 @@ git push origin v1.0.0
 4. **群晖 ARM 机型**：CI 已构建 `linux/arm64` 镜像，直接可用
 5. **切换 PostgreSQL**：修改 `DATABASE_URL` 即可，表结构自动创建；SQLite 文件中的历史数据需手动迁移
 6. **磁盘占用**：百万条记录 + 简介文本约 1-3GB，预留空间；SQLite 启用 WAL 后同目录会出现 `-wal`/`-shm` 文件属正常现象
+7. **服务「假死」/接口全 500 / 容器不健康**：基本都是同时跑了太多同步任务导致 SQLite 写锁争抢、连接池被占满（v1.4.1 已加全局并发闸门，正常不会再发生）。排查顺序：
+   - `GET /api/v1/stats` 看 `sync_load`（running/queued/limit）与 `db_pool.checked_out`；`checked_out` 长期贴近 `size+max_overflow` 说明压力过大
+   - 面板上同时点多个「全量」时，超出的会进入「排队中」，属正常排队，不要重复点击
+   - 想更快完成多个源站全量，调大 `SOURCE_SYNC_CONCURRENCY`（NAS 上建议 ≤2，SQLite 写是串行的，调太大只会互相等锁）
+   - 若日志仍有 `QueuePool limit ... reached`，把 `DB_POOL_TIMEOUT` 调小（如 5）让请求快速失败，并检查是否有外部脚本在狂刷列表接口
 
 ## 项目结构
 
@@ -388,3 +397,17 @@ vodsync/
   - 修复：新增 `synced` 判定（水位线 / 已入库 / 有断点 任一成立才算同步过），从未同步时进度恒为 0
   - `/api/v1/sources`、`/api/v1/sources/{slug}` 新增 `synced` 字段；面板对未同步站显示 `0%` +「从未同步 · 可点「增量」开始」
 - 测试：新增 `scripts/test_v140_proxy_progress.py`（19 项：URL 编码、直连不可达/403 自动切代理、记忆与 TTL、代理关闭即报错、进度口径）；`scripts/test_panel_render.js` 增加"未同步不得显示已完成"断言
+
+### v1.4.1
+- 修复：**并发同步过多导致数据库连接池耗尽，整个服务「假死」**（NAS 上表现为容器不健康 / 面板全 500）
+  - 根因链：面板连点十几个「全量」→ 每个请求各起一个线程、无任何上限 → SQLite 只允许一个写者，十几个写线程互相等写锁 → 等锁期间线程仍占着连接池连接（默认 5+10）→ 池满后连 `/healthz` 都 30s 超时 → Docker 判容器不健康
+  - **全局并发闸门**：`sync_source` 内加信号量，无论谁触发（面板 / 定时 / 续跑 / 批量），同时真正在跑的源站不超过 `SOURCE_SYNC_CONCURRENCY`（默认 2），其余排队且**不占数据库连接**；`/stats.sync_load`、`/sources[].queued` 可看排队情况，面板显示「排队中」
+  - **同源站防重入**：同一源站已在排队/运行时重复触发直接返回 `status=already_running`，不再双写同一张表
+  - **写事务串行化**：新增 `database.write_txn()`，SQLite 下进程内串行所有写事务，消除 `database is locked` 与写锁抢占；所有业务写操作统一走它
+  - **count(*) 移出写事务**：断点保存 / 水位线更新不再"持着写锁做全表扫描"，改用独立读连接先统计
+  - **修掉一处连接泄漏**：`GET /api/v1/videos` 原来是 `engine.connect().execute(...)` 直接丢弃对象（靠 GC 归还），改为 `with` 显式归还
+  - **连接池可配 + 更容易排障**：`DB_POOL_SIZE`(10) / `DB_MAX_OVERFLOW`(20) / `DB_POOL_TIMEOUT`(10)，`/api/v1/stats` 新增 `db_pool`、`sync_load`
+  - **`/healthz` 不再因数据库繁忙返回 5xx**：始终 200，用 `status=ok|degraded` + `db:true|false` 表达，避免 Docker 把还在干活的容器反复重启（健康检查只看状态码）
+  - **503 语义**：连接池排队超时 / `database is locked` 统一返回 `503` + `Retry-After: 5`，不再是 500 堆栈
+  - 聚合搜索并行度收敛为 `SEARCH_CONCURRENCY`（默认 4，原来固定 8，每线程各占一个连接）
+- 测试：新增 `scripts/test_v141_pool.py`（17 项：池参数、无泄漏、并发闸门峰值、防重入、并发写、池满时 healthz、断点保存）与 `scripts/loadtest_concurrency.py`（端到端：12 源站同时全量，实测峰值并发 2、探活 0 失败、连接池归零、720 条数据全部入库）
