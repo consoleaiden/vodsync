@@ -34,12 +34,16 @@ services:
       PROXY_PREF_TTL_MINUTES: "30"         # 走代理成功的源站，多久后重试直连
       PROXY_CONCURRENCY: "4"               # 每个代理的并发上限
       # ---- 数据库 ----
-      # 默认 SQLite（推荐），如需 PostgreSQL 打开下行并连接外部 PG 容器：
+      # 默认 SQLite（推荐），如需 PostgreSQL：迁移完成后再解开下行
       # DATABASE_URL: "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync"
       # ---- API ----
       API_PAGE_SIZE_DEFAULT: "20"
       API_KEY: ""                          # 留空不鉴权；设置后请求需带 X-API-Key 头
       TZ: "Asia/Shanghai"
+    # 启用 PostgreSQL 后解开（配合 postgres 的 healthcheck，避免 vodsync 比库先起而启动失败）
+    # depends_on:
+    #   postgres:
+    #     condition: service_healthy
 
   # ---- 可选：PostgreSQL（数据量超大或多实例共享时启用） ----
   # 切换前先迁数据，不用重新同步（详见 README「从 SQLite 迁移到 PostgreSQL」）：
@@ -57,5 +61,15 @@ services:
   #     POSTGRES_USER: vodsync
   #     POSTGRES_PASSWORD: vodsync
   #     POSTGRES_DB: vodsync
+  #     TZ: Asia/Shanghai
   #   volumes:
-  #     - /volume1/docker/vodsync/pgdata:/var/lib/postgresql/data
+  #     - /volume1/docker/vodsync/pgdata:/var/lib/postgresql/data   # 与上面 data 卷同一前缀
+  #   healthcheck:                     # 让 vodsync 等 PG 就绪再启动（配合 vodsync 的 depends_on）
+  #     test: ["CMD-SHELL", "pg_isready -U vodsync -d vodsync"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 10
+  #     start_period: 20s
+  #   # 不要映射 5432 到宿主机：容器之间直连用服务名即可，映射反而容易和已有 PG 抢端口
+  #   # ports:
+  #   #   - "5433:5432"

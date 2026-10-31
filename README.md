@@ -246,6 +246,38 @@ GET /api/v1/{slug}?ac=detail&ids=1,2,3 # 按 ID 批量取详情
 换成 PostgreSQL 后新库是空的。**不用把所有源站重新抓一遍** —— 用迁移脚本把 SQLite 里的数据整体搬过去即可，
 连 `watermark`（增量水位线）和 `last_page`（全量断点）都会保留，迁完直接接着做增量。
 
+### 0) 先把 PG 加进 compose（群晖 Container Manager 图形界面）
+
+`docker-compose.yml` 里的 `postgres` 段是**注释掉**的，所以 `docker ps | grep postgres` 什么都没有、迁移时报
+`could not translate host name "postgres"`。启用方式二选一：
+
+- **Container Manager** → 项目 → 选中 `vodsync` → 编辑 → 把末尾 `# postgres:` 起的整段注释去掉（或按下面整段粘贴，**2 空格缩进，与 `vodsync:` 同级**）→ 保存 → 构建/启动。
+- 项目是 SSH 里 `docker compose up` 起的、UI 里看不到时，用 **File Station** 右键 `docker-compose.yml` → 打开方式 → 文本编辑器 改。
+
+```yaml
+  postgres:
+    image: postgres:16-alpine
+    container_name: vodsync-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vodsync
+      POSTGRES_PASSWORD: vodsync
+      POSTGRES_DB: vodsync
+      TZ: Asia/Shanghai
+    volumes:
+      - /volume2/docker/vodsync/pgdata:/var/lib/postgresql/data   # 与 data 卷同一前缀
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vodsync -d vodsync"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+```
+
+> 两个不要：**不要映射 5432 到宿主机**（容器间用服务名直连，映射容易和已有 PG 抢端口）；
+> **不要在这一步就解开 `DATABASE_URL`** —— 空库会让 vodsync 以空库启动、白抓一遍，先迁移再切。
+> 想让 vodsync 等 PG 就绪再起，可在 vodsync 服务下加 `depends_on: {postgres: {condition: service_healthy}}`。
+
 ```bash
 # 0) 先停服务，保证源库不再写入（PG 容器要先起好，两种起法见下方"一条命令起 PG"）
 sudo docker compose stop vodsync
