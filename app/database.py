@@ -82,7 +82,6 @@ def write_txn():
 
 
 @contextlib.contextmanager
-@contextlib.contextmanager
 def write_lock_only():
     """只拿写锁不开事务（需要自己控制事务边界时用）。"""
     with _write_lock:

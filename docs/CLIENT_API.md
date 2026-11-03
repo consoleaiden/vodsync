@@ -417,7 +417,7 @@ POST /api/v1/sources/auto-sync?enabled=true&slugs=jkun,t1  # 只开启指定站
 #### GET `/api/v1/logs?limit=50`（1-200）
 ```json
 { "code": 1, "list": [{
-    "id": 99, "slug": "jkun", "mode": "full", "status": "success"|"failed"|"partial",
+    "id": 99, "slug": "jkun", "mode": "full", "status": "success"|"incomplete"|"failed"|"paused"|"interrupted",
     "fetched": 500, "inserted": 480, "updated": 20, "pages": 25,
     "error": "", "started_at": "...", "finished_at": "..."
 }]}

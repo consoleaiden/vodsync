@@ -31,7 +31,7 @@ app = FastAPI(
         "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，"
         "并对外提供统一的视频列表/详情 API（source 参数区分源站）。"
     ),
-    version="1.5.2",
+    version="1.6.0",
 )
 
 app.include_router(router)
@@ -162,6 +162,15 @@ def on_startup():
 
     pause.load_state()   # 恢复持久化的同步暂停状态（重启不丢）
 
+    from . import syncer
+
+    # 断电 / 崩溃 / docker restart 后，上一次留下的 running 日志永远不会自己结束，
+    # 面板会一直显示「进行中」。启动时统一改成 interrupted。
+    try:
+        syncer.mark_interrupted_logs()
+    except Exception:
+        log.exception("标记中断任务失败（不影响启动）")
+
     # 后台执行首次初始化：拉源站列表 -> （可选）全量同步 -> 启动调度器
     threading.Thread(target=_bootstrap, daemon=True).start()
 
@@ -189,6 +198,13 @@ def _bootstrap():
         from .scheduler import start_scheduler
 
         start_scheduler()
+
+        # 续跑上次没做完的全量同步（有断点的源站）。
+        # 放在最后：先让服务能正常响应，再由这个线程按并发闸门慢慢跑。
+        try:
+            syncer.auto_resume_incomplete()
+        except Exception:
+            log.exception("自动续跑检查失败（不影响服务）")
     except Exception:
         log.exception("启动引导失败（服务仍可用，可稍后通过 API 手动触发）")
 

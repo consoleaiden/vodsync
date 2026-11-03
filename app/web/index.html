@@ -480,6 +480,8 @@ async function loadLogs() {
       const badge = l.status === "success" ? '<span class="badge ok">成功</span>'
         : l.status === "failed" ? '<span class="badge bad">失败</span>'
         : l.status === "paused" ? '<span class="badge warn">已暂停</span>'
+        : l.status === "incomplete" ? '<span class="badge warn">部分完成</span>'
+        : l.status === "interrupted" ? '<span class="badge bad">被中断</span>'
         : '<span class="badge warn">进行中</span>';
       const mode = l.mode === "full" ? '<span class="badge mute">全量</span>' : '<span class="badge mute">增量</span>';
       return `<tr>

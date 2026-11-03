@@ -31,8 +31,22 @@ router = APIRouter()
 # 访问控制：登录 / 登出 / 改密码 / 开关 / Token
 # ---------------------------------------------------------------------------
 def _client_ip(request: Request) -> str:
+    """
+    登录限流用的客户端标识。
+
+    默认只看 TCP 对端地址：X-Forwarded-For 是客户端可以随便伪造的请求头，
+    无条件采信它等于给爆破脚本发了一张「每次换个假 IP」的免死金牌（六位默认密码尤其危险）。
+    确实部署在反代之后时，把 TRUST_PROXY=true，并取 XFF 的**最后一跳**——
+    那是我们信任的反代追加的；取第一段仍然可被伪造。
+    """
+    peer = request.client.host if request.client else "unknown"
+    if not config.TRUST_PROXY:
+        return peer
     fwd = request.headers.get("x-forwarded-for", "")
-    return (fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "unknown"))
+    if not fwd:
+        return peer
+    last = fwd.split(",")[-1].strip()
+    return last or peer
 
 
 def _set_session_cookie(response: Response) -> None:

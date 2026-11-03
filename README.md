@@ -13,6 +13,7 @@
 - **聚合搜索**：跨全部源站按名称并行搜索（线程池 + 内存归并），单源失败隔离
 - **中转代理降级**：源站直连不可达/被风控时，自动按顺序切到 API 中转代理取数（可配多个，成功后记忆 30 分钟）
 - **访问控制**：面板密码登录（默认 `666666`）+ API Token，可一键开关；Token 可在面板生成/重置
+- **断电可恢复**：每页一个事务 + 断点/水位线入库，重启后自动续跑；单页失败不会静默丢数据
 - **多数据库**：默认 SQLite（WAL），一行环境变量切换 PostgreSQL
 
 ## 技术选型说明
@@ -259,6 +260,38 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
   ```
 - 兼容：`API_KEY` 环境变量仍可作为一枚额外 Token 使用（老客户端不必改配置就能继续跑，只要它带的 Key 与之一致）。
 
+## 断电 / 重启恢复（v1.6.0）
+
+| 中断时机 | 数据 | 进度 | 重启后 |
+|---|---|---|---|
+| 全量同步中（断电 / `docker restart`） | 每页一个事务，已提交的页都在 | `sources.last_page` 持久化 | 自动续跑（默认延迟 30s），从断点的下一页继续 |
+| 全量某页持续抓取失败 | 该页不写入，其他页照常 | 断点停在失败页**之前** | 本次内重试 `PAGE_MAX_ATTEMPTS` 次；仍失败则中止，断点保留，下次接着来 |
+| 增量同步中 | 水位线最后才推进，重跑整批候选 | 水位线 | 下一轮调度自动重来（UPSERT 幂等，不会重复行） |
+| 写入瞬间断电（SQLite） | WAL 回滚，`synchronous=NORMAL` 下可能丢最后几秒已提交数据 | — | 库不会损坏；重抓该页即可补齐 |
+| 服务被 kill | 内存态清空 | — | 残留的 `running` 日志自动改 `interrupted`，不会永远显示"进行中" |
+
+设计要点（为什么能这么恢复）：
+
+- **断点只落在「连续完成的前缀」上**。一个批次里第 3 页失败、第 4 页成功时，断点存 2 而不是 4 ——
+  否则重启后会从 5 开始，第 3 页那几百条永久丢失，而任务还显示 100%。
+- **只有全部页写完才清断点、推进水位线**；否则状态记 `incomplete`（面板显示「部分完成」），
+  断点和 `total_pages` 都保留，随时可续。
+- **增量水位线只按「真的写进库」的 `vod_time` 推进**。详情拉取失败的记录会把水位线封顶在它之前，
+  下一轮筛选条件 `vod_time > watermark` 仍然能选中它。
+- **增量 list 索引页失败 → 水位线冻结**。漏掉的索引页里可能有新片，宁可不推进也不跳过。
+- **幂等**：`INSERT ... ON CONFLICT(vod_id) DO UPDATE`，重复抓同一页、重跑同一批候选都不会产生脏数据。
+
+配置：
+
+```yaml
+      AUTO_RESUME_ON_BOOT: "true"          # 不想自动续跑就改 false，等下一轮调度或手动点「继续」
+      AUTO_RESUME_DELAY_SECONDS: "30"
+      PAGE_MAX_ATTEMPTS: "3"
+```
+
+手动排查：`GET /api/v1/logs` 里 `status` 为 `incomplete`（部分完成）/ `interrupted`（被重启打断）的
+记录，`error` 字段会写明卡在第几页或失败了多少条。
+
 ## 配置项（环境变量）
 
 完整列表见 [.env.example](.env.example)，关键项：
@@ -269,6 +302,9 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
 | `SOURCE_REFRESH_INTERVAL_MINUTES` | 720 | 源站列表刷新间隔 |
 | `SOURCE_SYNC_CONCURRENCY` | 2 | **同时真正在跑的源站同步数上限**（全局闸门，排队不占资源；NAS 建议 1-2） |
 | `PAGE_CONCURRENCY` | 4 | 单源站内并行抓取页数 |
+| `PAGE_MAX_ATTEMPTS` | 3 | 同一页最多重试次数，超过则中止并保留断点 |
+| `AUTO_RESUME_ON_BOOT` | true | 启动时自动续跑有断点的全量同步 |
+| `AUTO_RESUME_DELAY_SECONDS` | 30 | 延迟多少秒开始续跑（让服务先起来） |
 | `REQUEST_INTERVAL_SECONDS` | 0.2 | 请求间隔，防源站封禁 |
 | `PROXY_ENABLED` | true | 直连失败后是否自动走中转代理 |
 | `PROXY_URLS` | 2 个内置地址 | 中转代理列表（逗号分隔），格式 `{proxy}?url=<urlencode(目标地址)>` |
@@ -283,6 +319,7 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
 | `ADMIN_PASSWORD` | 666666 | 首次启动的管理面板密码，登录后请改掉 |
 | `SESSION_TTL_DAYS` | 7 | 面板登录会话有效期（天） |
 | `LOGIN_MAX_FAILS` / `LOGIN_LOCK_MINUTES` | 5 / 5 | 连续登录失败锁定策略 |
+| `TRUST_PROXY` | false | 是否信任反代的 `X-Forwarded-For`（反代之后才开，否则锁定可被伪造 IP 绕过） |
 | `API_KEY` | 空 | 兼容项：设置后作为一枚额外有效的 Token |
 | `ONLY_OK_SOURCES` | true | 只同步在线源站 |
 
@@ -645,3 +682,21 @@ vodsync/
 - 新增 `scripts/test_v151_paging.py`（14 项：默认值、显式值、最后一页不足整页、越界 422、search 与 MacCMS 兼容接口一致性）
 - 文档：`docs/APP_TOKEN_UPGRADE.md` 新增「9. 分页约定：三列宫格每页 30 条」（含取数策略与三个常见坑）
 - 版本号 1.5.1 → 1.5.2
+
+### v1.6.0
+修复三个「静默丢数据」的同步缺陷（复盘报告 `docs/REVIEW_2026-11-03.md`），围绕断电/重启恢复补齐冗余：
+
+- **P0-1 全量同步丢页**：批内单页失败时旧代码用 `max(成功页)` 存断点 → 跳过失败页且清断点标记完成。
+  现在断点只落在「连续完成的前缀」，失败页在本次内重试（`PAGE_MAX_ATTEMPTS`），仍失败则中止并保留断点，
+  状态记 `incomplete`（新增，面板显示「部分完成」）
+- **P0-2 增量水位线越过未入库数据**：水位线改为按「实际写库的最大 `vod_time`」推进；有失败批次时
+  封顶在失败记录之前；详情缺失的 ID 追加一次补抓，仍未返回才按「源站已下架」跳过并记 `missing`
+- **P0-3 增量 list 单页失败导致整站崩溃**：`except` 分支里重复调用 `fut.result()` 会重抛异常；
+  已改为按页记录，并且索引不完整时**冻结水位线**
+- **重启恢复**：启动时把残留 `running` 日志标记为 `interrupted`；新增 `AUTO_RESUME_ON_BOOT`
+  （默认 true，延迟 30s）自动续跑有断点的源站；`pause_state.json` 改原子写（tmp + `os.replace`）
+- **安全**：`_client_ip` 不再无条件信任 `X-Forwarded-For`（默认只看对端地址，`TRUST_PROXY=true`
+  才取最后一跳），修复「伪造 IP 绕过登录失败锁定」
+- **隐患**：修复 `database.write_lock_only()` 被 `@contextmanager` 装饰两层导致调用即 `TypeError`
+- 测试：新增 `scripts/test_v160_recovery.py`（42 项，含三个缺陷的复现转回归 + 自动续跑），全仓 207 项通过
+- 版本号 1.5.2 → 1.6.0

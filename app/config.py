@@ -52,6 +52,20 @@ USER_AGENT = os.environ.get(
 INCR_CHECK_MISSING = os.environ.get("INCR_CHECK_MISSING", "false").lower() == "true"
 # 全量同步断点保存间隔（每 N 页保存一次进度）
 CHECKPOINT_EVERY_PAGES = int(os.environ.get("CHECKPOINT_EVERY_PAGES", "5"))
+# 单页抓取的最大尝试次数。超过即中止本次全量（保留断点），避免对已挂的源站空转。
+# 注意：这是「同一页在本次运行内」的计数，重启后重新计。
+PAGE_MAX_ATTEMPTS = int(os.environ.get("PAGE_MAX_ATTEMPTS", "3"))
+
+# ---------------------------------------------------------------------------
+# 重启恢复（断电 / 崩溃 / docker restart 之后）
+#
+# 数据安全本来就有保障（每页一个事务 + 断点存库 + UPSERT 幂等），但「自动接着跑」
+# 需要显式开启：启动时扫描 last_page > 0 的源站并延迟续跑。
+#   - 延迟是为了让服务先完成建库/校准条数/启动调度，别在启动瞬间抢连接
+#   - 关掉它就回到旧行为：等下一个调度周期（默认 6h）或手动点「继续」
+# ---------------------------------------------------------------------------
+AUTO_RESUME_ON_BOOT = os.environ.get("AUTO_RESUME_ON_BOOT", "true").lower() == "true"
+AUTO_RESUME_DELAY_SECONDS = int(os.environ.get("AUTO_RESUME_DELAY_SECONDS", "30"))
 
 # ---------------------------------------------------------------------------
 # 数据库连接池
@@ -120,3 +134,10 @@ SESSION_TTL_DAYS = int(os.environ.get("SESSION_TTL_DAYS", "7"))
 # 登录失败锁定：连续失败 N 次锁 M 分钟（防六位默认密码被爆破）
 LOGIN_MAX_FAILS = int(os.environ.get("LOGIN_MAX_FAILS", "5"))
 LOGIN_LOCK_MINUTES = int(os.environ.get("LOGIN_LOCK_MINUTES", "5"))
+# 是否信任反向代理写入的 X-Forwarded-For。
+#
+# 默认 false：只看 TCP 连接的对端地址。为什么默认关——XFF 是客户端可以自己伪造的头，
+# 无条件相信它，任何人都能用「每次换一个假 IP」绕过登录失败锁定（六位默认密码等于裸奔）。
+# 只有确实部署在 Nginx / Traefik / 群晖反代之后（且反代会覆盖 XFF）才打开。
+# 打开后取 XFF 的**最后一跳**（信任的代理追加的那一段），而不是第一段。
+TRUST_PROXY = os.environ.get("TRUST_PROXY", "false").lower() == "true"

@@ -53,13 +53,29 @@ def load_state():
 
 
 def _persist():
+    """
+    原子写：先写临时文件再 os.replace。
+
+    为什么不能直接 open(path, "w")：断电/被 kill 时文件可能只写了一半（或变成 0 字节），
+    下次启动 json.load 失败 → 按「未暂停」处理 → 用户主动暂停的任务在重启后自己跑起来。
+    os.replace 在同一个文件系统内是原子操作，要么是旧内容，要么是新内容。
+    """
     path = _file_path()
+    tmp = path + ".tmp"
     try:
         os.makedirs(config.DATA_DIR, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(_state, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
     except Exception as e:
         log.warning("暂停状态写入文件失败: %s", e)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 def set_paused(scope: str, paused: bool):

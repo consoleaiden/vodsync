@@ -22,7 +22,11 @@ services:
       SOURCE_REFRESH_INTERVAL_MINUTES: "720"  # 源站列表刷新间隔（分钟）
       SOURCE_SYNC_CONCURRENCY: "2"         # 同时真正在跑的源站同步数上限（超出排队；NAS 建议 1-2）
       PAGE_CONCURRENCY: "4"                # 单源站内并行抓取页数
+      PAGE_MAX_ATTEMPTS: "3"               # 同一页最多重试几次，超过就中止并保留断点
       REQUEST_INTERVAL_SECONDS: "0.3"      # 请求间隔，防源站封禁
+      # ---- 断电/重启恢复（v1.6.0）----
+      AUTO_RESUME_ON_BOOT: "true"          # 启动时自动续跑有断点的全量同步
+      AUTO_RESUME_DELAY_SECONDS: "30"      # 延迟多久开始续跑（等服务先起来）
       # ---- 数据库连接池（连接池耗尽会导致接口 500/503，见 README 常见坑第 7 条）----
       DB_POOL_SIZE: "10"
       DB_MAX_OVERFLOW: "20"
@@ -40,11 +44,11 @@ services:
       AUTH_ENABLED: "true"                 # 首次启动写入数据库，之后在面板「⚙ 设置」里改
       ADMIN_PASSWORD: "666666"             # 首次启动的面板密码，登录后请改掉
       SESSION_TTL_DAYS: "7"                # 登录会话有效期（天）
+      TRUST_PROXY: "false"                 # 部署在 Nginx/群晖反代之后才改 true（否则 XFF 可伪造，绕过登录锁定）
       # 兼容项：设置后作为一枚额外有效的 API Token
       # API_KEY: ""
       # ---- API ----
       API_PAGE_SIZE_DEFAULT: "30"          # 每页条数：App 三列 × 10 行 = 30（上限见 API_PAGE_SIZE_MAX）
-      API_KEY: ""                          # 留空不鉴权；设置后请求需带 X-API-Key 头
       TZ: "Asia/Shanghai"
     # 启用 PostgreSQL 后解开（配合 postgres 的 healthcheck，避免 vodsync 比库先起而启动失败）
     # depends_on:

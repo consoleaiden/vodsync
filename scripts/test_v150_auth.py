@@ -45,6 +45,11 @@ def main():
     from app import auth, database
     from app.main import app
 
+    # TestClient 的对端地址恒为 "testclient"，本文件用 X-Forwarded-For 模拟不同客户端 IP
+    # 来验证「锁定按 IP 计」。v1.6.0 起默认不信任 XFF（防伪造），这里显式打开。
+    from app import config as _cfg
+    _cfg.TRUST_PROXY = True
+
     database.init_db()
     auth.ensure_init()
 

@@ -217,7 +217,7 @@ type PlayLine = {
 | `id` | int | 日志 ID（自增） |
 | `slug` | string | 源站 |
 | `mode` | string | `full` / `incremental` |
-| `status` | string | `running` / `success` / `failed` / `paused` |
+| `status` | string | `running` / `success` / `incomplete`（部分完成，断点已保留）/ `interrupted`（被重启打断）/ `failed` / `paused` |
 | `fetched` | int | 抓取条数 |
 | `inserted` | int | 新增条数 |
 | `updated` | int | 更新条数 |

@@ -330,6 +330,19 @@ def full_sync(slug: str, client: MacCmsClient) -> dict:
     start_page = max(resume_page, 0) + 1 if resume_page else 1
     pg = start_page
 
+    # ---------------------------------------------------------------------
+    # 断点只能落在「连续完成的前缀」上
+    #
+    # 反例（v1.5.2 的静默丢数据）：一个批次 [1,2,3,4] 里第 3 页失败、4 成功，
+    # 旧代码用 last_done = max(成功页) = 4 存断点，下一轮从 5 开始 —— 第 3 页永远
+    # 不会被再抓，循环还正常结束、_finish_full 清断点推进水位线，面板显示 100%。
+    # 现在改用 written_upto：只有 [resume+1 .. written_upto] 全部写入成功才前进，
+    # 失败页留在前缀之外，本轮内重试，重启后续传也一定从它开始。
+    # ---------------------------------------------------------------------
+    written_upto = max(resume_page, 0)
+    attempts: dict = {}          # page -> 本次运行内已失败次数
+    last_error = ""
+
     def process_page(page: int) -> dict:
         payload = first if page == 1 else client.fetch_page(src_api, "detail", page)
         cmap = fetch_class_map(payload, {})
@@ -340,28 +353,29 @@ def full_sync(slug: str, client: MacCmsClient) -> dict:
         ]
         return {"page": page, "rows": rows}
 
-    consecutive_fail = 0
     while pg <= pagecount:
-        # ---- 暂停检查点：下一批次开始前优雅停止，断点保留在第 pg-1 页 ----
+        # ---- 暂停检查点：下一批次开始前优雅停止，断点保留在真正的完成位置 ----
         if should_stop(slug, "full"):
-            _save_checkpoint(slug, pg - 1)
+            _save_checkpoint(slug, written_upto)
             stats["paused"] = True
-            stats["paused_at_page"] = pg - 1
-            log.info("[%s] 全量同步已暂停（断点=%d，可随时继续）", slug, pg - 1)
+            stats["paused_at_page"] = written_upto
+            log.info("[%s] 全量同步已暂停（断点=%d，可随时继续）", slug, written_upto)
             return stats
 
         batch_pages = list(range(pg, min(pg + config.PAGE_CONCURRENCY, pagecount + 1)))
-        results = []
+        results, failures = [], []
         with ThreadPoolExecutor(max_workers=len(batch_pages)) as pool:
             futures = {pool.submit(process_page, p): p for p in batch_pages}
             for fut in as_completed(futures):
+                page = futures[fut]
                 try:
                     results.append(fut.result())
-                    consecutive_fail = 0
                 except MacCmsError as e:
-                    log.error("[%s] 第 %s 页抓取失败: %s", slug, futures[fut], e)
-                    consecutive_fail += 1
+                    failures.append(page)
+                    log.error("[%s] 第 %d 页抓取失败: %s", slug, page, e)
+
         if results:
+            # 幂等 UPSERT：失败页重试时，同批次已成功的页会再写一遍，不会产生脏数据
             results.sort(key=lambda x: x["page"])
             for res in results:
                 ins, upd = upsert_batch(slug, res["rows"])
@@ -369,17 +383,58 @@ def full_sync(slug: str, client: MacCmsClient) -> dict:
                 stats["inserted"] += ins
                 stats["updated"] += upd
                 stats["pages"] += 1
-            last_done = max(r["page"] for r in results)
-            if last_done % config.CHECKPOINT_EVERY_PAGES == 0 or last_done == pagecount:
-                _save_checkpoint(slug, last_done)
-            pg = last_done + 1
-        elif consecutive_fail >= config.PAGE_CONCURRENCY:
-            # 整批失败，直接退出，断点已保证下次续传
-            log.error("[%s] 连续整批失败，中止全量（断点=%d）", slug, pg - 1)
-            _save_checkpoint(slug, pg - 1)
-            stats["error"] = f"页面抓取连续失败于第 {pg} 页"
+
+            # 只把「和已有前缀连得上」的页计入断点
+            got = {r["page"] for r in results}
+            for p in got:
+                attempts.pop(p, None)   # 本轮已成功，不再计失败次数
+            while (written_upto + 1) in got:
+                written_upto += 1
+
+        for page in failures:
+            attempts[page] = attempts.get(page, 0) + 1
+            last_error = f"第 {page} 页抓取失败（第 {attempts[page]} 次）"
+            if attempts[page] >= config.PAGE_MAX_ATTEMPTS:
+                last_error = (
+                    f"第 {page} 页连续 {attempts[page]} 次抓取失败，"
+                    f"已保留断点 {written_upto}/{pagecount}"
+                )
+                break
+        stats["failed_pages"] = len(attempts)
+
+        # 有些页是「一次性整批全挂」（源站宕机/被限流），继续重试同批次只是空转
+        aborted = (
+            last_error if (attempts and max(attempts.values()) >= config.PAGE_MAX_ATTEMPTS) else ""
+        )
+        if not results and failures:
+            aborted = aborted or f"第 {pg}~{batch_pages[-1]} 页整批失败，已保留断点 {written_upto}/{pagecount}"
+        if aborted:
+            _save_checkpoint(slug, written_upto)
+            stats["error"] = aborted
+            stats["incomplete"] = True
+            log.error("[%s] 全量同步中止: %s", slug, aborted)
             return stats
+
+        # 按进度存断点（和旧的每 N 页一致，避免每批都做一次 count(*) 全表扫描）
+        if written_upto and (
+            written_upto % config.CHECKPOINT_EVERY_PAGES == 0 or written_upto == pagecount
+        ):
+            _save_checkpoint(slug, written_upto)
+
+        pg = written_upto + 1
         time.sleep(0.1)
+
+    # ---------------------------------------------------------------------
+    # 收尾：只有真的全部写完才清断点、推进水位线。
+    # 万一 pagecount 在同步过程中变小（源站删数据），written_upto 会超过 pagecount，
+    # 同样视为完成 —— 此时库里的数据比源站多，是安全方向。
+    # ---------------------------------------------------------------------
+    if written_upto < pagecount:
+        _save_checkpoint(slug, written_upto)
+        stats["incomplete"] = True
+        stats["error"] = last_error or f"仅完成到第 {written_upto}/{pagecount} 页"
+        log.error("[%s] 全量同步未完成: %s（断点已保留，可续传）", slug, stats["error"])
+        return stats
 
     _finish_full(slug, class_map)
     log.info("[%s] 全量同步完成: %s", slug, stats)
@@ -501,6 +556,7 @@ def incremental_sync(slug: str, client: MacCmsClient) -> dict:
         }
 
     pages = list(range(1, pagecount + 1))
+    failed_list_pages: list = []
     for i in range(0, len(pages), config.PAGE_CONCURRENCY):
         # ---- 暂停检查点：list 索引阶段可随时中断（该阶段无副作用，继续时重跑即可）----
         if should_stop(slug, "incremental"):
@@ -509,16 +565,33 @@ def incremental_sync(slug: str, client: MacCmsClient) -> dict:
             return stats
         batch = pages[i : i + config.PAGE_CONCURRENCY]
         with ThreadPoolExecutor(max_workers=len(batch)) as pool:
-            for fut in as_completed({pool.submit(collect, p): p for p in batch}):
+            futures = {pool.submit(collect, p): p for p in batch}
+            for fut in as_completed(futures):
+                page = futures[fut]
                 try:
                     index.update(fut.result())
                     stats["pages"] += 1
                 except MacCmsError as e:
-                    log.error("[%s] 增量 list 第 %s 页失败: %s", slug, fut.result() and "", e)
+                    # 注意：这里绝不能再调一次 fut.result()——对已抛异常的 Future 取结果会
+                    # 把同一次失败重抛出去，整站增量直接崩掉（v1.5.2 的 P0-3）。
+                    failed_list_pages.append(page)
+                    log.error("[%s] 增量 list 第 %d 页失败: %s", slug, page, e)
         stats["fetched"] = len(index)
+
+    # 索引不完整 → 漏掉的页里可能有新片，此时推进水位线等于把它们永久跳过。
+    # 所以水位线冻结，下次运行重新遍历完整索引（幂等，代价只是多一轮 list）。
+    index_complete = not failed_list_pages
+    if not index_complete:
+        log.warning(
+            "[%s] 索引不完整（%d 页失败: %s），本次不推进水位线",
+            slug, len(failed_list_pages), ",".join(map(str, failed_list_pages[:10])),
+        )
 
     if not index:
         log.info("[%s] 增量同步: 源站列表为空", slug)
+        if not index_complete:
+            stats["incomplete"] = True
+            stats["error"] = "源站列表页全部抓取失败，水位线保持不变"
         return stats
 
     # 2) 筛选候选：vod_time > 水位线（新更新），可选检测缺失 ID
@@ -538,12 +611,33 @@ def incremental_sync(slug: str, client: MacCmsClient) -> dict:
 
     if not candidates:
         _mark_synced(slug, watermark, len(index))
+        if not index_complete:
+            stats["incomplete"] = True
+            stats["error"] = f"索引页 {len(failed_list_pages)} 个失败，水位线保持不变"
         log.info("[%s] 增量同步: 无更新 (水位线=%s, 在库索引=%d)", slug, watermark, len(index))
         return stats
 
     # 3) 按 ID 批量拉详情并 UPSERT
     ids = sorted(candidates)
     log.info("[%s] 增量同步: %d 条候选需要拉取详情", slug, len(ids))
+    failed_ids: dict = {}      # vod_id -> 该 ID 在索引里的 vod_time（用于给水位线封顶）
+    written_times: list = []   # 真正写进库的 vod_time（水位线的唯一依据）
+    missing: list = []         # 详情接口没返回的 ID（可能源站已下架）
+
+    def write_payload(payload: dict, chunk_ids: set) -> set:
+        """写入一批详情，返回实际写库的 vod_id 集合。"""
+        fetch_class_map(payload, class_map)
+        rows = []
+        for it in payload.get("list") or []:
+            row = MacCmsClient.extract_row(it, class_map)
+            if row and row["vod_id"] in chunk_ids:
+                rows.append(row)
+        ins, upd = upsert_batch(slug, rows)
+        stats["inserted"] += ins
+        stats["updated"] += upd
+        written_times.extend(r["vod_time"] for r in rows if r.get("vod_time"))
+        return {r["vod_id"] for r in rows}
+
     for i in range(0, len(ids), 50):
         # ---- 暂停检查点：详情拉取阶段中断，水位线不动，继续时重新筛选候选 ----
         if should_stop(slug, "incremental"):
@@ -555,25 +649,72 @@ def incremental_sync(slug: str, client: MacCmsClient) -> dict:
         try:
             payload = client.fetch_detail_by_ids(src_api, chunk)
         except MacCmsError as e:
-            log.error("[%s] 详情批量拉取失败(跳过 %d 条): %s", slug, len(chunk), e)
+            log.error(
+                "[%s] 详情批量拉取失败(跳过 %d 条，水位线将封顶在失败点之前): %s",
+                slug, len(chunk), e,
+            )
+            for vid in chunk:
+                failed_ids[vid] = index.get(vid, ("",))[0]
             continue
-        fetch_class_map(payload, class_map)
-        rows = []
-        for it in payload.get("list") or []:
-            row = MacCmsClient.extract_row(it, class_map)
-            if row and row["vod_id"] in set(chunk):
-                rows.append(row)
-        ins, upd = upsert_batch(slug, rows)
-        stats["inserted"] += ins
-        stats["updated"] += upd
+        got = write_payload(payload, set(chunk))
+        missing.extend(v for v in chunk if v not in got)
 
-    # 4) 推进水位线
-    max_time = watermark
-    for vid, (t, _tid, _n) in index.items():
-        if t > max_time:
-            max_time = t
-    _mark_synced(slug, max_time, len(index))
-    log.info("[%s] 增量同步完成: %s 新水位线=%s", slug, stats, max_time)
+    # 3.1) 详情缺失的 ID 二次补抓一次：源站偶发丢条目时不必等下一轮
+    if missing:
+        log.info("[%s] %d 条候选详情未返回，二次补抓", slug, len(missing))
+        still_missing = []
+        for i in range(0, len(missing), 50):
+            chunk = missing[i : i + 50]
+            try:
+                payload = client.fetch_detail_by_ids(src_api, chunk)
+            except MacCmsError as e:
+                log.error("[%s] 补抓失败(跳过 %d 条): %s", slug, len(chunk), e)
+                for vid in chunk:
+                    failed_ids[vid] = index.get(vid, ("",))[0]
+                continue
+            got = write_payload(payload, set(chunk))
+            still_missing.extend(v for v in chunk if v not in got)
+        missing = still_missing
+        if missing:
+            # 补抓仍然没有 = 源站详情接口确实没有这条（通常已下架），
+            # 不能让它永久卡住水位线，只记录并继续。
+            stats["missing"] = len(missing)
+            log.warning(
+                "[%s] %d 条 ID 在详情接口中不存在（可能已下架），不计入水位线阻塞: %s",
+                slug, len(missing), ",".join(map(str, missing[:8])),
+            )
+
+    # 4) 推进水位线：只按「真的写进库的最大 vod_time」算
+    #
+    # 反例（v1.5.2 的 P0-2）：旧代码取 index 里所有 vod_time 的最大值，包括那些
+    # 详情拉取失败、根本没入库的记录。水位线一旦越过它们，筛选条件 t > watermark
+    # 永远不成立，这些记录再也不会被增量抓到。
+    # 现在：有失败 ID 时，把水位线封顶在「所有失败 ID 的最小时间」之前一格，
+    # 保证下一轮一定还能选中它们；失败 ID 的时间未知时干脆不动水位线。
+    new_wm = watermark
+    if not index_complete:
+        stats["incomplete"] = True
+        stats["error"] = f"索引页 {len(failed_list_pages)} 个失败，水位线保持不变"
+    elif failed_ids:
+        times = [t for t in failed_ids.values() if t]
+        if len(times) < len(failed_ids):
+            stats["incomplete"] = True
+            stats["error"] = f"{len(failed_ids)} 条详情拉取失败且时间未知，水位线保持不变"
+        else:
+            floor = min(times)
+            safe = [t for t in written_times if t < floor]
+            new_wm = max(safe) if safe else watermark
+            stats["incomplete"] = True
+            stats["error"] = f"{len(failed_ids)} 条详情拉取失败，水位线只推进到 {new_wm or '(未变)'}"
+    elif written_times:
+        new_wm = max(written_times)
+
+    # 水位线永不倒退（失败 ID 可能是历史漏抓，时间比当前水位线还早）
+    if watermark and new_wm < watermark:
+        new_wm = watermark
+
+    _mark_synced(slug, new_wm, len(index))
+    log.info("[%s] 增量同步完成: %s 新水位线=%s", slug, stats, new_wm)
     return stats
 
 
@@ -632,9 +773,15 @@ def sync_source(slug: str, mode: str = "auto") -> dict:
                     stats = full_sync(slug, client)
                 else:
                     stats = incremental_sync(slug, client)
-                _finish_log(log_id, "paused" if stats.get("paused") else "success", stats)
-                return {"slug": slug, "mode": mode,
-                        "status": "paused" if stats.get("paused") else "success", **stats}
+                # 三种终态：完成 / 用户暂停 / 部分完成（有页/有记录没抓到，但断点与水位线都安全）
+                if stats.get("paused"):
+                    status = "paused"
+                elif stats.get("incomplete"):
+                    status = "incomplete"
+                else:
+                    status = "success"
+                _finish_log(log_id, status, stats)
+                return {"slug": slug, "mode": mode, "status": status, **stats}
             except Exception as e:
                 log.exception("[%s] 同步失败", slug)
                 _finish_log(log_id, "failed", {"error": str(e)})
@@ -713,8 +860,10 @@ def sync_all(force_mode: str = "auto") -> list:
                 results.append(fut.result())
             except Exception as e:  # 理论上 sync_source 内部已兜底
                 log.error("源站 %s 同步异常: %s", futures[fut], e)
-    ok = sum(1 for r in results if r.get("status") == "success")
-    log.info("同步结束: 成功 %d / 失败 %d", ok, len(results) - ok)
+    ok = sum(1 for r in results if r.get("status") in ("success", "incomplete"))
+    partial = sum(1 for r in results if r.get("status") == "incomplete")
+    log.info("同步结束: 成功 %d（其中不完整 %d）/ 失败 %d",
+             ok, partial, len(results) - ok)
     return results
 
 
@@ -741,3 +890,75 @@ def _finish_log(log_id: int, status: str, stats: dict):
                 finished_at=datetime.now(),
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# 重启恢复（v1.6.0）
+#
+# 断电/崩溃后内存态（_running）本来就清空了，但数据库里会留下 status='running' 的
+# 日志行 —— 不处理的话面板永远挂着一个「进行中」的任务，用户以为是卡住了。
+# 这里在启动时统一改成 interrupted，并把有断点的源站排队续跑。
+# ---------------------------------------------------------------------------
+def mark_interrupted_logs() -> int:
+    """把上次进程遗留的 running 日志标记为 interrupted。返回影响行数。"""
+    with database.write_txn() as conn:
+        res = conn.execute(
+            sync_logs.update()
+            .where(sync_logs.c.status == "running")
+            .values(
+                status="interrupted",
+                error="服务重启，任务被中断（断点与水位线均已保留，可自动或手动续跑）",
+                finished_at=datetime.now(),
+            )
+        )
+    n = res.rowcount or 0
+    if n:
+        log.warning("已将 %d 条因重启中断的同步记录标记为 interrupted", n)
+    return n
+
+
+def auto_resume_incomplete() -> list:
+    """
+    启动时续跑「有断点但没跑完」的全量同步。
+
+    返回待续跑的 slug 列表（空表示没有待续任务或已被配置关闭）。
+    续跑走正常入口 sync_source(..., "full")，因此同样受暂停标记/并发闸门约束。
+    """
+    if not config.AUTO_RESUME_ON_BOOT:
+        log.info("自动续跑已关闭（AUTO_RESUME_ON_BOOT=false），未完成任务等下一轮调度")
+        return []
+    with database.engine.connect() as conn:
+        rows = conn.execute(
+            select(sources.c.slug, sources.c.last_page, sources.c.total_pages).where(
+                sources.c.enabled == 1,
+                sources.c.paused == 0,
+                sources.c.last_page > 0,
+            )
+        ).all()
+    slugs = [r[0] for r in rows]
+    if not slugs:
+        return []
+
+    delay = max(0, config.AUTO_RESUME_DELAY_SECONDS)
+
+    def _worker():
+        if delay:
+            time.sleep(delay)
+        if pause.is_paused("full"):
+            log.warning("自动续跑跳过：全量同步处于暂停状态（%d 个源站待续）", len(slugs))
+            return
+        for s in slugs:
+            if pause.is_paused("full"):
+                log.warning("自动续跑提前结束：全量同步被暂停（剩余 %d 个）", len(slugs) - slugs.index(s))
+                return
+            try:
+                sync_source(s, "full")
+            except Exception:
+                log.exception("自动续跑 %s 失败", s)
+        log.info("自动续跑结束：共处理 %d 个源站", len(slugs))
+
+    threading.Thread(target=_worker, daemon=True, name="auto-resume").start()
+    detail = ",".join(f"{r[0]}(页{r[1]}/{r[2] or '?'})" for r in rows[:8])
+    log.info("检测到 %d 个未完成的全量同步，%d 秒后自动续跑: %s%s",
+             len(slugs), delay, detail, " ..." if len(slugs) > 8 else "")
+    return slugs
