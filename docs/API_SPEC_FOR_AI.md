@@ -91,8 +91,12 @@ curl -b ck.txt http://<host>:8181/api/v1/auth/token
 
 ```bash
 curl -s http://<host>:8181/api/v1/auth/state
-# {"enabled":true,"logged_in":false,"has_token":true,"token_hint":"vs_HYgS…u51c",...}
+# 未登录：{"enabled":true,"logged_in":false}
+# 已登录：{"enabled":true,"logged_in":true,"has_token":true,"token_created_at":"..."}
 ```
+
+> **v1.6.1 变更**：该接口不再返回 `token_hint`，未登录时也不再返回 `has_token` / 时间戳。
+> 它是免鉴权接口（登录页要用），只回最小状态；客户端只应依赖 `enabled`。
 
 鉴权失败：`401 {"detail":"未授权：请求头需携带 Authorization: Bearer <token>..."}`。
 面板里关闭访问控制后，`enabled=false`，此时不带 Token 也能调通。
@@ -257,7 +261,7 @@ type PlayLine = {
 | 22 | POST | `/api/v1/maintenance/recount` | 管理 | 条数校准 |
 | 23 | POST | `/api/v1/auth/login` | 鉴权 | 面板登录（换会话 cookie） |
 | 24 | POST | `/api/v1/auth/logout` | 鉴权 | 退出登录 |
-| 25 | GET | `/api/v1/auth/state` | 鉴权 | 是否启用鉴权 / 是否已登录（免鉴权） |
+| 25 | GET | `/api/v1/auth/state` | 鉴权 | 鉴权状态（免鉴权，未登录只回 `enabled`/`logged_in`） |
 | 26 | POST | `/api/v1/auth/password` | 鉴权 | 修改面板密码 |
 | 27 | POST | `/api/v1/auth/settings` | 鉴权 | 开关访问控制（开启时自动换 Token） |
 | 28 | GET | `/api/v1/auth/token` | 鉴权 | 读取当前 Token（需登录） |

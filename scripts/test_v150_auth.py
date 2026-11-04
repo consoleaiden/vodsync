@@ -78,6 +78,21 @@ def main():
     check("双空格 Bearer 也认", client.get("/api/v1/stats", headers={"Authorization": f"Bearer  {token}"}).status_code == 200)
     check("无空格 Bearer 不认", client.get("/api/v1/stats", headers={"Authorization": f"Bearer{token}"}).status_code == 401)
 
+    print("[2.5] 状态接口不泄露凭据")
+    # /api/v1/auth/state 在中间件白名单里（登录页要用），未登录也必须能调通，
+    # 所以它只能回「最小状态」，任何 Token 相关内容都不该出现。
+    r = client.get("/api/v1/auth/state")
+    st = r.json()
+    check("未登录 state 只回 enabled/logged_in", set(st) == {"enabled", "logged_in"}, str(st))
+    check("未登录 state 不含 token_hint", "token_hint" not in st, str(st))
+    check("未登录 state 不含 has_token", "has_token" not in st, str(st))
+    check("未登录 state 不含 token 时间戳", "token_created_at" not in st, str(st))
+    check("未登录 state 不含密码时间戳", "password_changed_at" not in st, str(st))
+    check("state 响应体不含 Token 前 7 位", token[:7] not in r.text, r.text[:200])
+    check("state 响应体不含 Token 后 4 位", token[-4:] not in r.text, r.text[:200])
+    check("state 带 Cache-Control: no-store",
+          "no-store" in r.headers.get("cache-control", "").lower(), str(dict(r.headers)))
+
     print("[3] 面板登录")
     r = client.get("/", follow_redirects=False, headers={"Accept": "text/html"})
     check("未登录访问面板 303 跳登录", r.status_code == 303 and "/login" in r.headers.get("location", ""), r.status_code)
@@ -98,6 +113,8 @@ def main():
     check("cookie 也能调 API", r.status_code == 200, r.status_code)
     st = client.get("/api/v1/auth/state").json()
     check("state: enabled + logged_in", st["enabled"] and st["logged_in"], str(st))
+    check("登录后 state 才带 has_token", st.get("has_token") is True, str(st))
+    check("登录后 state 仍不含 token_hint", "token_hint" not in st, str(st))
 
     print("[4] 失败锁定")
     for _ in range(3):

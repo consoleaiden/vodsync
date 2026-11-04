@@ -151,9 +151,13 @@ def token_created_at() -> str:
     return get(K_TOKEN_AT)
 
 
-def token_hint() -> str:
-    tok = get_token()
-    return f"{tok[:7]}…{tok[-4:]}" if len(tok) > 14 else ("已生成" if tok else "未生成")
+def token_present() -> bool:
+    """只回答「有没有 Token」，不回显任何字符。
+
+    Token 是唯一凭据，哪怕只露前 7 位 + 后 4 位也会把搜索空间从 43 位降到十几位，
+    写进日志/接口里都是没必要的攻击面。
+    """
+    return bool(get_token())
 
 
 def rotate_token() -> str:
@@ -315,4 +319,8 @@ def ensure_init() -> None:
         rotate_token()
     if get(K_ENABLED) == "":
         set_enabled(config.AUTH_ENABLED)
-    log.info("访问控制：%s（Token %s）", "已启用" if is_enabled() else "未启用", token_hint())
+    log.info(
+        "访问控制：%s（API Token %s）",
+        "已启用" if is_enabled() else "未启用",
+        "已生成" if token_present() else "未生成",
+    )

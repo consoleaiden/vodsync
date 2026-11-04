@@ -259,6 +259,9 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
   docker compose up -d
   ```
 - 兼容：`API_KEY` 环境变量仍可作为一枚额外 Token 使用（老客户端不必改配置就能继续跑，只要它带的 Key 与之一致）。
+- **状态接口不回显凭据**：`/api/v1/auth/state` 在免鉴权白名单里（登录页要靠它判断），因此未登录只返回
+  `enabled` / `logged_in`；Token 是否存在、Token/密码的变更时间都要登录后才给。**任何接口和日志都不输出 Token 片段**
+  —— 要拿 Token 走面板或 `GET /api/v1/auth/token`（需登录）。
 
 ## 断电 / 重启恢复（v1.6.0）
 
@@ -700,3 +703,17 @@ vodsync/
 - **隐患**：修复 `database.write_lock_only()` 被 `@contextmanager` 装饰两层导致调用即 `TypeError`
 - 测试：新增 `scripts/test_v160_recovery.py`（42 项，含三个缺陷的复现转回归 + 自动续跑），全仓 207 项通过
 - 版本号 1.5.2 → 1.6.0
+
+### v1.6.1
+收紧 `/api/v1/auth/state` 的信息暴露面（该接口在免鉴权白名单里，登录页需要它）：
+
+- **删除 `token_hint`**：原来会回 `vs_HYgS…u51c` 这种前 7 位 + 后 4 位片段。Token 是唯一凭据，
+  暴露片段等于把搜索空间从 43 字符砍到十几个字符，而这个接口**任何人不登录都能调**
+- **未登录只回 `enabled` / `logged_in`**：`has_token`、`token_created_at`、`password_changed_at`
+  收敛到「已登录」才返回 —— 它们能用来推断服务器是否配过 Token、什么时候改的密码
+- 响应加 `Cache-Control: no-store`，避免代理/浏览器缓存状态
+- 启动日志里的 Token 也改为只报「已生成/未生成」，不再打印片段
+- 文档同步：`docs/APP_TOKEN_UPGRADE.md` 的 state 示例与「给 AI 的提示词」第 6 条改为
+  「任何日志都不出现 Token，最多记布尔位」；`docs/API_SPEC_FOR_AI.md` 同步
+- 测试：`scripts/test_v150_auth.py` 增加 10 项断言（未登录字段白名单、响应体不含 Token 前后缀、缓存头）
+- 版本号 1.6.0 → 1.6.1

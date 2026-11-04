@@ -89,15 +89,31 @@ def auth_logout(response: Response):
 
 
 @router.get("/api/v1/auth/state", summary="鉴权状态（登录页/面板启动时用）")
-def auth_state(request: Request):
-    return {
-        "enabled": auth.is_enabled(),
-        "logged_in": auth.has_session(request) or not auth.is_enabled(),
-        "has_token": bool(auth.get_token()),
-        "token_hint": auth.token_hint(),
-        "password_changed_at": auth.password_changed_at(),
-        "token_created_at": auth.token_created_at(),
-    }
+def auth_state(request: Request, response: Response):
+    """
+    这个接口在中间件白名单里（登录页要靠它决定是否渲染表单），因此**未登录也能调**。
+    所以按登录态分两级返回：
+
+    - 未登录：只给 `enabled` / `logged_in`，够登录页判断跳转即可；
+    - 已登录：再补 Token 是否存在、Token 与密码的变更时间。
+
+    返回值里不含 Token 本身，也不含 Token 的任何片段 —— 状态接口不是凭据回显口，
+    真正要拿 Token 请用 `GET /api/v1/auth/token`（需登录）。
+    """
+    enabled = auth.is_enabled()
+    logged_in = auth.has_session(request) or not enabled
+    state = {"enabled": enabled, "logged_in": logged_in}
+    if logged_in:
+        state.update(
+            {
+                "has_token": auth.token_present(),
+                "password_changed_at": auth.password_changed_at(),
+                "token_created_at": auth.token_created_at(),
+            }
+        )
+    # 状态随登录态而变，别让任何代理/浏览器缓存它
+    response.headers["Cache-Control"] = "no-store"
+    return state
 
 
 @router.post("/api/v1/auth/password", summary="修改管理面板密码")

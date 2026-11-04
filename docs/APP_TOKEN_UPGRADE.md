@@ -119,17 +119,28 @@ Token 只能发给自己的服务器 —— 发给第三方等于把钥匙给了
 
 `GET /api/v1/auth/state` 返回示例（**这是唯一能判断"要不要 Token"的接口**）：
 
+未登录（也就是 App 引导阶段能看到的样子）：
+
+```json
+{ "enabled": true, "logged_in": false }
+```
+
+已登录（带有效会话 cookie）才会多出这几项：
+
 ```json
 {
   "enabled": true,
-  "logged_in": false,
+  "logged_in": true,
   "has_token": true,
-  "token_hint": "vs_HYgS…u51c",
   "password_changed_at": "2026-10-31T16:02:11",
   "token_created_at": "2026-10-31T16:19:14"
 }
 ```
 
+> v1.6.1 起该接口**不再返回 `token_hint`**，也未登录时不再返回 `has_token` / 各种时间戳 ——
+> 这个接口免鉴权，是任何人都能调的，不该回显任何凭据片段。**App 只依赖 `enabled` 一个字段即可**，
+> 其余字段缺省都要能容错（用可选类型 / `has("key")` 判断，别强解包）。
+> 真要展示 Token，用面板登录后的 `GET /api/v1/auth/token`。
 > ⚠️ 不要用 `/healthz` 判断鉴权状态 —— 它为了容器健康检查**永远返回 200**。
 
 **给用户的填写指引文案建议**（可直接用）：
@@ -454,7 +465,8 @@ Authorization: Bearer <token>。接口路径、参数、响应结构均不变。
    TokenInvalidException，UI 层弹提示"API Token 无效，请到设置页重新填写"，
    并提供"去设置"和"重试"两个按钮。不要静默清空本地 Token。
 4. 设置页增加两个输入项（服务器地址、API Token），提供"测试连接"按钮：
-   调 GET /api/v1/auth/state（该接口免鉴权），
+   调 GET /api/v1/auth/state（该接口免鉴权，未登录只返回 enabled / logged_in 两个字段，
+   其余字段一律当可选处理，不要强解包），
    - 请求失败 → 提示地址/端口错误
    - enabled=false → 提示"该服务器未开启鉴权，可不填 Token"
    - enabled=true 且填了 Token → 再调一次需要鉴权的接口（如 /api/v1/stats），
@@ -462,7 +474,8 @@ Authorization: Bearer <token>。接口路径、参数、响应结构均不变。
 5. 首次启动引导：无 baseUrl 时先要求填地址；填完调 /api/v1/auth/state，
    若 enabled=true 且本地无 Token，则进入 Token 填写页，并展示引导文案：
    "打开 http://<服务器IP>:8181 → 用管理密码登录 → 右上角「⚙ 设置」→ 复制 API Token"
-6. 日志脱敏：任何日志中 Token 只显示前 7 位和后 4 位，形如 vs_HYgS…u51c。
+6. 日志脱敏：**任何日志/崩溃上报/埋点里都不要出现 Token**，最多记一个布尔位
+   （如 hasToken=true）或长度。不要打前缀/后缀片段 —— 半截 Token 依然是线索。
 7. 不要实现 /api/v1/auth/login 相关功能，App 不需要管理密码。
 8. 列表分页统一 page_size=30（三列 × 10 行），页码从 1 开始；
    用 page >= pagecount 判断结束，最后一页不足 30 条要正常渲染。

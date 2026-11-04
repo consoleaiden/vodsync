@@ -720,7 +720,8 @@ function openModal(title, bodyHtml) {
 }
 
 // ---------------- 访问控制（v1.5.0：密码登录 + API Token） ----------------
-let authState = { enabled: false, logged_in: true, has_token: false, token_hint: "" };
+// 只保留「是否有 Token」这种布尔位，接口不再回显 Token 片段
+let authState = { enabled: false, logged_in: true, has_token: false };
 
 async function loadAuthState() {
   try {
