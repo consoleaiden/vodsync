@@ -14,25 +14,33 @@
 - **中转代理降级**：源站直连不可达/被风控时，自动按顺序切到 API 中转代理取数（可配多个，成功后记忆 30 分钟）
 - **访问控制**：面板密码登录（默认 `666666`）+ API Token，可一键开关；Token 可在面板生成/重置
 - **断电可恢复**：每页一个事务 + 断点/水位线入库，重启后自动续跑；单页失败不会静默丢数据
-- **多数据库**：默认 SQLite（WAL），一行环境变量切换 PostgreSQL
+- **PostgreSQL 存储**：v1.7.0 起固定使用 PG，百万级行下列表查询走并行 top-K 归并
+- **自带维护任务**：定时清理同步日志、回收 WAL，长时间跑不会把库/磁盘撑爆
 
 ## 技术选型说明
 
 | 项 | 选型 | 理由 |
 |---|---|---|
 | 语言/框架 | Python 3.12 + FastAPI | IO 密集型抓取，多线程 + httpx 连接池足够；代码易读易改 |
-| 数据库（推荐） | SQLite WAL 模式 | 群晖单机部署零依赖；写集中在同步任务，读多写少场景 WAL 并发完全够用；备份=复制单文件 |
-| 数据库（可选） | PostgreSQL | 需要多实例共享/超大并发读时切换，仅改 `DATABASE_URL` |
+| 数据库 | PostgreSQL 16 | 220 万行起步、52 张分表、列表要按时间倒序翻页 —— 这些是 SQLite 的弱项（无并行查询、写串行、UNION 排序慢）；PG 还能让 API 与同步真正并发 |
 | 调度 | APScheduler | 轻量、随应用进程运行，无需额外 cron 容器 |
+| 列表查询 | 每表 top-K + 进程内归并 | 替代 52 表 UNION ALL + 全量排序，首页从秒级降到几十毫秒（见 `app/multiquery.py`） |
+
+> SQLite 驱动代码仍然保留，但**只用于自动化测试**（`python scripts/test_*.py` 直接跑，不需要起 PG）。
+> 生产环境请始终配置 `DATABASE_URL` 指向 PostgreSQL。
 
 ## 快速开始（本地开发）
 
 ```bash
-# 1. 安装依赖（建议 Python 3.10+）
+# 0. 先有一个 PostgreSQL（本地装、或用 compose 里那个都行）
+#    最省事：docker compose up -d postgres
+
+# 1. 安装依赖（建议 Python 3.11+）
 pip install -r requirements.txt
 
-# 2. （可选）复制并修改环境变量
+# 2. 配置连接串（必须指向 PG）
 cp .env.example .env
+# DATABASE_URL=postgresql+psycopg2://vodsync:vodsync@127.0.0.1:5432/vodsync
 
 # 3. 启动
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
@@ -42,7 +50,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 # API 文档: http://127.0.0.1:8000/docs
 ```
 
-首次启动会自动：建库 → 拉取源站列表 → 后台开始全量同步（数据量大，需数小时）。
+首次启动会自动：建表 → 拉取源站列表 → 后台开始全量同步（数据量大，需数小时）。
 
 ## 管理面板
 
@@ -252,11 +260,8 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
 - **防爆破**：连续输错 5 次锁定 5 分钟（按 IP 计），六位默认密码不至于被脚本刷开。
 - **忘记密码**：删掉数据库里的那行密码哈希再重启，即恢复成 `ADMIN_PASSWORD`（默认 `666666`）：
   ```bash
-  # SQLite
-  docker compose stop vodsync && sqlite3 data/vodsync.db "delete from settings where key='admin_password_hash'"
-  # PostgreSQL
   docker exec vodsync-pg psql -U vodsync -d vodsync -c "delete from settings where key='admin_password_hash'"
-  docker compose up -d
+  docker compose restart vodsync
   ```
 - 兼容：`API_KEY` 环境变量仍可作为一枚额外 Token 使用（老客户端不必改配置就能继续跑，只要它带的 Key 与之一致）。
 - **状态接口不回显凭据**：`/api/v1/auth/state` 在免鉴权白名单里（登录页要靠它判断），因此未登录只返回
@@ -270,7 +275,7 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
 | 全量同步中（断电 / `docker restart`） | 每页一个事务，已提交的页都在 | `sources.last_page` 持久化 | 自动续跑（默认延迟 30s），从断点的下一页继续 |
 | 全量某页持续抓取失败 | 该页不写入，其他页照常 | 断点停在失败页**之前** | 本次内重试 `PAGE_MAX_ATTEMPTS` 次；仍失败则中止，断点保留，下次接着来 |
 | 增量同步中 | 水位线最后才推进，重跑整批候选 | 水位线 | 下一轮调度自动重来（UPSERT 幂等，不会重复行） |
-| 写入瞬间断电（SQLite） | WAL 回滚，`synchronous=NORMAL` 下可能丢最后几秒已提交数据 | — | 库不会损坏；重抓该页即可补齐 |
+| 写入瞬间断电 | PG 回滚未提交事务（每页一个事务，最坏丢当前页），已提交的页都在 | — | 库不会损坏；断点还在，续跑该页即可补齐 |
 | 服务被 kill | 内存态清空 | — | 残留的 `running` 日志自动改 `interrupted`，不会永远显示"进行中" |
 
 设计要点（为什么能这么恢复）：
@@ -317,7 +322,15 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
 | `DB_MAX_OVERFLOW` | 20 | 连接池峰值溢出连接数 |
 | `DB_POOL_TIMEOUT` | 10 | 等连接的秒数，超时返回 503（不是 500） |
 | `SEARCH_CONCURRENCY` | 4 | 聚合搜索的并行度（每线程占一个连接） |
-| `DATABASE_URL` | SQLite | 切 PostgreSQL：`postgresql+psycopg2://user:pass@host:5432/db` |
+| `MERGE_MAX_PER_TABLE` | 3000 | **列表归并每表最多取多少行**（决定能精确翻到第几页，超出回退慢路径） |
+| `MERGE_CONCURRENCY` | 4 | 列表归并的并行度（每线程占一个连接，别超过 `DB_POOL_SIZE`） |
+| `TOTAL_CACHE_SECONDS` | 60 | 列表 total 的缓存秒数（0 = 每次实时 count） |
+| `HOUSEKEEPING_ENABLED` | true | 是否定时清理同步日志 / 回收 WAL |
+| `HOUSEKEEPING_INTERVAL_MINUTES` | 60 | 维护任务间隔 |
+| `SYNC_LOG_RETENTION_DAYS` | 30 | 同步日志保留天数（`running` 行不删） |
+| `SYNC_LOG_KEEP_PER_SOURCE` | 50 | 每个源站最多保留条数（兜底） |
+| `SYNC_LOG_MAX_ROWS` | 20000 | `sync_logs` 全表行数上限（兜底） |
+| `DATABASE_URL` | `postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync` | **必填**，指向 PostgreSQL |
 | `AUTH_ENABLED` | true | 访问控制初始开关（首次启动写入数据库，之后以面板设置为准） |
 | `ADMIN_PASSWORD` | 666666 | 首次启动的管理面板密码，登录后请改掉 |
 | `SESSION_TTL_DAYS` | 7 | 面板登录会话有效期（天） |
@@ -325,186 +338,6 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
 | `TRUST_PROXY` | false | 是否信任反代的 `X-Forwarded-For`（反代之后才开，否则锁定可被伪造 IP 绕过） |
 | `API_KEY` | 空 | 兼容项：设置后作为一枚额外有效的 Token |
 | `ONLY_OK_SOURCES` | true | 只同步在线源站 |
-
-## 从 SQLite 迁移到 PostgreSQL（不需要重新同步）
-
-换成 PostgreSQL 后新库是空的。**不用把所有源站重新抓一遍** —— 用迁移脚本把 SQLite 里的数据整体搬过去即可，
-连 `watermark`（增量水位线）和 `last_page`（全量断点）都会保留，迁完直接接着做增量。
-
-### 0) 先把 PG 加进 compose（群晖 Container Manager 图形界面）
-
-`docker-compose.yml` 里的 `postgres` 段是**注释掉**的，所以 `docker ps | grep postgres` 什么都没有、迁移时报
-`could not translate host name "postgres"`。启用方式二选一：
-
-- **Container Manager** → 项目 → 选中 `vodsync` → 编辑 → 把末尾 `# postgres:` 起的整段注释去掉（或按下面整段粘贴，**2 空格缩进，与 `vodsync:` 同级**）→ 保存 → 构建/启动。
-- 项目是 SSH 里 `docker compose up` 起的、UI 里看不到时，用 **File Station** 右键 `docker-compose.yml` → 打开方式 → 文本编辑器 改。
-
-```yaml
-  postgres:
-    image: postgres:16-alpine
-    container_name: vodsync-pg
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: vodsync
-      POSTGRES_PASSWORD: vodsync
-      POSTGRES_DB: vodsync
-      TZ: Asia/Shanghai
-    volumes:
-      - /volume2/docker/vodsync/pgdata:/var/lib/postgresql/data   # 与 data 卷同一前缀
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U vodsync -d vodsync"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
-```
-
-> 两个不要：**不要映射 5432 到宿主机**（容器间用服务名直连，映射容易和已有 PG 抢端口）；
-> **不要在这一步就解开 `DATABASE_URL`** —— 空库会让 vodsync 以空库启动、白抓一遍，先迁移再切。
-> 想让 vodsync 等 PG 就绪再起，可在 vodsync 服务下加 `depends_on: {postgres: {condition: service_healthy}}`。
-
-```bash
-# 0) 先停服务，保证源库不再写入（PG 容器要先起好，两种起法见下方"一条命令起 PG"）
-sudo docker compose stop vodsync
-
-# 1) 预演：看看要搬多少（不写目标库）
-#    compose run 会复用同一网络和同一 data 卷，所以 --source 默认就指向 /app/data/vodsync.db
-sudo docker compose run --rm vodsync python /app/scripts/migrate_sqlite_to_pg.py \
-  --target "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync" --dry-run
-
-# 2) 正式迁移（可重复执行，已存在的行按主键跳过）；同上命令去掉 --dry-run
-
-# 2.5) 迁移中途断了（SSH 掉线 / Ctrl+C / 容器重启）：一条命令补齐
-sudo docker compose run --rm vodsync python /app/scripts/migrate_sqlite_to_pg.py \
-  --target "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync" --repair
-
-# 3) 改 DATABASE_URL 并启动
-sudo docker compose up -d
-```
-
-`--repair` 做三件事：逐表对比 SQLite 与 PG 的行数 → 只对缺数据的表重跑一遍（每批一个事务 + 主键冲突跳过，
-所以可反复执行、不会重复写入）→ 补建索引并重置序列，再整体复查一遍。中断过的迁移尤其需要它，
-因为「建索引」是所有数据写完后才做的，断在中途等于**一张索引都没建**（PG 查询会慢到不可用）。
-
-> 如果 PostgreSQL 装在别的机器（不在 compose 内网），把 target 换成那台机器的地址即可，例如
-> `postgresql+psycopg2://vodsync:vodsync@192.168.1.10:5432/vodsync`；此时用
-> `docker run --rm -v /volume2/docker/vodsync/data:/data --entrypoint python ghcr.io/consoleaiden/vodsync:latest /app/scripts/migrate_sqlite_to_pg.py ...` 也行，注意 `--source /data/vodsync.db`。
-
-**不想改 compose 的话，一条命令就能起 PG**（挂到本项目网络并带 `postgres` 别名，迁移命令和 `DATABASE_URL` 都不用改）：
-
-```bash
-# 先确认真没有 PG：docker ps | grep -i postgres 无输出、docker inspect postgres 报 No such object
-mkdir -p /volume2/docker/vodsync/pgdata        # 与 data 卷同级，按实际路径改
-docker run -d --name vodsync-pg --restart unless-stopped \
-  --network vodsync_default --network-alias postgres \
-  -e POSTGRES_USER=vodsync -e POSTGRES_PASSWORD=vodsync -e POSTGRES_DB=vodsync \
-  -e TZ=Asia/Shanghai \
-  -v /volume2/docker/vodsync/pgdata:/var/lib/postgresql/data \
-  postgres:16-alpine
-
-# 等日志出现 "database system is ready to accept connections" 再迁移
-docker logs -f vodsync-pg
-docker exec vodsync-pg pg_isready -U vodsync
-```
-
-> `vodsync_default` 是 compose 项目默认网络名（`<项目名>_default`），用 `docker network ls | grep vodsync` 核对。
-> 若改用 compose 起 PG，记住两者 `container_name` 都是 `vodsync-pg`，需要先 `docker rm -f vodsync-pg` 再 `up -d`。
-
-### 报错 `could not translate host name "postgres"` 怎么办
-
-**这是 Docker 网络问题，不是 PG 没启动。** `docker compose run` 起的临时容器只认识「同一个 compose 项目网络」里的服务名；
-如果 `postgres` 这个容器是 `docker run --name postgres` 或另一个 compose 项目起的，名字虽然叫 postgres，但在本项目网络里没有这个 DNS 记录。
-
-```bash
-# 看 PG 挂在哪个网络（以及是否真的在跑）
-docker ps | grep -i postgres
-docker inspect -f '{{json .NetworkSettings.Networks}}' postgres
-docker network ls | grep vodsync       # 本项目默认网络名，通常 vodsync_default
-
-# 解法①（推荐，PG 不用重建、数据不动）：把 PG 接进本项目网络，并给它 postgres 这个别名
-docker network connect --alias postgres vodsync_default postgres
-
-# 自测：能打印出 IP 就说明通了
-docker compose run --rm vodsync python -c "import socket;print(socket.gethostbyname('postgres'))"
-```
-
-解法②（绕过 DNS）：PG 的 5432 已映射到宿主机时，直接用宿主机地址 ——
-`--target "postgresql+psycopg2://vodsync:vodsync@<NAS局域网IP 或 172.17.0.1>:5432/vodsync"`。
-
-解法③（最干净，适合 PG 还是空的/新建的）：解开 compose 里的 `postgres` 段，让两个服务同属一个项目网络，
-`docker compose up -d postgres` 后 `postgres:5432` 自然可解析。注意先停掉旧的同名 PG 容器（否则 5432 端口冲突）。
-
-- 迁移内容：`sources`（源站元数据 + 水位线 + 断点 + 暂停/自动同步开关）、`sync_logs`、全部 `vod_*` 数据表
-- 脚本结束会自动校验：表是否齐全、行数是否一致、`watermark`/`last_page`/`paused`/`auto_sync` 等关键字段逐行比对
-- 只想搬元数据不搬视频数据：`--only-meta`；只搬部分源站：`--tables jkun,t1`
-- 想要源库覆盖目标库（重跑迁移修正脏数据）：`--replace`；只校验不迁移：`--verify`
-- **索引在数据全部写完后统一创建**（先插数据再建 B-tree，比边插边维护快数倍），所以日志里会先看到“迁移数据”，跑完才看到“建索引”
-- PostgreSQL 下迁移结束会自动执行 `ANALYZE`（更新统计信息，让后续查询走对索引）
-- 迁移前会先探测目标库连通性，连不上直接列出排查清单（容器是否在跑 / 主机名端口 / 库和用户是否已建）
-- 速度实测：30 万行 5.7 秒（本地 SQLite 目标，约 5.2 万行/秒）；220 万行在 NAS 上连 PG 预计 **2~5 分钟**，加建索引 10~30 秒
-- 磁盘预留：PG 侧约为 SQLite 库大小的 1.5 倍（数据 + 索引 + WAL）
-- 大数据量想再快一点：`--batch 5000`（默认 2000）
-- 迁移完成后 PG 下写事务不再需要进程内串行，可把 `SOURCE_SYNC_CONCURRENCY` 从 2 调到 4~6
-
-> 兜底方案：如果 SQLite 里本来就没多少数据（比如只有几个站跑过），直接换 `DATABASE_URL`
-> 重新全量同步更省事 —— 迁移的收益在于**省掉百万级的重新抓取**。
-
-### 把 pgdata 搬到 SSD（可选，提升 PG 随机 IO）
-
-**不能边跑边复制，也不能用 File Station 拖拽**（会丢 uid/gid，PG 启动直接报 data directory has wrong ownership）。
-正确姿势是「干净停库 → 保权限复制 → 改挂载路径 → 重建容器 → 逐表校验」：
-
-```bash
-cd /volume2/docker/vodsync
-sudo docker compose stop vodsync postgres          # 必须停干净，不要 docker kill
-docker ps | grep -E "vodsync|postgres"              # 应为空
-
-sudo mkdir -p /volume3/ssd/vodsync/pgdata           # SSD 上的真实路径，必须在本地存储空间上
-sudo cp -a /volume2/docker/vodsync/pgdata/. /volume3/ssd/vodsync/pgdata/   # -a 保留属主/权限，或
-# sudo rsync -aHAX --numeric-ids /volume2/docker/vodsync/pgdata/ /volume3/ssd/vodsync/pgdata/
-sudo du -sh /volume2/docker/vodsync/pgdata /volume3/ssd/vodsync/pgdata     # 两份大小应一致
-
-# 改 compose 里的挂载路径，然后重建容器（改了 volume 必须 recreate 才生效）
-#   - /volume3/ssd/vodsync/pgdata:/var/lib/postgresql/data
-sudo docker compose up -d --force-recreate postgres
-docker exec vodsync-pg pg_isready -U vodsync
-```
-
-- `cp -a` 之后**不要 chown**：PG 数据目录属主必须保持原样（alpine 版是 uid 70）。若真丢了权限又没备份，只能重新 initdb。
-- **绝不能放在 SMB / NFS / iSCSI 等网络挂载上**，PG 依赖文件锁与 fsync，网络盘会随机报错甚至损坏数据。
-- SSD 若在加密共享文件夹里，务必确认**开机自动挂载**：路径不存在时 Docker 会自建空目录，PG 见到空目录会 initdb 一个新库，看起来就是「数据全没了」。
-- 旧 pgdata **先别删**，跑一周确认无误再清理（它是唯一的快速回滚点）。
-- 搬完用迁移脚本复查一遍（SQLite 与 PG 逐表比行数，最可靠的验证）：
-  `sudo docker compose run --rm vodsync python /app/scripts/migrate_sqlite_to_pg.py --target "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync" --verify`
-
-## GitHub 仓库搭建流程（完整步骤）
-
-```bash
-# 1. 在 GitHub 上创建空仓库（建议名 vodsync，不要勾选初始化 README）
-
-# 2. 本地初始化并推送
-cd vodsync
-git init
-git add .
-git commit -m "feat: vodsync 影视数据同步服务 v1.0"
-
-# 3. 关联远程并推送（替换 <你的用户名>）
-git branch -M main
-git remote add origin https://github.com/consoleaiden/vodsync.git   # 本项目已推送: https://github.com/consoleaiden/vodsync
-git push -u origin main
-
-# 4.（可选）推送版本标签触发多架构正式镜像构建
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-**启用 CI 自动构建镜像：**
-
-1. 仓库已在 `.github/workflows/docker-image.yml` 配好：推 `main` → 构建 `latest` 镜像；推 `v*` 标签 → 构建 `1.x.x` 版本镜像
-2. GHCR 无需额外配置（用内置 `GITHUB_TOKEN`），构建完成后镜像在仓库 Packages 页可见
-3. 首次使用 GHCR 镜像需将其设为 Public（Packages → vodsync → Package settings → Change visibility），或在群晖登录 GHCR
-4. （可选）同步推 Docker Hub：仓库 Settings → Secrets and variables → Actions → 添加 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`
-5. 修改代码后只需 `git push`，约 3-5 分钟后群晖即可拉到新镜像
 
 ## 群晖部署
 
@@ -514,16 +347,22 @@ git push origin v1.0.0
 
 ## 常见坑
 
-1. **必须挂载数据卷**：SQLite 数据库在容器内 `/app/data`，不挂载则重建容器数据全丢
-2. **全量同步耗时**：百万级数据首次同步约需数小时（受源站限速影响），期间断点可续传；`GET /api/v1/sources` 中 `syncing=true` 表示还在同步
-3. **部分源站 403**：源站有 UA/频率风控，可调大 `REQUEST_INTERVAL_SECONDS`；日志中会记录失败原因并自动跳过
-4. **群晖 ARM 机型**：CI 已构建 `linux/arm64` 镜像，直接可用
-5. **切换 PostgreSQL**：修改 `DATABASE_URL` 即可，表结构自动创建；SQLite 文件中的历史数据需手动迁移
-6. **磁盘占用**：百万条记录 + 简介文本约 1-3GB，预留空间；SQLite 启用 WAL 后同目录会出现 `-wal`/`-shm` 文件属正常现象
-7. **服务「假死」/接口全 500 / 容器不健康**：基本都是同时跑了太多同步任务导致 SQLite 写锁争抢、连接池被占满（v1.4.1 已加全局并发闸门，正常不会再发生）。排查顺序：
+1. **pgdata 必须持久化**：数据库在 postgres 容器里，`/var/lib/postgresql/data` 不挂载 = 重建容器数据全丢；
+   `/app/data` 也建议挂载（里面是同步断点 `pause_state.json`）
+2. **pgdata 别放机械盘**：220 万行 + 索引约 2~4GB，机械盘上全量同步和列表查询都会明显变慢（放 SSD）
+3. **PG 大版本不能直接换镜像**：`postgres:16-alpine` 升到 17 前必须 `pg_dump` 导出再导入，直接改 tag 会启动失败
+4. **全量同步耗时**：百万级数据首次同步约需数小时（受源站限速影响），期间断点可续传；`GET /api/v1/sources` 中 `syncing=true` 表示还在同步
+5. **部分源站 403**：源站有 UA/频率风控，可调大 `REQUEST_INTERVAL_SECONDS`；日志中会记录失败原因并自动跳过
+6. **群晖 ARM 机型**：CI 已构建 `linux/arm64` 镜像，直接可用
+7. **磁盘占用**：数据 + 索引约 1.5 倍原始 CSV 大小，PG 的 WAL 在 `pg_wal/` 下自行回收，不用手工清
+8. **接口变慢 / 列表首页要好几秒**：先看 `/api/v1/videos` 响应里的 `query_ms` 和 `pagecount`
+   - `query_ms` 大且翻页很深（超过 `MERGE_MAX_PER_TABLE / page_size`）→ 走了 UNION 回退路径，属预期；
+     想支持更深翻页就调大 `MERGE_MAX_PER_TABLE`（代价是内存）
+   - 一直慢则看 PG 侧：`docker exec vodsync-pg psql -U vodsync -d vodsync -c "select count(*) from pg_stat_activity"`
+9. **服务「假死」/接口全 500**：多数是同时跑了太多同步任务把连接池占满。排查顺序：
    - `GET /api/v1/stats` 看 `sync_load`（running/queued/limit）与 `db_pool.checked_out`；`checked_out` 长期贴近 `size+max_overflow` 说明压力过大
    - 面板上同时点多个「全量」时，超出的会进入「排队中」，属正常排队，不要重复点击
-   - 想更快完成多个源站全量，调大 `SOURCE_SYNC_CONCURRENCY`（NAS 上建议 ≤2，SQLite 写是串行的，调太大只会互相等锁）
+   - 想更快完成多个源站全量，调大 `SOURCE_SYNC_CONCURRENCY`（NAS 上建议 ≤3，抓取本身就是瓶颈）
    - 若日志仍有 `QueuePool limit ... reached`，把 `DB_POOL_TIMEOUT` 调小（如 5）让请求快速失败，并检查是否有外部脚本在狂刷列表接口
 
 ## 项目结构
@@ -531,19 +370,24 @@ git push origin v1.0.0
 ```
 vodsync/
 ├── app/
-│   ├── main.py          # 应用入口（启动初始化 + 调度器）
+│   ├── main.py          # 应用入口（启动初始化 + 调度器 + 鉴权中间件）
 │   ├── config.py        # 全部配置项（环境变量）
-│   ├── database.py      # 引擎（SQLite WAL 优化 / PG 支持）
-│   ├── models.py        # sources / sync_logs / 动态 vod_{slug} 表
-│   ├── maccms.py        # 苹果 CMS 接口客户端（重试/限速/字段提取）
-│   ├── syncer.py        # 同步引擎（全量断点续传 + 增量水位线）
+│   ├── database.py      # 引擎与连接池（生产 PG；SQLite 仅测试）
+│   ├── models.py        # sources / sync_logs / settings / 动态 vod_{slug} 表
+│   ├── maccms.py        # 苹果 CMS 接口客户端（重试/限速/代理降级）
+│   ├── syncer.py        # 同步引擎（全量断点续传 + 增量水位线 + 重启恢复）
+│   ├── multiquery.py    # 多源列表查询（每表 top-K + 进程内归并）
+│   ├── housekeeping.py  # 数据维护（sync_logs 清理 / WAL checkpoint）
+│   ├── auth.py          # 访问控制（面板密码 / 会话 / API Token）
+│   ├── pause.py         # 暂停状态持久化（原子写）
 │   ├── scheduler.py     # APScheduler 定时任务
-│   ├── utils.py         # 播放地址解析 / 鉴权 / 分页
+│   ├── utils.py         # 播放地址解析 / 分页参数
 │   ├── routes/api.py    # 全部 API 路由（含 /search 聚合搜索、/stats 统计）
-│   └── web/index.html   # Web 管理面板（单文件，内联 CSS/JS，无需构建）
+│   └── web/             # 管理面板 index.html + 登录页 login.html（单文件内联，无需构建）
 ├── .github/workflows/docker-image.yml   # CI：多架构镜像构建推送
-├── Dockerfile / docker-compose.yml
+├── Dockerfile / docker-compose.yml      # compose 内含必备的 postgres 服务
 ├── .env.example
+├── scripts/                             # 测试脚本（用 SQLite 临时库，不需要 PG）
 └── docs/
     ├── API_SPEC_FOR_AI.md   # ★ 交付给 AI 的完整 API 文档（字段字典/状态语义/代码骨架/排查表）
     ├── CLIENT_API.md        # 简明对接说明（人类速查）
@@ -717,3 +561,29 @@ vodsync/
   「任何日志都不出现 Token，最多记布尔位」；`docs/API_SPEC_FOR_AI.md` 同步
 - 测试：`scripts/test_v150_auth.py` 增加 10 项断言（未登录字段白名单、响应体不含 Token 前后缀、缓存头）
 - 版本号 1.6.0 → 1.6.1
+
+### v1.7.0
+Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一 PostgreSQL**。
+
+- **多源列表查询**（`app/multiquery.py`，新）：不带 `source` 查全部源站时，旧实现把 52 张表
+  `UNION ALL` 成子查询再套 `count(*)` + `ORDER BY ... OFFSET`，等于每次请求把 220 万行物化排序
+  （首页 4~8s，第 20 页 10s+）。改为每表各取 top-K（走 `idx_*_time` 倒序）+ 进程内多路归并：
+  全局第 N 行必然在所属表的前 N 行内，**结果精确**而非近似；首页降到几十毫秒
+  - `ac=detail` 改两段式：先瘦列排序分页，再只对当前页那几十行补 `content`/`play_url`
+  - `total` 并行 count + 60s 缓存；单表失败降级为 `total_is_partial` 而不是整页 500
+  - 翻页超过 `MERGE_MAX_PER_TABLE / page_size`（默认第 100 页）自动回退 UNION，宁可慢不快错
+  - 响应新增 `query_ms` / `total_is_partial` / `sources_failed`（App 可忽略）
+- **数据维护**（`app/housekeeping.py`，新）：`sync_logs` 原来只增不减。现在每小时三级清理
+  （超期 / 每源站上限 / 全表上限，`running` 行永不删）+ SQLite WAL checkpoint（PG 下 no-op）
+- **源站 slug 碰撞**（`syncer.refresh_sources`）：只按 `slugify(name)` 判重时，两个纯 ASCII 站名
+  撞车（`"HD 资源"` 与 `"HD-资源"` 都得 `hd`），第二个站被当成已存在 → 它的 `api_url` 永远写不进去，
+  表现为**长期同步的是别人家的接口且无任何报错**。改为按 `api_url` 认源站身份，slug 冲突时追加
+  `_2`/`_3`；已登记源站的 slug 永不变（它是表名与 API 路径的一部分）
+- **生产统一 PG**：默认 `DATABASE_URL` 指向 `postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync`；
+  compose 里 `postgres` 从注释段升为必备服务（`depends_on: service_healthy` + `shm_size`）；
+  删除 `scripts/migrate_sqlite_to_pg.py` 与其 58 项测试（数据已迁完，git 历史可查）；
+  SQLite 驱动仅保留给自动化测试
+- **安全**：启动日志不再打印带密码的 `DATABASE_URL`（`init_db` 内已打脱敏版本）
+- 测试：新增 `scripts/test_v170_wave2.py`（42 项：归并与 UNION 逐条比对、分页边界、detail 两段式、
+  LIKE 转义、缓存命中、深页回退、日志三级清理、slug 碰撞），全仓 201 项通过
+- 版本号 1.6.1 → 1.7.0

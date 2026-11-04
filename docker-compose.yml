@@ -1,5 +1,16 @@
 # 群晖 Container Manager / 通用 docker-compose 部署模板
 # 用法：把本项目放到 /volume1/docker/vodsync/ 后，Container Manager -> 项目 -> 新增 -> 使用此文件
+#
+# v1.7.0 起数据库固定为 PostgreSQL（同一个 compose 里带一个 postgres 服务），
+# SQLite 只保留给自动化测试，不作为部署选项。
+#
+# ★ 从旧版本升级时，先核对这 4 项，否则会连到一个空库并触发全量重新同步：
+#   1. postgres 的 volumes 路径 —— 必须指向**现有 pgdata 所在目录**（本模板写 /volume1，
+#      如果你的库在 /volume2 或其他盘，务必改掉）
+#   2. POSTGRES_PASSWORD —— 必须与 pgdata 初始化时设的密码一致（不是改这里就能改密码）
+#   3. DATABASE_URL 里的密码/端口 —— 要与上面一致
+#   4. 若已有名为 vodsync-pg 的容器由别的 compose 项目管理，先 docker rm -f vodsync-pg，
+#      否则这里会报 container name already in use
 services:
   vodsync:
     # 官方发布镜像（GitHub Actions 自动构建，双架构 amd64/arm64，公开可拉取）
@@ -11,8 +22,11 @@ services:
     ports:
       - "8181:8000"               # 宿主机端口:容器端口，左侧按需修改
     volumes:
-      - /volume1/docker/vodsync/data:/app/data   # SQLite 数据库持久化目录（必须）
+      # 数据库在 postgres 容器里，这里只放断点状态（pause_state.json）与日志
+      - /volume1/docker/vodsync/data:/app/data
     environment:
+      # ---- 数据库（必填；用户/密码/库名要与下面 postgres 服务一致）----
+      DATABASE_URL: "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync"
       # ---- 数据源 ----
       LATEST_JSON_URL: "https://mylazily.github.io/ziyuanzhan/data/latest.json"
       ONLY_OK_SOURCES: "true"              # 只同步在线源站
@@ -20,26 +34,33 @@ services:
       # ---- 调度 ----
       SYNC_INTERVAL_MINUTES: "360"         # 增量同步间隔（分钟），默认 6 小时
       SOURCE_REFRESH_INTERVAL_MINUTES: "720"  # 源站列表刷新间隔（分钟）
-      SOURCE_SYNC_CONCURRENCY: "2"         # 同时真正在跑的源站同步数上限（超出排队；NAS 建议 1-2）
+      SOURCE_SYNC_CONCURRENCY: "2"         # 同时真正在跑的源站同步数上限（超出排队）
       PAGE_CONCURRENCY: "4"                # 单源站内并行抓取页数
       PAGE_MAX_ATTEMPTS: "3"               # 同一页最多重试几次，超过就中止并保留断点
       REQUEST_INTERVAL_SECONDS: "0.3"      # 请求间隔，防源站封禁
       # ---- 断电/重启恢复（v1.6.0）----
       AUTO_RESUME_ON_BOOT: "true"          # 启动时自动续跑有断点的全量同步
       AUTO_RESUME_DELAY_SECONDS: "30"      # 延迟多久开始续跑（等服务先起来）
-      # ---- 数据库连接池（连接池耗尽会导致接口 500/503，见 README 常见坑第 7 条）----
+      # ---- 数据库连接池 ----
       DB_POOL_SIZE: "10"
       DB_MAX_OVERFLOW: "20"
       DB_POOL_TIMEOUT: "10"                # 等连接超时（秒），超时返回 503 让客户端退避
       SEARCH_CONCURRENCY: "4"              # 聚合搜索并行度
+      # ---- 多源列表查询（v1.7.0）----
+      MERGE_MAX_PER_TABLE: "3000"          # 每表参与归并的最大行数（= 最深支持 3000/page_size 页）
+      MERGE_CONCURRENCY: "4"               # 归并查询并行度（每个线程一个连接）
+      TOTAL_CACHE_SECONDS: "60"            # 列表 total 的缓存秒数
+      # ---- 数据维护（v1.7.0）----
+      HOUSEKEEPING_ENABLED: "true"
+      HOUSEKEEPING_INTERVAL_MINUTES: "60"  # 清理同步日志的间隔
+      SYNC_LOG_RETENTION_DAYS: "30"        # 同步日志保留天数
+      SYNC_LOG_KEEP_PER_SOURCE: "50"       # 每个源站最多保留多少条
+      SYNC_LOG_MAX_ROWS: "20000"           # 全表行数上限
       # ---- 中转代理（源站直连失败时自动降级）----
       PROXY_ENABLED: "true"
       PROXY_URLS: "https://pz.v88.qzz.io/,https://mconfig.viptv.work/"
       PROXY_PREF_TTL_MINUTES: "30"         # 走代理成功的源站，多久后重试直连
       PROXY_CONCURRENCY: "4"               # 每个代理的并发上限
-      # ---- 数据库 ----
-      # 默认 SQLite（推荐），如需 PostgreSQL：迁移完成后再解开下行
-      # DATABASE_URL: "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync"
       # ---- 访问控制（v1.5.0）：面板登录 + API Token ----
       AUTH_ENABLED: "true"                 # 首次启动写入数据库，之后在面板「⚙ 设置」里改
       ADMIN_PASSWORD: "666666"             # 首次启动的面板密码，登录后请改掉
@@ -50,36 +71,40 @@ services:
       # ---- API ----
       API_PAGE_SIZE_DEFAULT: "30"          # 每页条数：App 三列 × 10 行 = 30（上限见 API_PAGE_SIZE_MAX）
       TZ: "Asia/Shanghai"
-    # 启用 PostgreSQL 后解开（配合 postgres 的 healthcheck，避免 vodsync 比库先起而启动失败）
-    # depends_on:
-    #   postgres:
-    #     condition: service_healthy
+    depends_on:
+      postgres:
+        # 等 PG 真正可接受连接再启动，避免 vodsync 比库先起而 CrashLoop
+        condition: service_healthy
 
-  # ---- 可选：PostgreSQL（数据量超大或多实例共享时启用） ----
-  # 切换前先迁数据，不用重新同步（详见 README「从 SQLite 迁移到 PostgreSQL」）：
-  #   注意：迁移时的 --target 用 postgres:5432 能解析的前提是 PG 与本服务在同一 compose 项目网络里；
-  #   若 PG 是单独 docker run 或另一个项目起的，会报 could not translate host name "postgres"，
-  #   修法见 README「报错 could not translate host name "postgres" 怎么办」。
-  #   docker run --rm -v /volume2/docker/vodsync/data:/data --entrypoint python \
-  #     ghcr.io/consoleaiden/vodsync:latest /app/scripts/migrate_sqlite_to_pg.py \
-  #     --source /data/vodsync.db --target "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync" --dry-run
-  # postgres:
-  #   image: postgres:16-alpine
-  #   container_name: vodsync-pg
-  #   restart: unless-stopped
-  #   environment:
-  #     POSTGRES_USER: vodsync
-  #     POSTGRES_PASSWORD: vodsync
-  #     POSTGRES_DB: vodsync
-  #     TZ: Asia/Shanghai
-  #   volumes:
-  #     - /volume1/docker/vodsync/pgdata:/var/lib/postgresql/data   # 与上面 data 卷同一前缀
-  #   healthcheck:                     # 让 vodsync 等 PG 就绪再启动（配合 vodsync 的 depends_on）
-  #     test: ["CMD-SHELL", "pg_isready -U vodsync -d vodsync"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 10
-  #     start_period: 20s
-  #   # 不要映射 5432 到宿主机：容器之间直连用服务名即可，映射反而容易和已有 PG 抢端口
-  #   # ports:
-  #   #   - "5433:5432"
+  # ---- PostgreSQL（v1.7.0 起必备）----
+  # 数据卷建议放在 SSD 上：220 万行 + 索引约 2~4GB，机械盘上全量同步会明显拖慢。
+  # 升级大版本（如 16 → 17）前先 pg_dump 备份，pgdata 不能跨大版本直接复用。
+  postgres:
+    image: postgres:16-alpine
+    container_name: vodsync-pg
+    restart: unless-stopped
+    shm_size: "256mb"                 # 默认 64MB 不够并行查询排序用，容易报 out of shared memory
+    environment:
+      POSTGRES_USER: vodsync
+      POSTGRES_PASSWORD: vodsync     # 对外只走容器网络的在这可以不改；映射到宿主机就必须改
+      POSTGRES_DB: vodsync
+      TZ: Asia/Shanghai
+      # NAS 内存调优（可选，按机器内存来）：
+      #   postgres 默认 shared_buffers=128MB、work_mem=4MB，
+      #   4~8G 内存的 NAS 建议 shared_buffers=256MB、work_mem=16MB（多源归并/排序吃 work_mem）
+      # 取消下面两行的注释即可，改完 docker compose up -d 会重建容器生效
+      # POSTGRES_INITDB_ARGS: "--data-checksums"
+    #   command: ["postgres", "-c", "shared_buffers=256MB", "-c", "work_mem=16MB"]
+    volumes:
+      # ★ 按你实际的 SSD 路径改；与上面 vodsync 的 data 卷同一前缀
+      - /volume1/docker/vodsync/pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vodsync -d vodsync"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    # 不要映射 5432 到宿主机：容器之间直连用服务名即可，映射反而容易和已有 PG 抢端口。
+    # 只有在宿主机上要用 psql/客户端连进来时才解开（并改左侧端口避开冲突）：
+    # ports:
+    #   - "5433:5432"

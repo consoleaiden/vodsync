@@ -31,7 +31,7 @@ app = FastAPI(
         "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，"
         "并对外提供统一的视频列表/详情 API（source 参数区分源站）。"
     ),
-    version="1.6.1",
+    version="1.7.0",
 )
 
 app.include_router(router)
@@ -151,8 +151,9 @@ def _safe_next(raw):
 
 @app.on_event("startup")
 def on_startup():
+    # 注意：不要在这里打印 config.DATABASE_URL —— 它带着 PG 密码。
+    # init_db() 内部用 render_as_string(hide_password=True) 打了脱敏版本。
     database.init_db()
-    log.info("数据库已初始化: %s", config.DATABASE_URL)
 
     from . import auth
 
@@ -196,6 +197,16 @@ def _bootstrap():
             syncer.refresh_counts()
         # 无论首次与否，启动定时调度
         from .scheduler import start_scheduler
+
+        # 先跑一次数据维护：清掉积压的同步日志、顺手回收 WAL。
+        # 放在调度器启动前，避免和第一次定时触发撞车。
+        if config.HOUSEKEEPING_ENABLED:
+            try:
+                from . import housekeeping
+
+                housekeeping.run_all()
+            except Exception:
+                log.exception("启动时数据维护失败（不影响服务）")
 
         start_scheduler()
 

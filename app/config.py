@@ -6,14 +6,19 @@ import os
 # ---------------------------------------------------------------------------
 # 目录与数据库
 # ---------------------------------------------------------------------------
-# 数据目录（SQLite 文件、日志等）。Docker 中挂载 /app/data
+# 数据目录（断点状态 pause_state.json、日志等）。Docker 中挂载 /app/data
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(__file__), "..", "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# 数据库连接：
-#   SQLite（默认）: sqlite:///data/vodsync.db
-#   PostgreSQL    : postgresql+psycopg2://user:pass@host:5432/vodsync
-DATABASE_URL = os.environ.get("DATABASE_URL", f"sqlite:///{os.path.join(DATA_DIR, 'vodsync.db')}")
+# **生产统一使用 PostgreSQL**（v1.7.0 起，SQLite 已不再作为部署选项）。
+# 默认值对应 docker-compose.yml 里的 postgres 服务；部署时用环境变量覆盖即可：
+#   DATABASE_URL=postgresql+psycopg2://user:pass@host:5432/dbname
+#
+# SQLite 驱动代码保留，但**只服务自动化测试**（scripts/test_*.py 显式指向临时文件），
+# 生产路径上的所有优化（连接池、并行查询、VACUUM 等）都按 PG 设计。
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync"
+)
 
 # ---------------------------------------------------------------------------
 # 数据源
@@ -68,19 +73,54 @@ AUTO_RESUME_ON_BOOT = os.environ.get("AUTO_RESUME_ON_BOOT", "true").lower() == "
 AUTO_RESUME_DELAY_SECONDS = int(os.environ.get("AUTO_RESUME_DELAY_SECONDS", "30"))
 
 # ---------------------------------------------------------------------------
-# 数据库连接池
+# 数据库连接池（PostgreSQL）
 #
-# 背景：SQLite 只允许一个写者，并发写会互相等锁；每个等锁的线程都占着一个池连接，
-#      池被占满后所有请求（含 /healthz）都会 30s 超时报错。经验：
-#      「限并发写」比「放大连接池」有效，下面的池大小只作为安全余量。
+# 池大小要盖住「API 并发 + 同步线程 + 多源归并查询」的总和：默认 10+20 富余。
+# 历史上 SQLite 时代这里是为了躲写锁（池放大只会让等锁的线程更多），
+# 迁移到 PG 后限制的目的变成「别把 NAS 的 PG 连接数打满」，思路一致。
 # ---------------------------------------------------------------------------
 DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "10"))
 DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "20"))
-# 等连接的超时（秒）。小于 SQLite busy_timeout，宁可快速失败也不长时间挂住请求
+# 等连接的超时（秒）。宁可快速返回 503，也不让请求长时间挂住
 DB_POOL_TIMEOUT = int(os.environ.get("DB_POOL_TIMEOUT", "10"))
 
 # 聚合搜索的并行度（每个线程各占一个数据库连接）
 SEARCH_CONCURRENCY = int(os.environ.get("SEARCH_CONCURRENCY", "4"))
+
+# ---------------------------------------------------------------------------
+# 多源列表查询（/api/v1/videos 不带 source 时）
+#
+# 旧做法：52 张表 UNION ALL 成子查询，外面套 count(*) + ORDER BY ... OFFSET。
+#         220 万行每次请求全量物化排序，首页 4~8s、深页 10s+，并发两个就打死 IO。
+# 新做法：每张表各取自己的 top-K（走 idx_*_time 索引倒序扫描），进程内多路归并。
+#         全局第 N 行必然落在它所属表的前 N 行内，所以结果是精确的，不是近似。
+# ---------------------------------------------------------------------------
+# 每个表最多取多少行参与归并。= 能精确支持的「最深一页」× 每页条数，
+# 超过即回退 UNION 全量路径（慢但正确，正常用户翻不到那么深）。
+MERGE_MAX_PER_TABLE = int(os.environ.get("MERGE_MAX_PER_TABLE", "3000"))
+# 归并查询的线程数，每个线程占一个数据库连接（别超过 DB_POOL_SIZE）
+MERGE_CONCURRENCY = int(os.environ.get("MERGE_CONCURRENCY", "4"))
+# 无筛选条件时 total 的缓存秒数。total 只用于算 pagecount/展示，
+# 后台同步写入会造成最多这么多秒的偏差，属可接受（每次请求都全表 count 才是问题）。
+TOTAL_CACHE_SECONDS = int(os.environ.get("TOTAL_CACHE_SECONDS", "60"))
+
+# ---------------------------------------------------------------------------
+# 数据维护（sync_logs 清理 / 测试后端的 WAL checkpoint）
+#
+# sync_logs 每个源站每次同步写一行（52 源站 × 每天多次），不清就一直涨；
+# 面板只读最近几十条，历史全留没有意义。
+# ---------------------------------------------------------------------------
+HOUSEKEEPING_ENABLED = os.environ.get("HOUSEKEEPING_ENABLED", "true").lower() == "true"
+HOUSEKEEPING_INTERVAL_MINUTES = int(os.environ.get("HOUSEKEEPING_INTERVAL_MINUTES", "60"))
+# 保留最近多少天的同步日志（running 状态的行永不清理）—— 主策略
+SYNC_LOG_RETENTION_DAYS = int(os.environ.get("SYNC_LOG_RETENTION_DAYS", "30"))
+# 每个源站最多保留多少条（兜底：每 6 小时同步一次的站，30 天也能堆 120 条）
+SYNC_LOG_KEEP_PER_SOURCE = int(os.environ.get("SYNC_LOG_KEEP_PER_SOURCE", "50"))
+# 全表行数硬上限（防止保留策略失效时无限膨胀）
+SYNC_LOG_MAX_ROWS = int(os.environ.get("SYNC_LOG_MAX_ROWS", "20000"))
+# 仅测试后端（SQLite）有意义：WAL 超过这个大小做一次 TRUNCATE checkpoint（MB）。
+# PostgreSQL 下该配置无效，checkpoint 会自动跳过。
+WAL_CHECKPOINT_MB = int(os.environ.get("WAL_CHECKPOINT_MB", "128"))
 
 # ---------------------------------------------------------------------------
 # 中转代理：上游源站不可直连时的降级通道

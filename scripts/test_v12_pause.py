@@ -18,6 +18,11 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("DATA_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data-test"))
+# 生产默认连 PostgreSQL（v1.7.0），测试一律显式指向临时 SQLite
+os.environ.setdefault(
+    "DATABASE_URL",
+    "sqlite:///" + os.path.join(os.environ["DATA_DIR"], "vodsync.db").replace(os.sep, "/"),
+)
 os.environ["FULL_SYNC_ON_DISCOVER"] = "false"
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

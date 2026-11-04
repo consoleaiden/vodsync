@@ -8,6 +8,8 @@ BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEST_DIR = os.path.join(BASE, "data-test")
 os.environ["FULL_SYNC_ON_DISCOVER"] = "false"
 os.environ["DATA_DIR"] = TEST_DIR
+# 生产默认连 PostgreSQL（v1.7.0），测试一律显式指向临时 SQLite
+os.environ["DATABASE_URL"] = "sqlite:///" + os.path.join(TEST_DIR, "vodsync.db").replace(os.sep, "/")
 sys.path.insert(0, BASE)
 
 WEB_MARK = "VodSync 管理面板"

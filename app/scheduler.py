@@ -2,6 +2,7 @@
 定时调度：APScheduler 后台任务。
   - 源站列表刷新（默认每 12 小时）
   - 全源站增量同步（默认每 6 小时）
+  - 数据维护：清理同步日志 + WAL checkpoint（默认每小时，见 housekeeping.py）
 """
 import logging
 
@@ -40,6 +41,15 @@ def _job_sync_all():
         log.exception("定时同步任务失败")
 
 
+def _job_housekeeping():
+    from . import housekeeping
+
+    try:
+        housekeeping.run_all()
+    except Exception:
+        log.exception("数据维护任务失败")
+
+
 def start_scheduler():
     global _scheduler
     if _scheduler is not None:
@@ -61,11 +71,22 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
     )
+    if config.HOUSEKEEPING_ENABLED:
+        _scheduler.add_job(
+            _job_housekeeping,
+            "interval",
+            minutes=config.HOUSEKEEPING_INTERVAL_MINUTES,
+            id="housekeeping",
+            max_instances=1,
+            coalesce=True,
+        )
     _scheduler.start()
     log.info(
-        "调度器已启动: 源站刷新每 %d 分钟, 增量同步每 %d 分钟",
+        "调度器已启动: 源站刷新每 %d 分钟, 增量同步每 %d 分钟%s",
         config.SOURCE_REFRESH_INTERVAL_MINUTES,
         config.SYNC_INTERVAL_MINUTES,
+        f", 数据维护每 {config.HOUSEKEEPING_INTERVAL_MINUTES} 分钟"
+        if config.HOUSEKEEPING_ENABLED else "",
     )
     return _scheduler
 

@@ -86,7 +86,10 @@ def main():
     # ---- 建库 + 注册 N_SOURCES 个指向桩源站的源站 ----
     os.environ["DATA_DIR"] = data_dir
     os.environ["FULL_SYNC_ON_DISCOVER"] = "false"
-os.environ["AUTH_ENABLED"] = "false"   # 测试只关心业务逻辑，关掉鉴权
+    # 生产默认连 PostgreSQL（v1.7.0），压测一律显式指向临时 SQLite
+    db_url = "sqlite:///" + os.path.join(data_dir, "vodsync.db").replace(os.sep, "/")
+    os.environ["DATABASE_URL"] = db_url
+    os.environ["AUTH_ENABLED"] = "false"   # 只关心业务逻辑，关掉鉴权
     from app import database, syncer
     from app.models import sources
 
@@ -104,6 +107,7 @@ os.environ["AUTH_ENABLED"] = "false"   # 测试只关心业务逻辑，关掉鉴
 
     port = free_port()
     env = dict(os.environ, DATA_DIR=data_dir, FULL_SYNC_ON_DISCOVER="false",
+               DATABASE_URL=db_url, AUTH_ENABLED="false",
                SOURCE_SYNC_CONCURRENCY=str(LIMIT), PAGE_CONCURRENCY="2",
                REQUEST_INTERVAL_SECONDS="0", PROXY_ENABLED="false")
     log_path = os.path.join(data_dir, "server.log")

@@ -101,19 +101,18 @@ docker logs -f vodsync
 | 项 | 值 | 说明 |
 |---|---|---|
 | 端口映射 | `8181:8000` | 左侧为宿主机端口，可自改；右侧 8000 固定 |
-| 数据卷 | `/volume1/docker/vodsync/data:/app/data` | **必须**，SQLite 数据库与断点数据都在这里 |
+| 数据卷（App） | `/volume1/docker/vodsync/data:/app/data` | 同步断点（`pause_state.json`）与日志 |
+| 数据卷（PG） | `/volume1/docker/vodsync/pgdata:/var/lib/postgresql/data` | **必须**，数据库本体；建议放 SSD |
 | 重启策略 | `unless-stopped` | 开机自启、异常自动重启 |
-| 内存限制 | 建议 512MB-1GB | Container Manager 项目设置中可配 |
+| 内存限制 | 建议 1-2GB（含 PG） | Container Manager 项目设置中可配 |
 
 ## 常用环境变量（追加到 compose 的 environment）
 
 ```yaml
-      # 切换 PostgreSQL（需同时启用 postgres 服务，见根目录 docker-compose.yml 注释）
+      # 数据库（必填；PG 由同一个 compose 里的 postgres 服务提供）
       DATABASE_URL: "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync"
       # 只同步在线源站
       ONLY_OK_SOURCES: "true"
-      # API 鉴权
-      API_KEY: "your-secret-key"
       # 请求更保守的限速（源站风控严格时）
       REQUEST_INTERVAL_SECONDS: "0.5"
 ```
@@ -123,10 +122,12 @@ docker logs -f vodsync
 | 现象 | 处理 |
 |---|---|
 | 打不开 8181 | 检查端口占用：`netstat -tlnp | grep 8181`；防火墙/路由器端口 |
-| 数据没保存 | 确认 volumes 挂载了 `/app/data`；`ls /volume1/docker/vodsync/data` 应能看到 `vodsync.db` |
+| 启动就退出 / 连不上库 | `docker logs vodsync` 看是否 `could not translate host name "postgres"`：PG 没起或不在同一 compose 项目网络。`docker ps` 确认 `vodsync-pg` 在跑，`docker compose up -d postgres` 补起 |
+| 数据没保存 | 确认 `pgdata` 卷挂载了 `/var/lib/postgresql/data`；`ls /volume1/docker/vodsync/pgdata` 应能看到 `PG_VERSION` |
 | 同步一直失败 | `docker logs vodsync` 看具体报错；多为源站 403 风控，调大 `REQUEST_INTERVAL_SECONDS` |
-| 想重建从头同步 | 停容器 → 删除 data 目录下的 `vodsync.db*` → 启动 |
-| 备份 | 直接复制 `/volume1/docker/vodsync/data/vodsync.db`（建议先停容器或用 `sqlite3 .backup`） |
+| 想重建从头同步 | 停容器 → 清空 `pgdata` 目录（或 `drop database vodsync` 后重建）→ 启动 |
+| 备份 | `docker exec vodsync-pg pg_dump -U vodsync vodsync > vodsync-$(date +%F).sql`（热备安全，不用停容器） |
+| 恢复 | `docker exec -i vodsync-pg psql -U vodsync -d vodsync < vodsync-2026-11-04.sql` |
 
 ## 反向代理（可选，套用域名 + HTTPS）
 

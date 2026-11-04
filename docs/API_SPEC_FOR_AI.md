@@ -386,7 +386,7 @@ GET /api/v1/videos?source=jkun&type_name=电影
 | `ac` | string | 空 | `detail` 或 `videolist` → 列表返回完整字段 |
 | `ids` | string | 空 | 逗号分隔数字，批量取详情 |
 | `page` | int | 1 | 页码 |
-| `page_size` | int | 20 | 1–100 |
+| `page_size` | int | 30 | 1–100 |
 
 **① ④ 响应**：
 
@@ -396,6 +396,7 @@ GET /api/v1/videos?source=jkun&type_name=电影
   "page": 1,
   "pagecount": 308,
   "total": 6160,
+  "query_ms": 23,
   "list": [{
     "source": "jkun",
     "vod_id": 134369,
@@ -408,6 +409,12 @@ GET /api/v1/videos?source=jkun&type_name=电影
   }]
 }
 ```
+
+> **v1.7.0 新增字段**（都可忽略，不影响解析）：
+> - `query_ms`：服务端本次查询耗时（毫秒），可用于客户端埋点
+> - `total_is_partial` + `sources_failed`：只在个别源站查询失败时出现，表示 `total` 偏小；
+>   正常情况这两个字段不出现
+> 列表排序恒为 `vod_time` 倒序、同时间按 `vod_id` 倒序，跨源站合并后仍然是这个顺序。
 
 **② ③ 响应**：结构同上，`list` 元素额外含 `vod_content`、`vod_play_url`、`vod_play_from`、`vod_play_list`：
 
@@ -1104,7 +1111,7 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 | `SESSION_TTL_DAYS` | 7 | 面板登录会话有效期（天） |
 | `LOGIN_MAX_FAILS` / `LOGIN_LOCK_MINUTES` | 5 / 5 | 连续登录失败 N 次锁 M 分钟 |
 | `API_KEY` | 空 | 兼容项：设置后作为一枚额外有效的 Token |
-| `API_PAGE_SIZE_DEFAULT` / `API_PAGE_SIZE_MAX` | 20 / 100 | 分页默认值与上限（客户端可从这里读取实际值） |
+| `API_PAGE_SIZE_DEFAULT` / `API_PAGE_SIZE_MAX` | 30 / 100 | 分页默认值与上限（客户端可从这里读取实际值） |
 | `SYNC_INTERVAL_MINUTES` | 360 | 定时增量间隔（分钟） |
 | `SOURCE_REFRESH_INTERVAL_MINUTES` | 720 | 源站列表刷新间隔（分钟） |
 | `SOURCE_SYNC_CONCURRENCY` / `PAGE_CONCURRENCY` | 2 / 4 | 同步并发度（前者是全局并发闸门，超出排队） |
@@ -1112,7 +1119,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 | `SEARCH_CONCURRENCY` | 4 | 聚合搜索并行度 |
 | `PROXY_ENABLED` / `PROXY_URLS` | true / 2 个内置代理 | 直连失败后自动走中转代理（`{proxy}?url=<urlencode(目标)>`） |
 | `PROXY_PREF_TTL_MINUTES` | 30 | "该源站需走代理"的记忆时长 |
-| `DATABASE_URL` | 本地 SQLite | 可切 PostgreSQL |
+| `MERGE_MAX_PER_TABLE` / `MERGE_CONCURRENCY` | 3000 / 4 | 多源列表归并：每表最多取多少行、并行度 |
+| `DATABASE_URL` | `postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync` | PostgreSQL（v1.7.0 起固定） |
 
 > 中转代理是**服务端行为**，对客户端完全透明：App 调用的接口路径、字段、状态码都不变，只是原本拿不到数据的源站现在能同步成功。
 

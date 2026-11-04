@@ -26,6 +26,8 @@ import time
 # 必须在导入 app 之前设置
 _TMP = tempfile.mkdtemp(prefix="vodsync-pool-test-")
 os.environ["DATA_DIR"] = _TMP
+# 生产默认连 PostgreSQL（v1.7.0），测试一律显式指向临时 SQLite
+os.environ["DATABASE_URL"] = "sqlite:///" + os.path.join(_TMP, "vodsync.db").replace(os.sep, "/")
 os.environ["FULL_SYNC_ON_DISCOVER"] = "false"
 os.environ["SOURCE_SYNC_CONCURRENCY"] = "2"
 os.environ["DB_POOL_SIZE"] = "10"

@@ -942,65 +942,28 @@ def video_list(
             )
         return {"code": 1, "page": 1, "pagecount": 1, "total": len(items), "list": items}
 
-    # ---- 用法 1 / 3：列表（多源合并：UNION ALL 子查询 + 外层排序分页） ----
-    from sqlalchemy import literal, literal_column, union_all
+    # ---- 用法 1 / 3：列表 ----
+    # 走 app/multiquery.py：每表各取 top-K 后进程内归并（精确，见该模块顶部说明）。
+    # 只有当翻页深到超出 MERGE_MAX_PER_TABLE 时才回退全量 UNION —— 慢但正确。
+    from .. import multiquery
 
-    union_parts = []
-    params: dict = {}
-    for i, slug in enumerate(slugs):
-        table = build_vod_table(slug)
-        if not database.table_exists(table.name):
-            continue
-        where = []
-        if wd:
-            where.append(table.c.name.like(f"%{wd}%"))
-            params[f"wd_{i}"] = f"%{wd}%"
-        if type_name:
-            where.append(table.c.type_name == type_name)
-            params[f"tn_{i}"] = type_name
-        if type_id:
-            where.append(table.c.type_id == type_id)
-            params[f"ti_{i}"] = type_id
-        cols = [
-            table.c.vod_id,
-            table.c.type_id,
-            table.c.type_name,
-            table.c.name,
-            table.c.pic,
-            table.c.remarks,
-            table.c.vod_time,
-            literal(slug).label("source_slug"),
-        ]
-        if detail_mode:
-            cols += [table.c.content, table.c.play_url]
-        union_parts.append(select(*cols).where(*where))
+    kw = dict(wd=wd, type_name=type_name, type_id=type_id, detail=detail_mode)
+    if multiquery.can_merge(page, page_size):
+        result = multiquery.merged_page(slugs, page, page_size, **kw)
+    else:
+        log.info("翻页过深 page=%d page_size=%d，回退 UNION 查询", page, page_size)
+        result = multiquery.union_page(slugs, page, page_size, **kw)
 
-    if not union_parts:
+    if result["tables"] == 0:
         raise HTTPException(status_code=404, detail="指定源站均无数据")
 
-    merged = union_all(*union_parts).subquery()
-    # 注意：必须用 with 归还连接。之前写成 engine.connect().execute(...) 直接丢弃对象，
-    # 连接靠 GC 回收（不确定何时发生），高频调用时会把连接池悄悄占满（v1.4.1 修复）。
-    with database.engine.connect() as conn:
-        total = conn.execute(
-            select(func.count()).select_from(merged), params
-        ).scalar() or 0
-        pagecount = (total + page_size - 1) // page_size
-        rows = conn.execute(
-            select(merged)
-            .order_by(literal_column("vod_time").desc(), literal_column("vod_id").desc())
-            .offset((page - 1) * page_size)
-            .limit(page_size),
-            params,
-        ).mappings().all()
-
-    return {
+    resp = {
         "code": 1,
         "page": page,
-        "pagecount": pagecount,
-        "total": total,
+        "pagecount": result["pagecount"],
+        "total": result["total"],
         "list": (
-            [_detail_item(r["source_slug"], r) for r in rows]
+            [_detail_item(r["source_slug"], r) for r in result["rows"]]
             if detail_mode
             else [
                 {
@@ -1013,10 +976,16 @@ def video_list(
                     "vod_remarks": r["remarks"],
                     "vod_time": r["vod_time"],
                 }
-                for r in rows
+                for r in result["rows"]
             ]
         ),
     }
+    # 诊断字段（App 可忽略）：total 是否因个别源站查询失败而偏小、用了哪条路径、耗时
+    if result["partial"]:
+        resp["total_is_partial"] = True
+        resp["sources_failed"] = result["failed"]
+    resp["query_ms"] = result["elapsed_ms"]
+    return resp
 
 
 @router.get("/api/v1/videos/{slug}/{vod_id}")
@@ -1117,7 +1086,7 @@ def aggregate_search(
             log.warning("聚合搜索 [%s] 失败: %s", slug, e)
             return slug, [], False, str(e)
 
-    # 2) 并行查询（SQLite WAL 支持并发读；线程数受控避免 NAS IO 打满）
+    # 2) 并行查询（PostgreSQL 支持真正的并行读；线程数受控避免 NAS IO 打满）
     collected: list = []
     failed: list = []
     truncated_sources: list = []

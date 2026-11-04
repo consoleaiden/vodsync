@@ -1,8 +1,8 @@
 """
 数据库引擎与元数据管理。
 
+- **生产统一 PostgreSQL**（v1.7.0 起）；SQLite 分支仅保留给自动化测试用
 - 使用 SQLAlchemy Core（性能优于 ORM，适合百万级行批量写入）
-- SQLite 时自动开启 WAL、busy_timeout、NORMAL 同步模式
 - 每个源站一张 vod_{slug} 动态表，见 models.build_vod_table()
 """
 import contextlib
@@ -15,8 +15,13 @@ from . import config
 
 
 def dialect_insert(table):
-    """返回带 ON CONFLICT 能力的方言 INSERT 构造器（SQLite 与 PostgreSQL 同签名）。"""
-    if _is_sqlite:
+    """
+    返回带 ON CONFLICT 能力的方言 INSERT 构造器。
+
+    PostgreSQL 的 `ON CONFLICT DO UPDATE` 与 SQLite 的同名语法签名一致，
+    所以业务代码（syncer.upsert_batch）不需要关心底层是哪个数据库。
+    """
+    if _is_sqlite:  # 仅测试后端
         from sqlalchemy.dialects.sqlite import insert
 
         return insert(table)
@@ -26,10 +31,12 @@ def dialect_insert(table):
 
 log = logging.getLogger("vodsync.db")
 
+# SQLite 仅出现在自动化测试里（生产用 PG）。保留这个分支只是为了让 250+ 项测试
+# 不需要依赖一个真 PG 实例就能跑，不构成部署选项。
 _is_sqlite = config.DATABASE_URL.strip().lower().startswith("sqlite")
 
 # 连接池参数：
-#   pool_size / max_overflow 必须有上限（无上限=打死 SQLite 的写锁）
+#   pool_size / max_overflow 必须有上限（别把 NAS 上 PG 的连接数打满）
 #   pool_timeout 比 SQLite busy_timeout(10s) 更短，宁可快速返回 503 也不把请求挂死
 engine_kwargs = {
     "pool_pre_ping": True,
@@ -49,13 +56,12 @@ engine = create_engine(config.DATABASE_URL, **engine_kwargs)
 # ---------------------------------------------------------------------------
 # 写事务闸门
 #
-# SQLite（WAL）同一时刻只允许一个写者：并发写事务会互相等 busy_timeout，
-# 等待期间线程仍占着池连接 —— 这正是 v1.4.0 在 NAS 上「连接池耗尽 → 全接口 500」的根因。
-# 这里在进程内把所有写事务串行化，写者排队时不占连接，也不触发 busy_timeout。
-# PostgreSQL 有自己的行/表锁机制，无需串行化。
+# PostgreSQL 有自己的行/表锁，多个写事务可以真正并发，这里不加锁。
+# SQLite（仅测试后端）同一时刻只允许一个写者：并发写事务会互相等 busy_timeout，
+# 等待期间线程仍占着池连接 —— 所以测试路径上仍保留进程内串行化。
 # ---------------------------------------------------------------------------
 class _NoLock:
-    """占位锁：非 SQLite 时不做任何串行化。"""
+    """占位锁：PostgreSQL 下不做任何串行化。"""
 
     def __enter__(self):
         return self
@@ -72,8 +78,8 @@ def write_txn():
     """
     统一写事务入口：`with database.write_txn() as conn: ...`
 
-    - SQLite：进程内串行 + 单个事务，天然避免 "database is locked"
     - PostgreSQL：直接开事务
+    - SQLite（测试）：进程内串行 + 单个事务，天然避免 "database is locked"
     所有写操作都应走这里，不要在业务代码里直接 engine.begin()。
     """
     with _write_lock:
@@ -106,7 +112,7 @@ def pool_status() -> dict:
 if _is_sqlite:
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragma(dbapi_conn, _record):  # noqa: ANN001
-        """每个新连接开启 WAL 等性能参数（WAL 大幅提升读写并发）。"""
+        """仅测试后端：每个新连接开启 WAL 等参数（WAL 让读写并发不互相阻塞）。"""
         cur = dbapi_conn.cursor()
         cur.execute("PRAGMA journal_mode=WAL")
         cur.execute("PRAGMA synchronous=NORMAL")
@@ -117,13 +123,12 @@ if _is_sqlite:
 
 
 def init_db():
-    """初始化元数据表（sources / sync_logs）。源站数据表在发现源站时动态创建。"""
+    """初始化元数据表（sources / sync_logs / settings）。源站数据表在发现源站时动态创建。"""
     from .models import META
 
     META.create_all(engine)
     _migrate()
-    if not _is_sqlite:
-        log.info("使用 PostgreSQL: %s", engine.url.render_as_string(hide_password=True))
+    log.info("数据库已就绪: %s", engine.url.render_as_string(hide_password=True))
 
 
 def _migrate():
@@ -159,3 +164,23 @@ def table_exists(name: str) -> bool:
         sql = "SELECT table_name FROM information_schema.tables WHERE table_name = :n"
     with engine.connect() as conn:
         return conn.execute(text(sql), {"n": name}).first() is not None
+
+
+def list_tables(prefix: str = "") -> set:
+    """
+    一次取回全部表名（可带前缀）。
+
+    为什么需要：多源查询要判断 52 张 vod_{slug} 表是否存在，逐张调 table_exists()
+    等于 52 次「借连接 + 一次往返」——在群晖那种 IO 上就是白白多几十毫秒。
+    """
+    if _is_sqlite:
+        sql = "SELECT name FROM sqlite_master WHERE type='table'"
+    else:
+        sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()"
+    with engine.connect() as conn:
+        names = {r[0] for r in conn.execute(text(sql)).all()}
+    return {n for n in names if n.startswith(prefix)} if prefix else names
+
+
+def is_sqlite() -> bool:
+    return _is_sqlite

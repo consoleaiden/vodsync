@@ -5,9 +5,10 @@
 1. 全量：ac=detail 翻页，多线程抓取，按页批量 UPSERT，每 N 页保存断点到 sources.last_page
 2. 增量：ac=list 只取 vod_id/vod_time（轻量），只对 vod_time > 水位线 或 本库缺失的
    ID 拉取 ac=detail&ids=...，百万级存量数据零重复传输
-3. 写入：单条 INSERT ... ON CONFLICT(vod_id) DO UPDATE 批量执行（SQLite/PG 通用）
+3. 写入：批量 INSERT ... ON CONFLICT(vod_id) DO UPDATE（PostgreSQL 原生语法）
 """
 import logging
+import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -37,8 +38,9 @@ _running_lock = threading.Lock()
 # 全局并发闸门（v1.4.1 修复连接池耗尽的关键）
 #
 # 为什么需要：面板上连点十几个「全量」时，每次请求各起一个线程，没有任何上限。
-# SQLite 只允许一个写者，十几个写线程会互相等锁，每个等锁线程占着一个连接池连接，
-# 池满后连 /healthz、面板刷新都 30s 超时 → 表现为整个服务"挂了"。
+# 历史背景是 SQLite 只允许一个写者、等锁线程会占满连接池（v1.4.1 的 P0）；
+# 换到 PG 后写不再串行，但**同步本身仍会给源站和 NAS 造成压力**，这个闸门继续保留：
+# 它限制的是「同时真正在跑的全站同步数」，超出的排队且不占数据库连接。
 # 这里用一个信号量把「同时真正在跑的源站同步」限制在 SOURCE_SYNC_CONCURRENCY 个，
 # 其余排队等待（排队不占数据库连接）。
 # ---------------------------------------------------------------------------
@@ -121,10 +123,50 @@ def running_snapshot() -> dict:
 # ---------------------------------------------------------------------------
 # 源站发现：拉取 latest.json，登记新源站并建表
 # ---------------------------------------------------------------------------
+def _find_source_by_api(conn, api_url: str):
+    """
+    按 API 地址找已登记的源站。
+
+    **源站的身份是 api_url，不是名字**。名字会撞：`slugify("HD 资源")` 和
+    `slugify("HD-资源")` 都是 `hd`，只按 slug 判重会让后来那个站被当成「已存在」，
+    于是它的 api_url 永远写不进去 —— 该站长期同步的其实是别人家的接口，且没有任何报错。
+
+    这里再兼容一下「尾斜杠」差异（同一 API 被登记成带/不带 `/` 两种写法时不要重复建表）。
+    """
+    url = api_url[:500]
+    cols = (sources.c.id, sources.c.slug, sources.c.api_url)
+    row = conn.execute(select(*cols).where(sources.c.api_url == url)).mappings().first()
+    if row:
+        return row
+    trim = url.rstrip("/")
+    if trim != url:
+        row = conn.execute(select(*cols).where(sources.c.api_url == trim)).mappings().first()
+        if row:
+            return row
+    return conn.execute(select(*cols).where(sources.c.api_url == trim + "/")).mappings().first()
+
+
+def _unique_slug(conn, base: str) -> str:
+    """
+    slug 已被占用（不同 api_url 但名字撞了）时追加 `_2` / `_3` …
+
+    为什么用下划线：`utils.SAFE_SLUG` 只放行 `[a-z0-9_]`，用 `-` 会让这个源站的
+    所有 API 路径直接被 400 拒掉。表名 `vod_hd_2` 也合法。
+    """
+    if not conn.execute(select(sources.c.id).where(sources.c.slug == base)).first():
+        return base
+    for i in range(2, 52):
+        cand = f"{base}_{i}"
+        if not conn.execute(select(sources.c.id).where(sources.c.slug == cand)).first():
+            return cand
+    # 理论上到不了这里（52 个同名站）；用随机后缀兜底，绝不返回重复值
+    return f"{base[:50]}_{secrets.token_hex(3)}"
+
+
 def refresh_sources(client: MacCmsClient = None) -> list:
     """
     拉取 latest.json，把新的源站登记进 sources 表并创建数据表。
-    返回新增源站的 slug 列表。已存在的源站只更新状态/描述等元信息。
+    返回新增源站的 slug 列表。已存在的源站（按 api_url 认）只更新元信息。
     """
     own_client = client is None
     client = client or MacCmsClient()
@@ -144,17 +186,23 @@ def refresh_sources(client: MacCmsClient = None) -> list:
                 continue
             if config.ONLY_OK_SOURCES and res.get("status") != "ok":
                 continue
-            slug = slugify(name)
-            exists = conn.execute(
-                select(sources.c.id).where(sources.c.slug == slug)
-            ).first()
-            if exists:
+
+            src = _find_source_by_api(conn, api_url)
+            if src:
+                # 已登记：更新元信息。**slug 不再变** —— 它是表名和 API 路径的一部分，
+                # 改名等于把已有数据和所有客户端一起废掉。
                 conn.execute(
                     sources.update()
-                    .where(sources.c.slug == slug)
-                    .values(status=res.get("status") or "ok", description=(res.get("description") or "")[:500])
+                    .where(sources.c.id == src["id"])
+                    .values(
+                        name=name[:120],
+                        status=res.get("status") or "ok",
+                        description=(res.get("description") or "")[:500],
+                    )
                 )
                 continue
+
+            slug = _unique_slug(conn, slugify(name))
             conn.execute(
                 sources.insert().values(
                     name=name[:120],
@@ -245,7 +293,7 @@ def set_auto_sync_bulk(enabled: bool, slugs: list = None) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 批量 UPSERT（SQLite / PostgreSQL 通用语法）
+# 批量 UPSERT（PostgreSQL 的 ON CONFLICT；测试后端 SQLite 同语法）
 # ---------------------------------------------------------------------------
 _UPSERT_COLS = ["vod_id", "type_id", "type_name", "name", "pic", "remarks", "content", "play_url", "vod_time"]
 

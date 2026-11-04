@@ -4,6 +4,10 @@ import os
 # 必须在导入 app 之前设置：避免测试期间触发全量同步
 os.environ["FULL_SYNC_ON_DISCOVER"] = "false"
 os.environ["DATA_DIR"] = os.path.join(os.path.dirname(__file__), "..", "data-test")
+# 生产默认连 PostgreSQL（v1.7.0），测试一律显式指向临时 SQLite
+os.environ["DATABASE_URL"] = "sqlite:///" + os.path.abspath(
+    os.path.join(os.environ["DATA_DIR"], "vodsync.db")
+).replace(os.sep, "/")
 os.environ["AUTH_ENABLED"] = "false"   # 测试只关心业务逻辑，关掉鉴权
 
 import sys
