@@ -220,6 +220,7 @@
       <h2>源站同步状态</h2>
       <span class="hint" id="sourcesHint"></span>
       <span style="flex:1"></span>
+      <button class="sm primary" id="btnAddSource" title="手动登记一个 latest.json 里没有的源站">+ 添加源站</button>
       <button class="sm" id="btnAutoAllOn" title="所有源站参与定时自动同步">全部开启自动同步</button>
       <button class="sm warn" id="btnAutoAllOff" title="所有源站退出定时自动同步（手动同步不受影响）">全部暂停自动同步</button>
       <button class="sm" id="btnAutoSelOn" disabled title="仅对勾选的源站开启自动同步">开启所选</button>
@@ -440,12 +441,22 @@ async function loadSources() {
       const autoOn = autoPending ? pendingAuto[s.slug] : !!s.auto_sync;
       const autoCell = `<label class="switch" title="自动同步：定时任务与全站同步是否包含该源站（手动单站同步不受影响）">
         <input type="checkbox" class="autoSw" data-slug="${esc(s.slug)}" ${autoOn ? "checked" : ""} ${autoPending ? "disabled" : ""}> 自动</label>`;
+      // 来源：custom = 面板手动登记，refresh 不会覆盖名字也不会删除
+      const isCustom = s.origin === "custom";
+      const originCell = isCustom
+        ? '<span class="badge" title="面板手动添加：刷新源站列表不会覆盖名称，也不会被删除">自定义</span>'
+        : '<span class="badge mute" title="来自 latest.json 自动发现">官方</span>';
+      const customBtns = isCustom
+        ? `<button class="sm" data-act="edit" data-slug="${esc(s.slug)}" data-origin="custom">编辑</button>
+           <button class="sm warn" data-act="del" data-slug="${esc(s.slug)}" data-origin="custom">删除</button>`
+        : "";
       return `<tr>
         <td><input type="checkbox" class="selRow" data-slug="${esc(s.slug)}" ${selectedSlugs.has(s.slug) ? "checked" : ""}></td>
         <td>
           <div class="name">${esc(s.name)}</div>
           <div class="slugcode">${esc(s.slug)}</div>
         </td>
+        <td>${originCell}</td>
         <td>${s.status === "ok" ? '<span class="badge ok">在线</span>' : '<span class="badge bad">离线</span>'}${s.paused ? ' <span class="badge warn">本站暂停</span>' : ""}${s.queued ? ' <span class="badge mute">排队中</span>' : ""}</td>
         <td class="num">${fmtNum(s.total_videos)}</td>
         <td style="min-width:130px">${prog}</td>
@@ -456,6 +467,7 @@ async function loadSources() {
           <button class="sm" data-act="incr" data-slug="${esc(s.slug)}">增量</button>
           <button class="sm" data-act="full" data-slug="${esc(s.slug)}">全量</button>
           <button class="sm" data-act="detail" data-slug="${esc(s.slug)}">日志</button>
+          ${customBtns}
           ${pauseBtn}
         </td>
       </tr>`;
@@ -464,7 +476,7 @@ async function loadSources() {
     $("#sourcesBody").innerHTML = `<table>
       <thead><tr>
         <th style="width:34px" title="全选 / 取消全选"><input type="checkbox" id="selAll" ${allSel ? "checked" : ""}></th>
-        <th>源站</th><th>状态</th><th>已入库</th><th>全量进度</th><th>增量水位线</th><th>最后同步</th><th>自动同步</th><th>操作</th>
+        <th>源站</th><th>来源</th><th>状态</th><th>已入库</th><th>全量进度</th><th>增量水位线</th><th>最后同步</th><th>自动同步</th><th>操作</th>
       </tr></thead><tbody>${rows}</tbody></table>`;
     updateBulkButtons(list.filter((s) => s.auto_sync).length);
   } catch (e) { toast("源站列表加载失败：" + e.message, true); }
@@ -521,6 +533,8 @@ $("#sourcesBody").addEventListener("click", async (ev) => {
   if (!btn) return;
   const slug = btn.dataset.slug, act = btn.dataset.act;
   if (act === "detail") return showSourceLogs(slug);
+  if (act === "edit") return openSourceForm(slug);
+  if (act === "del") return deleteCustomSource(slug);
   if (act === "pause" || act === "resume") return toggleSourcePause(slug, act === "pause");
   if (act === "full" && !window.confirm(`确认对 ${slug} 从第一页重新全量同步？（数据量大时耗时较长）`)) return;
   triggerSync(slug, act === "full" ? "full" : "incremental");
@@ -621,6 +635,7 @@ async function refreshSources(full) {
 }
 
 $("#btnRefreshSources").onclick = () => refreshSources(false);
+$("#btnAddSource").onclick = () => openSourceForm("");
 $("#btnReload").onclick = () => refreshAll();
 $("#btnSourceApi").onclick = () => window.open("/source", "_blank", "noopener");
 $("#btnRecount").onclick = async () => {
@@ -717,6 +732,135 @@ function openModal(title, bodyHtml) {
     if (e.target === mask || e.target.hasAttribute("data-close")) mask.remove();
   });
   document.body.appendChild(mask);
+  return mask;   // 调用方可继续在这棵子树上绑事件
+}
+
+
+// ---------------- 自定义源站（v1.8.0） ----------------
+// 只有 origin='custom' 的行才有编辑/删除入口；官方源站的元信息归 latest.json 管，
+// 面板只能通过「自动同步」开关控制它是否参与定时任务。
+async function openSourceForm(slug) {
+  const editing = !!slug;
+  let cur = null;
+
+  if (editing) {
+    try {
+      const data = await api("/api/v1/sources");
+      cur = (data.list || []).find((s) => s.slug === slug);
+    } catch (e) { return toast("读取源站信息失败：" + e.message, true); }
+    if (!cur) return toast("源站不存在", true);
+  }
+
+  const fld = (label, id, value, ph, extra = "") =>
+    `<label style="display:block;font-size:12px;color:var(--muted)">${label}
+       <input id="${id}" style="${INPUT_CSS};margin-top:4px" value="${esc(value || "")}"
+              placeholder="${ph}" ${extra}></label>`;
+
+  const mask = openModal(editing ? "编辑源站" : "添加自定义源站", `
+    <div class="kv">${editing
+      ? "只改需要变的字段，保存后立即生效（标识不可改：它是表名与 API 路径的一部分）"
+      : "latest.json 里没有的源站可以在这里登记；重启、刷新源站列表都不会丢失"}</div>
+    <div style="display:grid;gap:12px">
+      ${fld("源站名称", "csName", cur && cur.name, "例如：我的私有资源站")}
+      ${fld("API 地址", "csApi", cur && cur.api_url, "https://api.example.com/api.php/provide/vod/")}
+      ${editing ? "" : fld("源站标识（可选）", "csSlug", "",
+        "留空自动生成；填了就固定，如 myhd（决定表名 vod_myhd 与 API 路径）")}
+      ${fld("备注（可选）", "csDesc", "", "随便写点什么，方便以后认出这个源")}
+      <div id="csMsg" style="font-size:12px;min-height:16px;line-height:1.6"></div>
+      ${editing ? "" : `
+        <label class="switch" style="font-size:12.5px">
+          <input type="checkbox" id="csSyncNow"> 添加后立即全量同步</label>
+        <label class="switch" style="font-size:12.5px">
+          <input type="checkbox" id="csForce"> 地址暂时不可访问也强制添加</label>`}
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:2px">
+        <button id="csTest">测试连接</button>
+        <button class="primary" id="csSave">${editing ? "保存" : "添加"}</button>
+      </div>
+    </div>`);
+
+  const q = (id) => mask.querySelector("#" + id);
+  const msg = q("csMsg");
+  const setMsg = (text, bad) => {
+    msg.textContent = text;
+    msg.style.color = bad ? "#c62828" : "var(--muted)";
+  };
+
+  // 测试连接：不落库、不建表，只抓第 1 页确认接口可用
+  q("csTest").onclick = async () => {
+    const url = q("csApi").value.trim();
+    if (!url) return setMsg("请先填 API 地址", true);
+    setMsg("正在连接…");
+    try {
+      const r = await _jsonPost("/api/v1/sources/probe", { api_url: url });
+      if (r.ok) {
+        setMsg(`可访问：${fmtNum(r.total)} 条 / ${fmtNum(r.pagecount)} 页 · ` +
+               `示例「${(r.samples || [])[0] || "-"}」· ${r.elapsed_ms}ms`);
+      } else {
+        setMsg(`不可用：${r.error || "未知错误"}`, true);
+      }
+    } catch (e) { setMsg("测试失败：" + e.message, true); }
+  };
+
+  q("csSave").onclick = async () => {
+    const name = q("csName").value.trim();
+    const apiUrl = q("csApi").value.trim();
+    if (!name) return setMsg("请填写源站名称", true);
+    if (!apiUrl) return setMsg("请填写 API 地址", true);
+
+    try {
+      if (editing) {
+        const body = { name, description: q("csDesc").value.trim() };
+        if (apiUrl !== cur.api_url) {
+          if (!window.confirm(
+            `修改 API 地址会清空该源站已入库的 ${fmtNum(cur.total_videos)} 条数据，` +
+            `并重置同步进度。\n\n确认继续？`)) return;
+          body.api_url = apiUrl;
+        }
+        const r = await api(`/api/v1/sources/${encodeURIComponent(slug)}/custom`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        toast(r.data_reset ? "已保存，历史数据已清空" : "已保存");
+      } else {
+        const force = q("csForce").checked;
+        const r = await _jsonPost("/api/v1/sources/custom", {
+          name,
+          api_url: apiUrl,
+          slug: q("csSlug").value.trim(),
+          description: q("csDesc").value.trim(),
+          probe: !force,
+          allow_unreachable: force,
+          sync_now: q("csSyncNow").checked,
+        });
+        toast(r.msg || "已添加");
+      }
+      mask.remove();
+      await Promise.allSettled([loadSources(), loadStats()]);
+    } catch (e) { setMsg("保存失败：" + e.message, true); }
+  };
+}
+
+async function deleteCustomSource(slug) {
+  let cur = null;
+  try {
+    const data = await api("/api/v1/sources");
+    cur = (data.list || []).find((s) => s.slug === slug);
+  } catch (e) { return toast("读取源站信息失败：" + e.message, true); }
+
+  const n = cur ? fmtNum(cur.total_videos) : "?";
+  if (!window.confirm(
+    `确认删除源站「${cur ? cur.name : slug}」（${slug}）？\n\n` +
+    `会连同已入库的 ${n} 条数据一起删除，不可恢复。\n` +
+    `（如果只是不想再同步，关掉「自动」开关就行，不必删）`)) return;
+
+  try {
+    const r = await api(
+      `/api/v1/sources/${encodeURIComponent(slug)}/custom?confirm=${encodeURIComponent(slug)}`,
+      { method: "DELETE" });
+    toast(r.msg || "已删除");
+    await Promise.allSettled([loadSources(), loadStats()]);
+  } catch (e) { toast("删除失败：" + e.message, true); }
 }
 
 // ---------------- 访问控制（v1.5.0：密码登录 + API Token） ----------------

@@ -74,6 +74,10 @@ sources = Table(
     Column("paused_at", DateTime),                        # 单源站暂停时间（便于审计/展示）
     # 自动同步开关：1=参与定时任务与全站同步，0=排除在外（手动单站同步不受影响）
     Column("auto_sync", Integer, default=1, server_default="1"),
+    # 来源：latest=从 latest.json 自动发现；custom=面板手动添加
+    # refresh_sources 不会覆盖 custom 行的元信息（名字/描述归用户所有），
+    # 也永不删除 custom 行 —— 这是「自定义源持续存在」的实现基础。
+    Column("origin", String(16), default="latest", server_default="latest"),
     Column("last_sync_at", DateTime),                     # 最近一次成功同步时间
     Column("created_at", DateTime, server_default=func.now()),
     Column("updated_at", DateTime, server_default=func.now(), onupdate=func.now()),
@@ -145,3 +149,16 @@ def build_vod_table(slug: str) -> Table:
     Index(f"idx_{slug}_name", table.c.name)
     _vod_table_cache[slug] = table
     return table
+
+
+def forget_vod_table(slug: str):
+    """
+    丢弃某个 slug 的 Table 对象缓存（删除源站后调用）。
+
+    必须同时从 META 里移除：SQLAlchemy 的 Table 构造时会把名字注册进
+    `metadata.tables`，同名再构造一次直接抛 InvalidRequestError。只清
+    `_vod_table_cache` 的话，删掉源站再用同一个 slug 添加新源站就会 500。
+    """
+    table = _vod_table_cache.pop(slug, None)
+    if table is not None and table.key in META.tables:
+        META.remove(table)

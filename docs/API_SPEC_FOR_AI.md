@@ -262,6 +262,10 @@ type PlayLine = {
 | 23 | POST | `/api/v1/auth/login` | 鉴权 | 面板登录（换会话 cookie） |
 | 24 | POST | `/api/v1/auth/logout` | 鉴权 | 退出登录 |
 | 25 | GET | `/api/v1/auth/state` | 鉴权 | 鉴权状态（免鉴权，未登录只回 `enabled`/`logged_in`） |
+| 26 | POST | `/api/v1/sources/probe` | 管理 | 测试 API 地址连通性（不落库、不建表） |
+| 27 | POST | `/api/v1/sources/custom` | 管理 | **添加自定义源站**（latest.json 之外） |
+| 28 | PATCH | `/api/v1/sources/{slug}/custom` | 管理 | 修改自定义源站（改 `api_url` 会清空该站数据） |
+| 29 | DELETE | `/api/v1/sources/{slug}/custom` | 管理 | 删除自定义源站（需 `confirm=<slug>`） |
 | 26 | POST | `/api/v1/auth/password` | 鉴权 | 修改面板密码 |
 | 27 | POST | `/api/v1/auth/settings` | 鉴权 | 开关访问控制（开启时自动换 Token） |
 | 28 | GET | `/api/v1/auth/token` | 鉴权 | 读取当前 Token（需登录） |
@@ -590,6 +594,7 @@ GET /api/v1/jkun?ac=list&wd=三体&page=1&page_size=20
     "slug": "jkun",
     "name": "示例资源站",
     "api_url": "https://example.com/api.php/provide/vod",
+    "origin": "latest",
     "status": "ok",
     "enabled": true,
     "total_videos": 6160,
@@ -809,6 +814,100 @@ POST /api/v1/sources/auto-sync?enabled=true&slugs=jkun,t1 # 指定多站开启
 ```
 
 异步重算各源站 `total_videos`（同步中断后面板条数可能滞后时使用），无请求体、无参数。
+
+### 4.19 自定义源站（v1.8.0）
+
+原来所有源站都来自 `latest.json`，无法登记自己的接口。这组接口用于手动添加 / 修改 / 删除，
+记录存在 `sources` 表并由 `origin='custom'` 标记。
+
+**`origin` 字段语义**
+
+| 值 | 含义 | `refresh_sources` 的行为 |
+|---|---|---|
+| `latest` | 从 latest.json 自动发现 | 更新名称 / 描述 / 状态 |
+| `custom` | 面板手动添加 | **只更新 status，不改名称/描述，永不删除** |
+
+因此「自定义源持续存在」不依赖任何配置文件或内存状态：它就是一行 `origin='custom'` 的记录，
+重启、刷新源站列表、重新部署都还在。
+
+#### POST `/api/v1/sources/probe` — 测试连通性（不落库）
+
+```json
+{ "api_url": "https://api.example.com/api.php/provide/vod/" }
+```
+
+响应**永远是 200**，用 `ok` 表示结果（探测失败是正常业务结果，不该让客户端 catch 异常）：
+
+```json
+{ "code": 1, "ok": true, "total": 1200, "pagecount": 24,
+  "samples": ["示例影片A", "示例影片B"], "elapsed_ms": 312 }
+```
+
+```json
+{ "code": 1, "ok": false, "error": "MacCmsError: 重试 1 次仍失败: ...", "elapsed_ms": 80 }
+```
+
+只抓 `ac=list&pg=1` 一页，不建表、不写库。`api_url` 只接受 `http://` / `https://`。
+
+#### POST `/api/v1/sources/custom` — 添加
+
+```json
+{
+  "name": "我的私有源",
+  "api_url": "https://api.example.com/api.php/provide/vod/",
+  "slug": "myhd",
+  "homepage": "",
+  "description": "",
+  "probe": true,
+  "allow_unreachable": false,
+  "sync_now": false
+}
+```
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `slug` | `""` | 留空由名称推导（纯中文名 → `s` + md5 前 10 位）。**决定表名 `vod_{slug}` 与 API 路径，添加后不可改** |
+| `probe` | `true` | 添加前先抓一页验证 |
+| `allow_unreachable` | `false` | 探测失败仍强制添加（源站临时维护时用） |
+| `sync_now` | `false` | 添加成功后立即后台全量同步（响应里 `sync_started=true`） |
+
+成功响应：
+
+```json
+{ "code": 1, "slug": "myhd", "probe": { "ok": true, "...": "..." },
+  "sync_started": false, "msg": "已添加源站 myhd" }
+```
+
+错误：`409` = 该 `api_url` 已登记（含尾斜杠差异）或 `slug` 被占用；`400` = 地址非法 / 探测失败。
+
+#### PATCH `/api/v1/sources/{slug}/custom` — 修改
+
+只传需要改的字段：`name` / `api_url` / `homepage` / `description` / `enabled` / `auto_sync`。
+
+```json
+{ "name": "改名后的私有源", "auto_sync": false }
+```
+
+⚠️ **改 `api_url` 会清空该站已入库的数据**（响应 `data_reset: true`）并重置水位线与断点。
+换了接口就是换了数据源，保留旧行只会让列表里混进「新源已经没有」的片子，且 `vod_id` 冲突时
+会被 UPSERT 覆盖成新源内容，看起来像数据错乱。
+
+只能改 `origin='custom'` 的源；官方源返回 `403`，不存在返回 `404`。
+
+#### DELETE `/api/v1/sources/{slug}/custom` — 删除
+
+```
+DELETE /api/v1/sources/myhd/custom?confirm=myhd&drop_table=true
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `confirm` | — | 必须等于 `slug`，否则 `400`（防止误调用） |
+| `drop_table` | `true` | 是否 DROP 数据表；`false` 只删登记记录、保留已入库数据 |
+
+- 只能删 `origin='custom'` 的源，官方源返回 `403`（删了下次 refresh 也会回来，没有意义）
+- 该源正在同步时返回 `409`，需先暂停或等其结束
+- 删除后可以用同一个 `slug` 重新添加（内部会清理 SQLAlchemy 的 Table 缓存）
 
 ---
 
@@ -1128,7 +1227,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.4.1（当前） | 服务端稳定性修复：同步并发闸门（超出排队）、同源站防重入、连接池可配、`/healthz` 池满时仍 200 + `degraded`、过载统一 503；新增 `queued`、`db_pool`、`sync_load` 字段 |
+| v1.8.0（当前） | 新增自定义源站：`POST /api/v1/sources/custom`、`PATCH/DELETE /api/v1/sources/{slug}/custom`、`POST /api/v1/sources/probe`；`/api/v1/sources` 增加 `origin` 字段（`latest` / `custom`） |
+| v1.4.1 | 服务端稳定性修复：同步并发闸门（超出排队）、同源站防重入、连接池可配、`/healthz` 池满时仍 200 + `degraded`、过载统一 503；新增 `queued`、`db_pool`、`sync_load` 字段 |
 | v1.4.0 | 服务端新增中转代理降级（源站不可达自动走代理）；新增 `synced` 字段，修正未同步站进度误显示 100 |
 | v1.3.0 | 新增 `auto_sync` 字段与单站/批量自动同步开关接口 |
 | v1.2.2 | 新增 `running` / `running_mode` / `running_seconds`，修正"暂停按钮误显示" |

@@ -201,8 +201,14 @@ class MacCmsClient:
         sem = _proxy_semaphore(proxy_base) if kind == "proxy" else None
         has_alt_route = bool(config.PROXY_ENABLED and config.PROXY_URLS) or bool(proxy_base)
         last_err: Optional[Exception] = None
+        # retries 语义是「总尝试次数」，必须至少 1 次。
+        # 原来的写法 range(1, self.retries + 1) 在 retries=0 时循环体一次都不进，
+        # 直接抛出 "重试 0 次仍失败 (None)" —— 一个请求都没发出去。
+        # 连通性探测（syncer.probe_source）正是传 retries=0 想「只试一次」，
+        # 于是它永远返回失败，把「不重试」变成了「不请求」。
+        attempts = max(1, self.retries)
 
-        for attempt in range(1, self.retries + 1):
+        for attempt in range(1, attempts + 1):
             try:
                 time.sleep(config.REQUEST_INTERVAL_SECONDS + random.random() * 0.2)
                 if sem is not None:
@@ -230,18 +236,18 @@ class MacCmsClient:
                 if has_alt_route:
                     raise _RouteFailed(f"读取超时: {e}") from e
                 last_err = e
-                if attempt >= self.retries:
+                if attempt >= attempts:
                     break
                 wait = min(2 ** attempt, 15)
-                log.warning("请求超时(%d/%d) %s，%ds 后重试", attempt, self.retries, target[:100], wait)
+                log.warning("请求超时(%d/%d) %s，%ds 后重试", attempt, attempts, target[:100], wait)
                 time.sleep(wait)
 
             except (httpx.HTTPError, json.JSONDecodeError, MacCmsError) as e:
                 last_err = e
-                if attempt >= self.retries:
+                if attempt >= attempts:
                     break
                 wait = min(2 ** attempt, 15)
-                log.warning("请求失败(%d/%d) %s: %s，%ds 后重试", attempt, self.retries, target, e, wait)
+                log.warning("请求失败(%d/%d) %s: %s，%ds 后重试", attempt, attempts, target, e, wait)
                 time.sleep(wait)
 
         raise MacCmsError(f"重试 {self.retries} 次仍失败: {target[:120]} ({last_err})") from last_err

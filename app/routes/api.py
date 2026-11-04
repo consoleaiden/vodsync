@@ -11,14 +11,25 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from pydantic import BaseModel, Field
 
 from sqlalchemy import func, select, text
 
 from .. import auth, config, database
 from ..models import build_vod_table, sources, sync_logs
-from ..syncer import ensure_table, refresh_sources, sync_all, sync_source
+from ..syncer import (
+    delete_custom_source,
+    ensure_table,
+    probe_source,
+    refresh_sources,
+    register_custom_source,
+    sync_all,
+    sync_source,
+    update_custom_source,
+)
 from ..utils import page_params, parse_play_url, validate_slug
 
 log = logging.getLogger("vodsync.api")
@@ -430,6 +441,7 @@ def list_sources():
                 sources.c.enabled, sources.c.total_videos, sources.c.watermark,
                 sources.c.last_page, sources.c.total_pages, sources.c.last_sync_at,
                 sources.c.paused, sources.c.paused_at, sources.c.auto_sync,
+                sources.c.origin,
             ).order_by(sources.c.id)
         ).mappings().all()
     return {
@@ -439,6 +451,7 @@ def list_sources():
                 "slug": r["slug"],
                 "name": r["name"],
                 "api_url": r["api_url"],
+                "origin": r["origin"] or "latest",
                 "status": r["status"],
                 "enabled": bool(r["enabled"]),
                 "total_videos": r["total_videos"],
@@ -735,6 +748,191 @@ def refresh_source_list(full_sync: bool = Query(default=False, description="发�
             target=_bg_sync_new, args=(list(new_slugs),), daemon=True
         ).start()
     return {"code": 1, "new_sources": new_slugs, "full_sync_started": full_sync}
+
+
+# ---------------------------------------------------------------------------
+# 自定义源站（v1.8.0）
+#
+# 需求：原来所有源站都只能来自 latest.json，无法登记自己的接口。
+# 这里提供 add / patch / delete + 一个不落库的连通性探测。
+#
+# 「持续存在」是怎么保证的：自定义源站就是 sources 表里一行 origin='custom' 的记录。
+# refresh_sources() 遇到它只更新 status（在线状态是客观事实），不改名字/描述，
+# 更不会删除。所以重启、刷新源站列表、重新部署都不会丢，也不依赖任何内存状态
+# 或额外配置文件。
+# ---------------------------------------------------------------------------
+
+_ALLOWED_URL_SCHEMES = ("http://", "https://")
+
+
+def _clean_api_url(raw: str) -> str:
+    """
+    校验用户填的 API 地址。
+
+    只放行 http/https：服务端会主动去请求这个地址，`file://`、`gopher://`、`dict://`
+    这类 scheme 在 SSRF 场景里能读本地文件或打内网服务，必须在入口挡掉。
+    （本项目需要管理员登录才能调这个接口，风险不高，但挡一下成本几乎为零。）
+    """
+    url = (raw or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="API 地址不能为空")
+    if not url.lower().startswith(_ALLOWED_URL_SCHEMES):
+        raise HTTPException(status_code=400, detail="API 地址必须以 http:// 或 https:// 开头")
+    if any(ch.isspace() for ch in url):
+        raise HTTPException(status_code=400, detail="API 地址不能包含空白字符")
+    return url[:500]
+
+
+class CustomSourceIn(BaseModel):
+    """添加自定义源站的请求体。"""
+    name: str = Field(..., min_length=1, max_length=120, description="源站名称（显示用，可中文）")
+    api_url: str = Field(..., min_length=8, max_length=500, description="苹果 CMS 采集接口地址")
+    slug: str = Field("", max_length=64, description="自定义标识（同时是表名后缀与 API 路径）；留空由名称推导")
+    homepage: str = Field("", max_length=500)
+    description: str = Field("", max_length=500)
+    probe: bool = Field(True, description="添加前先抓一页验证可用性")
+    allow_unreachable: bool = Field(False, description="探测失败也强制添加")
+    sync_now: bool = Field(False, description="添加成功后立即后台全量同步")
+
+
+class ProbeIn(BaseModel):
+    """连通性探测请求体。"""
+    api_url: str = Field(..., min_length=8, max_length=500)
+
+
+class CustomSourcePatch(BaseModel):
+    """修改自定义源站：只传需要改的字段。"""
+    name: Optional[str] = Field(None, max_length=120)
+    api_url: Optional[str] = Field(None, max_length=500)
+    homepage: Optional[str] = Field(None, max_length=500)
+    description: Optional[str] = Field(None, max_length=500)
+    enabled: Optional[bool] = None
+    auto_sync: Optional[bool] = None
+
+
+@router.post("/api/v1/sources/probe", summary="测试源站 API 连通性（不落库）")
+def probe_source_api(body: ProbeIn):
+    """
+    抓第 1 页验证地址是不是可用的苹果 CMS 采集接口。
+
+    永远返回 200，用 `ok` 字段表示结果 —— 探测失败是正常业务结果，不该让
+    前端去 catch 异常。失败时 `error` 给出人能看懂的原因。
+    """
+    api_url = _clean_api_url(body.api_url)
+    return {"code": 1, **probe_source(api_url)}
+
+
+@router.post("/api/v1/sources/custom", summary="添加自定义源站")
+def add_custom_source(body: CustomSourceIn):
+    """
+    手动登记源站，立即建表并持久化。
+
+    - 身份按 `api_url` 认（与 latest.json 同一套规则），地址重复直接 409
+    - `slug` 留空时由名称推导；纯中文名会得到 `s+md5前缀` 这种不好读的标识，
+      想要可读就自己填（如 `myhd`），它同时决定表名 `vod_myhd` 和 API 路径
+    - `probe=true` 会先抓一页验证；失败默认拒绝入库，确认无误可传
+      `allow_unreachable=true` 强制添加（比如源站临时维护中）
+    """
+    api_url = _clean_api_url(body.api_url)
+
+    probe_result = None
+    if body.probe:
+        probe_result = probe_source(api_url)
+        if not probe_result["ok"] and not body.allow_unreachable:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"源站不可用：{probe_result.get('error')}"
+                    "（确认地址无误可传 allow_unreachable=true 强制添加）"
+                ),
+            )
+
+    try:
+        res = register_custom_source(
+            name=body.name,
+            api_url=api_url,
+            slug=(body.slug or "").strip(),
+            homepage=body.homepage,
+            description=body.description,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    slug = res["slug"]
+    sync_started = False
+    if body.sync_now:
+        from .. import syncer
+
+        if not syncer.is_busy(slug):
+            threading.Thread(target=sync_source, args=(slug, "full"), daemon=True).start()
+            sync_started = True
+
+    return {
+        "code": 1,
+        "slug": slug,
+        "probe": probe_result,
+        "sync_started": sync_started,
+        "msg": f"已添加源站 {slug}" + ("，正在后台全量同步" if sync_started else ""),
+    }
+
+
+@router.patch("/api/v1/sources/{slug}/custom", summary="修改自定义源站")
+def patch_custom_source(slug: str, body: CustomSourcePatch):
+    """
+    修改自定义源站的名称 / 地址 / 备注 / 开关。
+
+    ⚠️ 改 `api_url` 会**清空该站已入库的数据**并重置水位线与断点 —— 换了接口
+    就是换了数据源，保留旧行只会让列表里混进「新源已经没有」的片子，而且
+    vod_id 冲突时会被覆盖成新源内容，看起来像数据错乱。
+    """
+    slug = validate_slug(slug)
+    fields = body.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(status_code=400, detail="没有需要修改的字段")
+    if fields.get("api_url") is not None:
+        fields["api_url"] = _clean_api_url(fields["api_url"])
+
+    try:
+        res = update_custom_source(slug, **fields)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"code": 1, **res}
+
+
+@router.delete("/api/v1/sources/{slug}/custom", summary="删除自定义源站")
+def remove_custom_source(
+    slug: str,
+    confirm: str = Query(default="", description="必须与 slug 相同，防止误调用"),
+    drop_table: bool = Query(default=True, description="是否同时删除该站的数据表（含已入库数据）"),
+):
+    """
+    删除手动添加的源站（可连同数据表一起 DROP）。
+
+    只允许删 `origin='custom'` 的：官方源站删掉之后下一次 refresh 还会回来，
+    删它没有意义，反而让「我的源站怎么不见了」变成查不清的谜。
+    """
+    slug = validate_slug(slug)
+    if confirm != slug:
+        raise HTTPException(status_code=400, detail="需传 confirm=<slug> 确认删除，防止误操作")
+
+    try:
+        res = delete_custom_source(slug, drop_table=drop_table)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return {
+        "code": 1,
+        **res,
+        "msg": f"已删除源站 {slug}" + ("（数据表已删除）" if res["dropped"] else "（数据表保留）"),
+    }
 
 
 def _bg_sync_new(slugs: list):

@@ -18,7 +18,7 @@ from sqlalchemy import bindparam, func, select, text
 
 from . import config, database, pause
 from .maccms import MacCmsClient, MacCmsError
-from .models import build_vod_table, slugify, sources, sync_logs
+from .models import build_vod_table, forget_vod_table, slugify, sources, sync_logs
 
 log = logging.getLogger("vodsync.syncer")
 
@@ -134,7 +134,7 @@ def _find_source_by_api(conn, api_url: str):
     这里再兼容一下「尾斜杠」差异（同一 API 被登记成带/不带 `/` 两种写法时不要重复建表）。
     """
     url = api_url[:500]
-    cols = (sources.c.id, sources.c.slug, sources.c.api_url)
+    cols = (sources.c.id, sources.c.slug, sources.c.api_url, sources.c.origin)
     row = conn.execute(select(*cols).where(sources.c.api_url == url)).mappings().first()
     if row:
         return row
@@ -191,6 +191,16 @@ def refresh_sources(client: MacCmsClient = None) -> list:
             if src:
                 # 已登记：更新元信息。**slug 不再变** —— 它是表名和 API 路径的一部分，
                 # 改名等于把已有数据和所有客户端一起废掉。
+                if (src.get("origin") or "latest") == "custom":
+                    # 用户手动添加的源站：名称/描述是用户填的，latest.json 无权覆盖。
+                    # 只更新 status（在线状态是客观事实），其余保持原样。
+                    # 这也是「自定义源持续存在」的关键：refresh 既不覆盖，也不删除。
+                    conn.execute(
+                        sources.update()
+                        .where(sources.c.id == src["id"])
+                        .values(status=res.get("status") or "ok")
+                    )
+                    continue
                 conn.execute(
                     sources.update()
                     .where(sources.c.id == src["id"])
@@ -213,6 +223,7 @@ def refresh_sources(client: MacCmsClient = None) -> list:
                     status=res.get("status") or "ok",
                     enabled=1,
                     auto_sync=1,
+                    origin="latest",
                 )
             )
             new_slugs.append(slug)
@@ -229,6 +240,182 @@ def ensure_table(slug: str):
     """创建 vod_{slug} 表（幂等）。"""
     table = build_vod_table(slug)
     table.create(database.engine, checkfirst=True)
+
+
+# ---------------------------------------------------------------------------
+# 自定义源站（v1.8.0）
+#
+# 与 latest.json 自动发现的源站共用 sources 表，靠 origin 列区分：
+#   latest —— 由 refresh_sources() 维护，元信息可被 JSON 覆盖
+#   custom —— 用户在面板手动登记，refresh_sources() 只更新 status，绝不删除
+#
+# 「自定义源持续存在」不依赖任何额外存储：它就是 sources 表里一行 origin='custom'
+# 的记录。重启、刷新源站列表、重新部署都不会丢。
+# ---------------------------------------------------------------------------
+
+def probe_source(api_url: str, timeout: int = None) -> dict:
+    """
+    抓第 1 页验证一个地址是不是可用的苹果 CMS 采集接口。不落库、不建表。
+
+    用 ac=list 而非 ac=detail：只取一页元信息（几十 KB），比 detail 快一个量级，
+    足以判断「域名通不通、是不是这套接口、有没有数据」。
+    """
+    started = time.time()
+    client = MacCmsClient(timeout=min(timeout or config.REQUEST_TIMEOUT, 15), retries=0)
+    try:
+        data = client.fetch_page(api_url, "list", 1)
+    except Exception as exc:  # noqa: BLE001 - 任何异常都要转成人能看懂的一句话
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {str(exc)[:180]}",
+            "elapsed_ms": int((time.time() - started) * 1000),
+        }
+    finally:
+        client.close()
+
+    elapsed = int((time.time() - started) * 1000)
+    items = data.get("list")
+    if not isinstance(items, list):
+        return {"ok": False, "error": "响应不是苹果 CMS 格式（缺少 list 字段）", "elapsed_ms": elapsed}
+    if not items:
+        return {
+            "ok": False,
+            "error": "接口可访问但列表为空，该源站可能暂无数据",
+            "total": int(data.get("total") or 0),
+            "elapsed_ms": elapsed,
+        }
+    return {
+        "ok": True,
+        "total": int(data.get("total") or 0),
+        "pagecount": int(data.get("pagecount") or 0),
+        "samples": [(it.get("vod_name") or "").strip() for it in items[:3]],
+        "elapsed_ms": elapsed,
+    }
+
+
+def register_custom_source(name: str, api_url: str, slug: str = "",
+                           homepage: str = "", description: str = "") -> dict:
+    """
+    登记手动添加的源站并立即建表。
+    抛 ValueError 表示业务冲突（API 已登记 / slug 已占用），由 API 层转 409。
+    """
+    name = (name or "").strip()[:120]
+    api_url = (api_url or "").strip()[:500]
+    if not name:
+        raise ValueError("源站名称不能为空")
+    if not api_url:
+        raise ValueError("API 地址不能为空")
+
+    with database.write_txn() as conn:
+        exist = _find_source_by_api(conn, api_url)
+        if exist:
+            raise ValueError(f"该 API 地址已登记为源站 {exist['slug']}")
+        if slug:
+            slug = slug.strip().lower()
+            if conn.execute(select(sources.c.id).where(sources.c.slug == slug)).first():
+                raise ValueError(f"标识 {slug} 已被占用，请换一个")
+        else:
+            # 中文名会变成 s+md5 前缀，用户看不出含义，但作为表名/路径是稳定的；
+            # 想要可读标识就在表单里自己填。
+            slug = _unique_slug(conn, slugify(name) or "custom")
+        conn.execute(
+            sources.insert().values(
+                name=name,
+                slug=slug,
+                api_url=api_url,
+                homepage=(homepage or "").strip()[:500],
+                description=(description or "").strip()[:500],
+                status="ok",
+                enabled=1,
+                auto_sync=1,
+                origin="custom",
+            )
+        )
+    ensure_table(slug)
+    log.info("自定义源站已登记: %s (%s)", slug, api_url)
+    return {"slug": slug, "created": True}
+
+
+def update_custom_source(slug: str, **fields) -> dict:
+    """
+    修改自定义源站，接受 name / api_url / homepage / description / enabled / auto_sync。
+
+    **改 api_url 会清空该站已入库的数据并重置水位线**：换了接口就是换了数据源，
+    旧行留着只会让列表里混进一批「新源已经没有」的片子，而且 vod_id 冲突时会被
+    覆盖成新源内容，看上去像是数据错乱。清空是唯一语义清晰的做法。
+    """
+    with database.write_txn() as conn:
+        src = conn.execute(select(sources).where(sources.c.slug == slug)).mappings().first()
+        if not src:
+            raise LookupError(f"源站不存在: {slug}")
+        if (src["origin"] or "latest") != "custom":
+            raise PermissionError("只能修改手动添加的源站；官方源站请用「自动同步」开关控制")
+
+        changes: dict = {}
+        if fields.get("name") is not None:
+            v = str(fields["name"]).strip()[:120]
+            if not v:
+                raise ValueError("源站名称不能为空")
+            changes["name"] = v
+        if fields.get("homepage") is not None:
+            changes["homepage"] = str(fields["homepage"]).strip()[:500]
+        if fields.get("description") is not None:
+            changes["description"] = str(fields["description"]).strip()[:500]
+        if fields.get("enabled") is not None:
+            changes["enabled"] = 1 if fields["enabled"] else 0
+        if fields.get("auto_sync") is not None:
+            changes["auto_sync"] = 1 if fields["auto_sync"] else 0
+
+        reset_data = False
+        if fields.get("api_url") is not None:
+            new_api = str(fields["api_url"]).strip()[:500]
+            if not new_api:
+                raise ValueError("API 地址不能为空")
+            if new_api != (src["api_url"] or ""):
+                dup = _find_source_by_api(conn, new_api)
+                if dup and dup["slug"] != slug:
+                    raise ValueError(f"该 API 地址已登记为源站 {dup['slug']}")
+                changes.update(api_url=new_api, watermark="", last_page=0,
+                               total_pages=0, total_videos=0)
+                reset_data = True
+
+        if changes:
+            conn.execute(sources.update().where(sources.c.slug == slug).values(**changes))
+
+    if reset_data:
+        table = build_vod_table(slug)
+        if database.table_exists(table.name):
+            with database.write_txn() as conn:
+                conn.execute(table.delete())
+        log.info("源站 %s 的 API 地址已变更，历史数据已清空", slug)
+
+    return {"slug": slug, "updated": sorted(changes), "data_reset": reset_data}
+
+
+def delete_custom_source(slug: str, drop_table: bool = True) -> dict:
+    """
+    删除自定义源站。
+
+    只允许删 origin='custom' 的：官方源站删掉之后下一次 refresh 还会回来，
+    删它没有意义，反而让「我的源站怎么不见了」变成一个查不清的谜。
+    """
+    if is_busy(slug):
+        raise RuntimeError(f"{slug} 正在同步，请先暂停或等它结束再删除")
+
+    with database.write_txn() as conn:
+        src = conn.execute(select(sources).where(sources.c.slug == slug)).mappings().first()
+        if not src:
+            raise LookupError(f"源站不存在: {slug}")
+        if (src["origin"] or "latest") != "custom":
+            raise PermissionError("只能删除手动添加的源站；官方源站请关闭自动同步或禁用")
+        conn.execute(sources.delete().where(sources.c.slug == slug))
+
+    if drop_table:
+        table = build_vod_table(slug)
+        table.drop(database.engine, checkfirst=True)
+        forget_vod_table(slug)
+    log.info("自定义源站已删除: %s（数据表%s）", slug, "已删除" if drop_table else "保留")
+    return {"slug": slug, "dropped": bool(drop_table)}
 
 
 def get_source(conn, slug: str):

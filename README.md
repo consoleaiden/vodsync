@@ -16,6 +16,7 @@
 - **断电可恢复**：每页一个事务 + 断点/水位线入库，重启后自动续跑；单页失败不会静默丢数据
 - **PostgreSQL 存储**：v1.7.0 起固定使用 PG，百万级行下列表查询走并行 top-K 归并
 - **自带维护任务**：定时清理同步日志、回收 WAL，长时间跑不会把库/磁盘撑爆
+- **自定义源站**（v1.8.0）：latest.json 之外的接口可在面板手动登记，带连通性测试；持久化保存，刷新源站列表不会覆盖或删除
 
 ## 技术选型说明
 
@@ -67,6 +68,65 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 面板每 5 秒自动刷新（可关闭），页面切换后台时自动暂停，避免占资源。
 
 > 面板默认需要密码登录（默认 `666666`）。登录后右上「⚙ 设置」可改密码、复制/重置 API Token、开关访问控制。
+
+## 自定义源站（v1.8.0）
+
+默认源站来自 `latest.json` 自动发现。你自己有的接口（私有站、内网源、朋友给的）可以在面板上
+「+ 添加源站」直接登记，**重启、刷新源站列表、重新部署都不会丢**。
+
+### 面板操作
+
+源站列表右上角「+ 添加源站」：
+
+1. 填名称与 API 地址（苹果 CMS 采集接口，如 `https://api.example.com/api.php/provide/vod/`）
+2. 点「测试连接」——抓第 1 页，显示总条数、页数与一条示例片名
+3. 可选填「源站标识」（决定表名 `vod_{slug}` 和 API 路径 `?source={slug}`）。留空自动生成；
+   纯中文名会得到 `s` + 10 位哈希这种不好读的形式，想要 `myhd` 这种可读标识就自己填
+4. 「添加」或「添加后立即全量同步」
+
+添加后表格该行出现「自定义」徽标，并多出「编辑」「删除」两个按钮。
+
+### 行为约定
+
+| 场景 | 行为 |
+|---|---|
+| 刷新源站列表（latest.json） | 自定义源的名称/描述**不会被覆盖**，`status` 按上游更新 |
+| latest.json 里没有它 | 不会被删除（refresh 只增不减） |
+| 改 API 地址 | **清空该站已入库数据**并重置进度（换接口 = 换数据源） |
+| 改源站标识 slug | 不允许——它是表名与 API 路径的一部分，改了等于把已有数据和客户端一起废掉 |
+| 删除 | 需 `confirm=<slug>`；默认连数据表一起删；正在同步时拒绝（先暂停） |
+| 官方源站 | 不能编辑/删除，只能用「自动同步」开关控制是否参与定时任务 |
+
+实现上没有任何额外存储：自定义源就是 `sources` 表里一行 `origin='custom'` 的记录，
+`refresh_sources()` 遇到它只更新 `status`，不改名字也不删行。
+
+### 内网源站与 HTTP_PROXY
+
+如果服务器设了全局 `HTTP_PROXY`（群晖上不少镜像/脚本会设），httpx 默认会把它也用在
+`127.0.0.1` 和内网地址上，表现为「测试连接」报 `ConnectError … 仍失败`。加一个环境变量：
+
+```yaml
+environment:
+  NO_PROXY: "127.0.0.1,localhost,192.168.0.0/16,10.0.0.0/8"
+```
+
+### 命令行等价操作
+
+```bash
+# 测试连通性（不落库、不建表）
+curl -s -X POST http://<host>:8181/api/v1/sources/probe \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"api_url":"https://api.example.com/api.php/provide/vod/"}'
+
+# 添加（sync_now=true 则添加后立即全量同步）
+curl -s -X POST http://<host>:8181/api/v1/sources/custom \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"我的私有源","api_url":"https://api.example.com/api.php/provide/vod/","slug":"myhd","sync_now":true}'
+
+# 删除（必须带 confirm）
+curl -s -X DELETE "http://<host>:8181/api/v1/sources/myhd/custom?confirm=myhd" \
+  -H "Authorization: Bearer $TOKEN"
+```
 
 ## API 一览
 
@@ -587,3 +647,32 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 - 测试：新增 `scripts/test_v170_wave2.py`（42 项：归并与 UNION 逐条比对、分页边界、detail 两段式、
   LIKE 转义、缓存命中、深页回退、日志三级清理、slug 碰撞），全仓 201 项通过
 - 版本号 1.6.1 → 1.7.0
+
+### v1.8.0
+自定义源站：latest.json 之外的接口可以在面板直接登记。
+
+- **数据模型**：`sources` 表新增 `origin`（`latest` / `custom`），`_migrate()` 自动为老库补列。
+  自定义源就是一行 `origin='custom'` 的记录，不依赖任何额外配置文件或内存状态
+- **持久化语义**：`refresh_sources()` 遇到 `origin='custom'` 只更新 `status`，不改名称/描述，
+  也永不删除（refresh 本来就只增不减）。所以「持续存在」是结构保证，不是约定
+- **新接口**：`POST /api/v1/sources/custom`（添加）、`PATCH|DELETE /api/v1/sources/{slug}/custom`
+  （修改/删除）、`POST /api/v1/sources/probe`（连通性测试，不落库不建表）
+- **身份与标识**：按 `api_url` 判重（含尾斜杠差异）；`slug` 留空自动生成、冲突自动加 `_2`；
+  显式指定的 `slug` 冲突直接 409。`slug` 决定表名与 API 路径，登记后不可修改
+- **改地址清数据**：`PATCH api_url` 会清空该站已入库数据并重置水位线/断点 —— 换接口就是换数据源，
+  保留旧行只会让列表混进「新源已经没有」的片子，且 `vod_id` 冲突时会被覆盖成新源内容
+- **删除保护**：必须 `confirm=<slug>`；只能删自定义源（官方源删了下次 refresh 也回来）；
+  正在同步时返回 409；`drop_table=false` 可只删登记、保留数据
+- **SSRF 收口**：`api_url` 只放行 `http://` / `https://`，挡掉 `file://`/`gopher://` 这类能读本地文件的 scheme
+- **顺带修的两个 bug**：
+  - `MacCmsClient._request` 的 `range(1, retries+1)` 在 `retries=0` 时循环体一次都不执行，
+    直接抛「重试 0 次仍失败 (None)」——一个请求都没发。连通性探测正好传了 0，
+    本来想「只试一次」，实际变成了「绝不请求」。改为 `max(1, retries)`
+  - `forget_vod_table()` 只清 `_vod_table_cache` 不清 `META.tables`，导致「删掉自定义源
+    再用同一个 slug 重建」会抛 `InvalidRequestError: Table ... is already defined`
+- **面板**：源站列表右上「+ 添加源站」，弹窗内可测试连接、可选立即全量同步；
+  表格新增「来源」列（官方/自定义），自定义行提供编辑与删除入口
+- 测试：新增 `scripts/test_v180_custom_source.py`（66 项：地址校验、探测成功/失败/强制添加、
+  去重含尾斜杠、slug 生成与冲突、refresh 不覆盖不删除、改地址清数据、删除权限与表 DROP、
+  同 slug 重建，以及一段真实 HTTP 的端到端链路），全仓 267 项通过
+- 版本号 1.7.0 → 1.8.0
