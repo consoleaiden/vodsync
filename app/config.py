@@ -60,6 +60,24 @@ CHECKPOINT_EVERY_PAGES = int(os.environ.get("CHECKPOINT_EVERY_PAGES", "5"))
 # 单页抓取的最大尝试次数。超过即中止本次全量（保留断点），避免对已挂的源站空转。
 # 注意：这是「同一页在本次运行内」的计数，重启后重新计。
 PAGE_MAX_ATTEMPTS = int(os.environ.get("PAGE_MAX_ATTEMPTS", "3"))
+# 增量索引阶段失败页重试之间的等待（秒）。给限流的源站一点喘息，重试成功率明显更高。
+PAGE_RETRY_SLEEP_SECONDS = float(os.environ.get("PAGE_RETRY_SLEEP_SECONDS", "2"))
+
+# ---------------------------------------------------------------------------
+# 源站健康度退避（v1.8.1）
+#
+# 场景：某源站被限流/宕机，旧逻辑每 6 小时照样从第 1 页捶到最后一页（2,700 页
+# 全失败也照捶），既烧自己的流量又持续触发对方风控，还每轮写一行 incomplete 日志。
+#
+# 规则：一轮同步「大面积失败」（索引失败率 >= 50%，或整轮异常）→ fail_streak +1，
+#       调度器在 skip_until 之前跳过该站；退避时长 60min → 2h → 4h → ... 封顶 24h。
+#       到期后自然参与下一轮（第一页就是探针，早停保证探针成本只有几页请求）。
+#       任何一次成功 → streak 清零、解除退避。手动点「增量/全量」不受退避限制。
+# ---------------------------------------------------------------------------
+BACKOFF_BASE_MINUTES = int(os.environ.get("BACKOFF_BASE_MINUTES", "60"))
+BACKOFF_MAX_HOURS = int(os.environ.get("BACKOFF_MAX_HOURS", "24"))
+# 连续失败达到该次数后，面板状态标为 down（离线徽标）
+FAIL_STATUS_DOWN_STREAK = int(os.environ.get("FAIL_STATUS_DOWN_STREAK", "2"))
 
 # ---------------------------------------------------------------------------
 # 重启恢复（断电 / 崩溃 / docker restart 之后）

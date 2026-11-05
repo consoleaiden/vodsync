@@ -12,7 +12,7 @@ import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import bindparam, func, select, text
 
@@ -561,6 +561,7 @@ def full_sync(slug: str, client: MacCmsClient) -> dict:
             sources.update().where(sources.c.slug == slug).values(total_pages=pagecount)
         )
     log.info("[%s] 全量同步开始: total=%s pagecount=%s 断点=%s", slug, total, pagecount, resume_page)
+    stats["pages_total"] = pagecount   # 供健康度判定计算失败率
 
     start_page = max(resume_page, 0) + 1 if resume_page else 1
     pg = start_page
@@ -760,6 +761,36 @@ def _finish_full(slug: str, class_map: dict):
 # ---------------------------------------------------------------------------
 # 增量同步
 # ---------------------------------------------------------------------------
+def _classify_error(msg: str) -> str:
+    """把底层报错粗分类，用于日志聚合（「2,678 个失败」不如「timeout×1900, http_403×778」有用）。"""
+    m = (msg or "").lower()
+    if "timed out" in m or "timeout" in m:
+        return "timeout"
+    if "403" in m:
+        return "http_403"
+    if "429" in m:
+        return "http_429"
+    if "404" in m:
+        return "http_404"
+    if "connect" in m or "getaddrinfo" in m or "translate host" in m:
+        return "connect_error"
+    if "ssl" in m:
+        return "ssl_error"
+    if "json" in m:
+        return "bad_json"
+    return "other"
+
+
+def _failure_detail(page_errors: dict) -> str:
+    """聚合失败原因：{'timeout×1900, http_403×778'} 形式的摘要，随日志行返回面板。"""
+    if not page_errors:
+        return ""
+    from collections import Counter
+
+    counts = Counter(_classify_error(m) for m in page_errors.values())
+    return ", ".join(f"{k}×{v}" for k, v in counts.most_common())
+
+
 def incremental_sync(slug: str, client: MacCmsClient) -> dict:
     with database.engine.connect() as conn:
         src = get_source(conn, slug)
@@ -792,26 +823,78 @@ def incremental_sync(slug: str, client: MacCmsClient) -> dict:
 
     pages = list(range(1, pagecount + 1))
     failed_list_pages: list = []
-    for i in range(0, len(pages), config.PAGE_CONCURRENCY):
-        # ---- 暂停检查点：list 索引阶段可随时中断（该阶段无副作用，继续时重跑即可）----
-        if should_stop(slug, "incremental"):
-            stats["paused"] = True
-            log.info("[%s] 增量同步已暂停（索引阶段，水位线未动）", slug)
-            return stats
-        batch = pages[i : i + config.PAGE_CONCURRENCY]
-        with ThreadPoolExecutor(max_workers=len(batch)) as pool:
-            futures = {pool.submit(collect, p): p for p in batch}
-            for fut in as_completed(futures):
-                page = futures[fut]
-                try:
-                    index.update(fut.result())
-                    stats["pages"] += 1
-                except MacCmsError as e:
-                    # 注意：这里绝不能再调一次 fut.result()——对已抛异常的 Future 取结果会
-                    # 把同一次失败重抛出去，整站增量直接崩掉（v1.5.2 的 P0-3）。
-                    failed_list_pages.append(page)
-                    log.error("[%s] 增量 list 第 %d 页失败: %s", slug, page, e)
-        stats["fetched"] = len(index)
+    page_errors: dict = {}   # page -> 最近一次失败原因（用于聚合错误类型）
+
+    def scan(page_list: list) -> list:
+        """
+        扫描一批索引页，返回仍失败的页号列表。
+
+        v1.8.1 两点增强：
+        1. 连续 2 个批次整批失败 → 判定源站当前不可达，剩余页直接记为失败，
+           不再逐页捶过去（每页内部已有 REQUEST_RETRIES 次重试，继续扫只是空转）。
+        2. 暂停时未扫到的页按失败处理 —— 水位线反正不动，续跑时重扫即可。
+        """
+        todo = list(page_list)
+        failed: list = []
+        empty_batches = 0
+        i = 0
+        while i < len(todo):
+            # ---- 暂停检查点：list 索引阶段可随时中断（该阶段无副作用，继续时重跑即可）----
+            if should_stop(slug, "incremental"):
+                stats["paused"] = True
+                log.info("[%s] 增量同步已暂停（索引阶段，水位线未动）", slug)
+                failed.extend(todo[i:])
+                break
+            batch = todo[i : i + config.PAGE_CONCURRENCY]
+            i += len(batch)
+            batch_ok = 0
+            with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+                futures = {pool.submit(collect, p): p for p in batch}
+                for fut in as_completed(futures):
+                    page = futures[fut]
+                    try:
+                        index.update(fut.result())
+                        stats["pages"] += 1
+                        batch_ok += 1
+                        page_errors.pop(page, None)
+                    except MacCmsError as e:
+                        # 注意：这里绝不能再调一次 fut.result()——对已抛异常的 Future 取结果会
+                        # 把同一次失败重抛出去，整站增量直接崩掉（v1.5.2 的 P0-3）。
+                        failed.append(page)
+                        page_errors[page] = str(e)
+                        log.error("[%s] 增量 list 第 %d 页失败: %s", slug, page, e)
+            empty_batches = empty_batches + 1 if not batch_ok else 0
+            if empty_batches >= 2:
+                # 连续 2 批整批失败 = 至少 2×PAGE_CONCURRENCY 次请求（每次内部已重试
+                # REQUEST_RETRIES 遍）全部失败 —— 这是源站宕机/被封的强信号。
+                # 剩余页直接记为失败交给重试轮与下一轮调度，不再逐页捶过去。
+                log.error(
+                    "[%s] 增量 list 连续 %d 批整批失败，判定源站当前不可达，"
+                    "剩余 %d 页跳过（省掉 %d 次注定失败的请求）",
+                    slug, empty_batches, len(todo) - i, len(todo) - i,
+                )
+                failed.extend(todo[i:])
+                break
+        return failed
+
+    failed_list_pages = scan(pages)
+    # ---- 页级重试（M1）：瞬时抖动当场恢复，不必等下一轮重扫全索引 ----
+    # 源站真不可达时重试轮几乎零成功，零进展即提前退出，避免空转。
+    retry_round = 1
+    while (
+        failed_list_pages
+        and retry_round < config.PAGE_MAX_ATTEMPTS
+        and not stats.get("paused")
+    ):
+        time.sleep(config.PAGE_RETRY_SLEEP_SECONDS)
+        before = stats["pages"]
+        log.info("[%s] 增量 list 重试第 %d 轮（%d 页失败）", slug, retry_round, len(failed_list_pages))
+        failed_list_pages = scan(failed_list_pages)
+        retry_round += 1
+        if stats["pages"] == before:
+            log.warning("[%s] 重试零进展，提前放弃剩余 %d 页", slug, len(failed_list_pages))
+            break
+    stats["fetched"] = len(index)
 
     # 索引不完整 → 漏掉的页里可能有新片，此时推进水位线等于把它们永久跳过。
     # 所以水位线冻结，下次运行重新遍历完整索引（幂等，代价只是多一轮 list）。
@@ -848,7 +931,14 @@ def incremental_sync(slug: str, client: MacCmsClient) -> dict:
         _mark_synced(slug, watermark, len(index))
         if not index_complete:
             stats["incomplete"] = True
-            stats["error"] = f"索引页 {len(failed_list_pages)} 个失败，水位线保持不变"
+            stats["failed_list_pages"] = len(failed_list_pages)
+            stats["list_pages_total"] = pagecount
+            detail = _failure_detail(page_errors)
+            stats["error"] = (
+                f"索引页 {len(failed_list_pages)} 个失败"
+                + (f"（{detail}）" if detail else "")
+                + "，水位线保持不变"
+            )
         log.info("[%s] 增量同步: 无更新 (水位线=%s, 在库索引=%d)", slug, watermark, len(index))
         return stats
 
@@ -929,7 +1019,14 @@ def incremental_sync(slug: str, client: MacCmsClient) -> dict:
     new_wm = watermark
     if not index_complete:
         stats["incomplete"] = True
-        stats["error"] = f"索引页 {len(failed_list_pages)} 个失败，水位线保持不变"
+        stats["failed_list_pages"] = len(failed_list_pages)
+        stats["list_pages_total"] = pagecount
+        detail = _failure_detail(page_errors)
+        stats["error"] = (
+            f"索引页 {len(failed_list_pages)} 个失败"
+            + (f"（{detail}）" if detail else "")
+            + "，水位线保持不变"
+        )
     elif failed_ids:
         times = [t for t in failed_ids.values() if t]
         if len(times) < len(failed_ids):
@@ -962,6 +1059,74 @@ def _mark_synced(slug: str, watermark: str, _index_size: int):
         values["total_videos"] = count
     with database.write_txn() as conn:
         conn.execute(sources.update().where(sources.c.slug == slug).values(**values))
+
+
+# ---------------------------------------------------------------------------
+# 源站健康度退避（v1.8.1）
+#
+# 大面积失败的判定：索引/全量页失败率 >= 50%，或整轮异常（连 pagecount 都没拿到）。
+# 失败 → streak+1 并按指数退避（60min → 2h → 4h → ... 封顶 24h），streak 达到
+# FAIL_STATUS_DOWN_STREAK 后面板状态显示「离线」。成功 → 全部清零恢复。
+# 只影响「调度器什么时候再试」，不影响数据正确性（水位线语义不变）。
+# ---------------------------------------------------------------------------
+def _is_hard_failure(status: str, stats: dict) -> bool:
+    if status == "failed":
+        return True
+    if status != "incomplete":
+        return False
+    total = stats.get("list_pages_total") or stats.get("pages_total") or 0
+    failed = stats.get("failed_list_pages", stats.get("failed_pages", 0)) or 0
+    return total > 0 and failed * 2 >= total
+
+
+def _apply_health(slug: str, status: str, stats: dict):
+    """按本轮结果更新 fail_streak / skip_until / status。在 sync_source 收尾处调用。"""
+    if status == "paused":
+        return
+    try:
+        if _is_hard_failure(status, stats):
+            with database.write_txn() as conn:
+                row = conn.execute(
+                    select(sources.c.fail_streak).where(sources.c.slug == slug)
+                ).first()
+                streak = ((row[0] if row else 0) or 0) + 1
+                minutes = min(
+                    config.BACKOFF_BASE_MINUTES * (2 ** (streak - 1)),
+                    config.BACKOFF_MAX_HOURS * 60,
+                )
+                skip_until = datetime.now() + timedelta(minutes=minutes)
+                values = {"fail_streak": streak, "skip_until": skip_until}
+                if streak >= config.FAIL_STATUS_DOWN_STREAK:
+                    values["status"] = "down"
+                conn.execute(
+                    sources.update().where(sources.c.slug == slug).values(**values)
+                )
+            log.warning(
+                "[%s] 源站大面积失败（第 %d 次连续），退避至 %s 后再试",
+                slug, streak, skip_until.strftime("%m-%d %H:%M"),
+            )
+        elif status == "success":
+            with database.write_txn() as conn:
+                row = conn.execute(
+                    select(sources.c.fail_streak, sources.c.status).where(
+                        sources.c.slug == slug
+                    )
+                ).first()
+                if not row:
+                    return
+                streak, cur_status = row
+                values = {"fail_streak": 0, "skip_until": None}
+                if cur_status == "down":
+                    values["status"] = "ok"   # 已恢复在线；下次 refresh 仍会按远端刷新
+                if streak or values.get("status") or "skip_until" in values:
+                    conn.execute(
+                        sources.update().where(sources.c.slug == slug).values(**values)
+                    )
+                if streak:
+                    log.info("[%s] 同步成功，失败退避已解除（此前连续失败 %d 次）", slug, streak)
+    except Exception:
+        # 健康度记录失败绝不能影响同步结果本身
+        log.exception("[%s] 更新源站健康度失败（忽略）", slug)
 
 
 # ---------------------------------------------------------------------------
@@ -1016,10 +1181,12 @@ def sync_source(slug: str, mode: str = "auto") -> dict:
                 else:
                     status = "success"
                 _finish_log(log_id, status, stats)
+                _apply_health(slug, status, stats)
                 return {"slug": slug, "mode": mode, "status": status, **stats}
             except Exception as e:
                 log.exception("[%s] 同步失败", slug)
                 _finish_log(log_id, "failed", {"error": str(e)})
+                _apply_health(slug, "failed", {"error": str(e)})
                 return {"slug": slug, "mode": mode, "status": "failed", "error": str(e)}
             finally:
                 mark_stopped(slug)        # 退出运行态
@@ -1076,16 +1243,22 @@ def _resume_worker(slugs: list, mode: str):
 def sync_all(force_mode: str = "auto") -> list:
     """
     并行同步所有源站（定时任务与「全站同步」共用入口）。
-    跳过：手动暂停的站 + 自动同步已关闭的站。
+    跳过：手动暂停的站 + 自动同步已关闭的站 + 处于失败退避期的站（v1.8.1）。
+    手动单站触发不受退避限制（用户显式要求时应当照跑）。
     """
+    now = datetime.now()
     with database.engine.connect() as conn:
-        slugs = [r[0] for r in conn.execute(
-            select(sources.c.slug).where(
+        rows = conn.execute(
+            select(sources.c.slug, sources.c.skip_until).where(
                 sources.c.enabled == 1,
                 sources.c.paused == 0,
                 sources.c.auto_sync == 1,
             )
-        ).all()]
+        ).all()
+    slugs = [s for s, su in rows if not su or su <= now]
+    skipped = [s for s, su in rows if su and su > now]
+    if skipped:
+        log.info("失败退避：跳过 %d 个源站（%s...）", len(skipped), ",".join(skipped[:5]))
     log.info("开始同步 %d 个源站 (模式=%s，暂停/关闭自动同步的源站已跳过)", len(slugs), force_mode)
     results = []
     with ThreadPoolExecutor(max_workers=config.SOURCE_SYNC_CONCURRENCY) as pool:

@@ -405,6 +405,15 @@ async function loadSources() {
       const fullPaused = pauseState.global || pauseState.full;
       const pct = Math.max(0, Math.min(100, Number(s.progress || 0)));
       const elapsed = s.running_seconds != null ? ` · ${fmtDur(s.running_seconds)}` : "";
+      // 健康度退避（v1.8.1）：连续大面积失败后调度器暂时跳过该站
+      const backoffBadge = (src) => {
+        if (!src.skip_until || !src.fail_streak) return "";
+        const until = new Date(src.skip_until).getTime();
+        if (!(until > Date.now())) return "";
+        const min = Math.ceil((until - Date.now()) / 60000);
+        const hint = min >= 60 ? `${Math.floor(min / 60)}h${min % 60 ? (min % 60) + "m" : ""}` : `${min}m`;
+        return ` <span class="badge warn" title="连续 ${src.fail_streak} 次大面积失败，调度器退避中（手动同步不受限），到期自动恢复">退避 ${hint}</span>`;
+      };
       let prog;
       if (running && isFull) {
         const pageTxt = s.total_pages
@@ -457,7 +466,7 @@ async function loadSources() {
           <div class="slugcode">${esc(s.slug)}</div>
         </td>
         <td>${originCell}</td>
-        <td>${s.status === "ok" ? '<span class="badge ok">在线</span>' : '<span class="badge bad">离线</span>'}${s.paused ? ' <span class="badge warn">本站暂停</span>' : ""}${s.queued ? ' <span class="badge mute">排队中</span>' : ""}</td>
+        <td>${s.status === "ok" ? '<span class="badge ok">在线</span>' : '<span class="badge bad">离线</span>'}${s.paused ? ' <span class="badge warn">本站暂停</span>' : ""}${s.queued ? ' <span class="badge mute">排队中</span>' : ""}${backoffBadge(s)}</td>
         <td class="num">${fmtNum(s.total_videos)}</td>
         <td style="min-width:130px">${prog}</td>
         <td class="muted num" style="font-size:12px">${esc(s.watermark || "-")}</td>

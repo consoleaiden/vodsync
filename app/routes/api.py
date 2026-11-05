@@ -441,7 +441,7 @@ def list_sources():
                 sources.c.enabled, sources.c.total_videos, sources.c.watermark,
                 sources.c.last_page, sources.c.total_pages, sources.c.last_sync_at,
                 sources.c.paused, sources.c.paused_at, sources.c.auto_sync,
-                sources.c.origin,
+                sources.c.origin, sources.c.fail_streak, sources.c.skip_until,
             ).order_by(sources.c.id)
         ).mappings().all()
     return {
@@ -475,6 +475,9 @@ def list_sources():
                 "paused_at": r["paused_at"].isoformat() if r["paused_at"] else None,
                 # 自动同步开关：false 时不参与定时任务与全站同步（手动单站同步不受影响）
                 "auto_sync": bool(r["auto_sync"]),
+                # 健康度退避（v1.8.1）：连续大面积失败次数 + 退避截止时间
+                "fail_streak": r["fail_streak"] or 0,
+                "skip_until": r["skip_until"].isoformat() if r["skip_until"] else None,
             }
             for r in rows
         ],

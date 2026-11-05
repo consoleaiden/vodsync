@@ -78,6 +78,12 @@ sources = Table(
     # refresh_sources 不会覆盖 custom 行的元信息（名字/描述归用户所有），
     # 也永不删除 custom 行 —— 这是「自定义源持续存在」的实现基础。
     Column("origin", String(16), default="latest", server_default="latest"),
+    # ---- 健康度退避（v1.8.1）----
+    # 连续「大面积失败」的次数（成功率 <50% 的 incomplete / 整轮 failed）。
+    # 成功一次即清零。用于把持续限流/宕机的源站按指数退避，而不是每轮都捶一遍。
+    Column("fail_streak", Integer, default=0, server_default="0"),
+    # 退避截止时间：调度器跳过 skip_until > now 的源站（手动触发不受限）。
+    Column("skip_until", DateTime),
     Column("last_sync_at", DateTime),                     # 最近一次成功同步时间
     Column("created_at", DateTime, server_default=func.now()),
     Column("updated_at", DateTime, server_default=func.now(), onupdate=func.now()),

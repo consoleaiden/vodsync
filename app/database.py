@@ -145,6 +145,9 @@ def _migrate():
         ("sources", "auto_sync", "INTEGER DEFAULT 1"),
         # 已有 52 个源站会被填成 latest；新库由 models.py 的 server_default 保证
         ("sources", "origin", "VARCHAR(16) DEFAULT 'latest'"),
+        # 健康度退避（v1.8.1）
+        ("sources", "fail_streak", "INTEGER DEFAULT 0"),
+        ("sources", "skip_until", "TIMESTAMP"),
     ]
     insp = inspect(engine)
     existing_tables = set(insp.get_table_names())
