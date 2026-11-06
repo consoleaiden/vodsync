@@ -5,3 +5,6 @@ apscheduler>=3.10,<4.0
 sqlalchemy>=2.0,<3.0
 # PostgreSQL 驱动（v1.7.0 起为必需依赖，生产固定用 PG）
 psycopg2-binary>=2.9,<3.0
+
+# 繁转简（相关推荐标题归一化用，可选；未安装时自动跳过繁体转换）
+opencc-python-reimplemented>=0.1.6

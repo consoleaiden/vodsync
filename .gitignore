@@ -21,3 +21,4 @@ data/
 # 系统
 .DS_Store
 Thumbs.db
+data-test

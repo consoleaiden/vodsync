@@ -8,7 +8,7 @@ import logging
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from . import config, pause
+from . import config, database, pause
 
 log = logging.getLogger("vodsync.scheduler")
 _scheduler: BackgroundScheduler = None
@@ -50,6 +50,63 @@ def _job_housekeeping():
         log.exception("数据维护任务失败")
 
 
+def _job_related_calibration():
+    """相关推荐每日校准：重算 computed_at 过期 / 覆盖率不满的源站（预算内）。"""
+    from . import related
+
+    if pause.is_paused("incremental"):
+        log.info("相关推荐校准已跳过: 增量同步处于暂停状态")
+        return
+    try:
+        related.daily_calibration()
+    except Exception:
+        log.exception("相关推荐每日校准失败")
+
+
+def _job_field_backfill():
+    """
+    存量字段回填（v1.9.0）：升级前已同步的库，演员/地区/年代列是空的。
+    每晚凌晨对「还有字段缺失」的源站按小站优先重跑全量（UPSERT 幂等，只补字段）。
+    """
+    from sqlalchemy import func, select
+
+    from . import syncer
+    from .models import build_vod_table, sources
+
+    slugs_done = []
+    with database.engine.connect() as conn:
+        rows = conn.execute(
+            select(sources.c.slug, sources.c.total_videos)
+            .where(sources.c.enabled == 1, sources.c.total_videos > 0)
+            .order_by(sources.c.total_videos)          # 小站优先，快速见成效
+        ).all()
+    for slug, _tv in rows:
+        if len(slugs_done) >= config.FIELD_BACKFILL_SOURCES_PER_NIGHT:
+            break
+        table = build_vod_table(slug)
+        if not database.table_exists(table.name):
+            continue
+        try:
+            with database.engine.connect() as conn:
+                missing = conn.execute(
+                    select(func.count())
+                    .select_from(table)
+                    .where(table.c.vod_year == "")     # 有年代数据的行 = 已被回填过
+                ).scalar() or 0
+        except Exception:
+            continue
+        if missing == 0:
+            continue
+        log.info("[字段回填] %s 仍有 %d 行缺少推荐信号字段，开始全量回填", slug, missing)
+        slugs_done.append(slug)
+        try:
+            syncer.sync_source(slug, mode="full")
+        except Exception:
+            log.exception("[字段回填] %s 全量回填失败（明晚继续）", slug)
+    if slugs_done:
+        log.info("[字段回填] 今晚完成: %s", ",".join(slugs_done))
+
+
 def start_scheduler():
     global _scheduler
     if _scheduler is not None:
@@ -80,13 +137,36 @@ def start_scheduler():
             max_instances=1,
             coalesce=True,
         )
+    if config.RELATED_ENABLED:
+        _scheduler.add_job(
+            _job_related_calibration,
+            "cron",
+            hour=max(0, min(23, config.RELATED_CALIBRATION_HOUR)),
+            minute=max(0, min(59, config.RELATED_CALIBRATION_MINUTE)),
+            id="related_calibration",
+            max_instances=1,
+            coalesce=True,
+        )
+    if config.RELATED_ENABLED and config.FIELD_BACKFILL_ENABLED:
+        _scheduler.add_job(
+            _job_field_backfill,
+            "cron",
+            hour=max(0, min(23, config.FIELD_BACKFILL_START_HOUR)),
+            minute=0,
+            id="field_backfill",
+            max_instances=1,
+            coalesce=True,
+        )
     _scheduler.start()
     log.info(
-        "调度器已启动: 源站刷新每 %d 分钟, 增量同步每 %d 分钟%s",
+        "调度器已启动: 源站刷新每 %d 分钟, 增量同步每 %d 分钟%s%s",
         config.SOURCE_REFRESH_INTERVAL_MINUTES,
         config.SYNC_INTERVAL_MINUTES,
         f", 数据维护每 {config.HOUSEKEEPING_INTERVAL_MINUTES} 分钟"
         if config.HOUSEKEEPING_ENABLED else "",
+        f", 相关推荐校准每天 {config.RELATED_CALIBRATION_HOUR:02d}:{config.RELATED_CALIBRATION_MINUTE:02d}"
+        f", 字段回填每天 {config.FIELD_BACKFILL_START_HOUR:02d}:00"
+        if config.RELATED_ENABLED and config.FIELD_BACKFILL_ENABLED else "",
     )
     return _scheduler
 

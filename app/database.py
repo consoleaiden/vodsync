@@ -161,6 +161,34 @@ def _migrate():
             conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
         log.info("数据库迁移: %s.%s 已添加", table, column)
 
+    # ---- v1.9.0：为所有已存在的 vod_{slug} 表补相关推荐信号字段 ----
+    # 建表模板（models.build_vod_table）已含这些列，但存量库的几十张表是老模板
+    # 建的，必须逐表 ALTER。新列全部带 DEFAULT ''，立即生效、不锁表（PG 走
+    # 快速 ADD COLUMN）。注意：必须先跑迁移再让业务代码 build_vod_table()，
+    # 否则缓存的 Table 对象和真实表结构不一致。
+    vod_extra = [
+        ("vod_actor", "VARCHAR(512) DEFAULT ''"),
+        ("vod_director", "VARCHAR(255) DEFAULT ''"),
+        ("vod_writer", "VARCHAR(255) DEFAULT ''"),
+        ("vod_area", "VARCHAR(64) DEFAULT ''"),
+        ("vod_year", "VARCHAR(16) DEFAULT ''"),
+        ("vod_tag", "VARCHAR(255) DEFAULT ''"),
+    ]
+    for tname in sorted(existing_tables):
+        if not tname.startswith("vod_") or tname == "vod_related":
+            continue
+        cols = {c["name"] for c in insp.get_columns(tname)}
+        missing = [(c, ddl) for c, ddl in vod_extra if c not in cols]
+        if not missing:
+            continue
+        with write_txn() as conn:
+            for column, ddl in missing:
+                conn.execute(text(f"ALTER TABLE {tname} ADD COLUMN {column} {ddl}"))
+        log.info(
+            "数据库迁移: %s 已补推荐信号字段 %s",
+            tname, ",".join(c for c, _ in missing),
+        )
+
 
 def table_exists(name: str) -> bool:
     if _is_sqlite:

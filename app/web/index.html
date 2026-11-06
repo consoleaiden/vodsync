@@ -934,6 +934,22 @@ function openSettings() {
       <div><button class="primary" id="btnPw">保存新密码</button></div>
     </div>
 
+    <hr style="border:none;border-top:1px solid var(--line);margin:16px 0">
+    <div style="font-weight:600;font-size:13px;margin-bottom:4px">明星词库（相关推荐增强信号）</div>
+    <div style="color:var(--muted);font-size:12px;line-height:1.75;margin-bottom:8px">
+      词库中的主演名会用来扫描<b>缺失演员信息</b>视频的标题与简介：标题命中且字段稀少 → 强信号（不打折）；
+      仅简介命中 → 弱信号（降权）。支持批量粘贴：JSON 数组、带引号片段（"名字",）、逗号/顿号/竖线/换行分隔。
+      修改后点「重算推荐」生效（每日校准也会兜底）。
+    </div>
+    <textarea id="starInput" rows="3" placeholder='例如：["最美宝儿", "困困狗", "魔鬼爱", "小巨",]  或  张三，李四|王五（每行一个也可以）'
+              style="${INPUT_CSS};font-size:12px;resize:vertical"></textarea>
+    <div style="display:flex;gap:8px;margin-top:6px;align-items:center">
+      <button class="primary sm" id="btnStarAdd">批量添加</button>
+      <button class="sm" id="btnStarRecompute">重算推荐</button>
+      <span class="badge ok" id="starCount">-</span>
+    </div>
+    <div id="starList" style="max-height:170px;overflow:auto;margin-top:8px;border:1px solid var(--line);border-radius:8px"></div>
+
     <div style="margin-top:18px;text-align:right"><button data-close>关闭</button></div>
   </div>`;
   document.body.appendChild(mask);
@@ -1010,6 +1026,85 @@ function openSettings() {
       toast(e.message, true);
     }
   });
+
+  // ---------------- 明星词库管理 ----------------
+  const starListEl = q("#starList");
+  const starCountEl = q("#starCount");
+
+  async function loadStarTerms() {
+    try {
+      const r = await api("/api/v1/star-terms");
+      starCountEl.textContent = `生效 ${r.active || 0} 条`;
+      const rows = (r.list || []).map((t) => `
+        <div style="display:flex;align-items:center;gap:6px;padding:5px 8px;border-bottom:1px solid var(--line);font-size:12px">
+          <span class="badge ${t.enabled ? "ok" : "mute"}">${t.enabled ? "启用" : "停用"}</span>
+          <span style="font-weight:600">${esc(t.term)}</span>
+          <span style="color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.note || "")}</span>
+          <button class="sm" data-star-toggle="${t.id}" data-en="${t.enabled ? 1 : 0}">${t.enabled ? "停用" : "启用"}</button>
+          <button class="sm" data-star-edit="${t.id}" data-term="${esc(t.term)}" data-note="${esc(t.note || "")}">改名</button>
+          <button class="sm warn" data-star-del="${t.id}">删除</button>
+        </div>`).join("");
+      starListEl.innerHTML = rows ||
+        '<div style="padding:10px;color:var(--muted);font-size:12px">词库为空：粘贴名字后点「批量添加」</div>';
+    } catch (e) {
+      starListEl.innerHTML = `<div style="padding:10px;color:var(--muted);font-size:12px">加载失败：${esc(e.message)}</div>`;
+    }
+  }
+
+  starListEl.addEventListener("click", async (ev) => {
+    const b = ev.target.closest("button");
+    if (!b) return;
+    try {
+      if (b.dataset.starToggle !== undefined) {
+        await api(`/api/v1/star-terms/${b.dataset.starToggle}`, {
+          method: "PATCH", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: b.dataset.en !== "1" }),
+        });
+        toast("已更新（点「重算推荐」生效）");
+      } else if (b.dataset.starEdit) {
+        const name = prompt("修改演员名：", b.dataset.term);
+        if (name === null) return;
+        const note = prompt("备注（可留空）：", b.dataset.note);
+        await api(`/api/v1/star-terms/${b.dataset.starEdit}`, {
+          method: "PATCH", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ term: name, note: note || "" }),
+        });
+        toast("已保存（点「重算推荐」生效）");
+      } else if (b.dataset.starDel !== undefined) {
+        if (!confirm("确认删除该词条？")) return;
+        await api(`/api/v1/star-terms/${b.dataset.starDel}`, { method: "DELETE" });
+        toast("已删除（点「重算推荐」生效）");
+      }
+      await loadStarTerms();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  q("#btnStarAdd").addEventListener("click", async () => {
+    const text = q("#starInput").value.trim();
+    if (!text) return toast("请先粘贴词条", true);
+    try {
+      const r = await _jsonPost("/api/v1/star-terms", { terms: text });
+      q("#starInput").value = "";
+      toast(r.msg || "已添加");
+      await loadStarTerms();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  q("#btnStarRecompute").addEventListener("click", async () => {
+    if (!confirm("对全部源站重算相关推荐？数据量大时需要一段时间（后台执行）。")) return;
+    try {
+      const r = await _jsonPost("/api/v1/star-terms/recompute", {});
+      toast(r.msg || "重算已受理");
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  loadStarTerms();
 }
 
 $("#btnSettings").addEventListener("click", openSettings);

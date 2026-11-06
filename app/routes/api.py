@@ -6,7 +6,9 @@
    —— 输出结构与 MacCMS 采集接口一致，方便现有播放器/采集器直接对接
 3. 管理接口：源站列表、手动触发同步、查看同步日志
 """
+import json
 import logging
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1191,15 +1193,24 @@ def video_list(
 
 @router.get("/api/v1/videos/{slug}/{vod_id}")
 def video_detail(slug: str, vod_id: int):
-    """视频详情（含结构化播放地址列表）。"""
-    _src, table = _require_table(slug)
+    """视频详情（含结构化播放地址列表）。RELATED_IN_DETAIL=true 时附带 related 推荐数组。"""
+    src, table = _require_table(slug)
     with database.engine.connect() as conn:
         row = conn.execute(
             select(table).where(table.c.vod_id == vod_id)
         ).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="视频不存在")
-    return {"code": 1, "detail": _detail_item(slug, row)}
+    detail = _detail_item(slug, row)
+    if config.RELATED_IN_DETAIL:
+        try:
+            cards, fallback = _related_cards(slug, src["name"], vod_id,
+                                             config.RELATED_LIMIT_DEFAULT, table)
+            detail["related"] = cards
+            detail["related_fallback"] = fallback
+        except Exception as e:  # 推荐挂了不能连累详情
+            log.warning("[%s] 详情附带推荐失败（忽略）: %s", slug, e)
+    return {"code": 1, "detail": detail}
 
 
 # ---------------------------------------------------------------------------
@@ -1339,6 +1350,296 @@ def aggregate_search(
 
 
 # ---------------------------------------------------------------------------
+# 相关推荐（v1.9.0，服务端预计算）
+#
+# 读路径只有两次查询：vod_related 主键查一次 + vod_{slug} IN 补卡片字段，
+# P95 < 50ms。预计算结果缺失（新视频还没被重算覆盖）时退化为实时兜底查询，
+# 保证任何详情页的推荐栏都不为空。
+# ---------------------------------------------------------------------------
+def _related_cards(slug: str, source_name: str, vod_id: int, limit: int, table) -> tuple:
+    from .. import related
+
+    entries, fallback = related.get_related_entries(slug, vod_id, limit, table)
+    cards = related.enrich_cards(slug, source_name, entries, table)
+    return cards, fallback
+
+
+@router.get("/api/v1/related")
+def related_videos(
+    slug: str = Query(..., description="源站 slug"),
+    id: int = Query(..., ge=1, description="视频 vod_id"),
+    limit: int = Query(config.RELATED_LIMIT_DEFAULT, ge=1, le=config.RELATED_LIMIT_MAX,
+                       description=f"推荐条数（1~{config.RELATED_LIMIT_MAX}）"),
+):
+    """
+    视频相关推荐（预计算结果直读，P95 < 50ms）。
+
+    返回 {code, slug, vod_id, fallback, computed_at, list}：
+      - list 为对齐视频卡片结构的数组（含 source/source_name/score），
+        source 用于客户端跨站点击跳转
+      - fallback=true 表示该条目来自兜底链（同分类/同地区年代/最新收录），
+        客户端可按需弱化展示；列表永远非空（只要该视频本身存在）
+      - 视频不存在返回 404 标准错误结构
+    """
+    src, table = _require_table(slug)
+    with database.engine.connect() as conn:
+        exists = conn.execute(
+            select(table.c.vod_id).where(table.c.vod_id == id)
+        ).first()
+    if not exists:
+        raise HTTPException(status_code=404, detail=f"视频不存在: {slug}/{id}")
+    from .. import related
+
+    entries, fallback = related.get_related_entries(slug, id, limit, table)
+    cards = related.enrich_cards(slug, src["name"], entries, table)
+    computed_at = None
+    if not fallback:
+        with database.engine.connect() as conn:
+            row = conn.execute(
+                select(related.vod_related.c.computed_at).where(
+                    related.vod_related.c.slug == slug, related.vod_related.c.vod_id == id
+                )
+            ).first()
+            computed_at = row[0].isoformat() if row and row[0] else None
+    return {
+        "code": 1,
+        "slug": slug,
+        "vod_id": id,
+        "limit": limit,
+        "fallback": fallback,
+        "computed_at": computed_at,
+        "algo_version": config.RELATED_ALGO_VERSION,
+        "list": cards,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 明星词库（v1.9.0 可选增强）：面板设置页维护的主演名单。
+# 词库中的名字会扫描「缺失演员信息」视频的标题与简介，命中即推断为演员信号
+# 参与相关推荐匹配（标题命中且字段稀疏=强信号不打折；仅简介命中=弱信号降权）。
+# ---------------------------------------------------------------------------
+
+
+def _normalize_star_term(raw: str) -> str:
+    t = (raw or "").strip()[:64]
+    return t
+
+
+# 分隔符：半角/全角逗号、顿号、竖线、换行、制表符
+_STAR_SPLIT_RE = re.compile(r"[,，、|\n\r\t]+")
+
+
+def _parse_star_terms_input(raw) -> list:
+    """
+    批量词条解析（自动识别格式，用户怎么粘都行）：
+      1. 标准 JSON 数组        ["a","b",] / ["a", "b"]
+      2. JSON 数组片段（无括号） "最美宝儿",\n"困困狗",\n"魔鬼爱",
+      3. 带引号的混合串        "a", 'b', "c"
+      4. 纯分隔符串            a，b、c|d e / 每行一个
+    带引号时优先按引号提取（引号内的分隔符不属于词条）；否则按分隔符切。
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        raw = "\n".join(str(x) for x in raw)
+    s = str(raw).strip()
+    if not s:
+        return []
+    # 1) 标准 JSON 数组
+    if s.startswith("["):
+        try:
+            data = json.loads(s)
+            if isinstance(data, list):
+                return [_normalize_star_term(str(x)) for x in data
+                        if _normalize_star_term(str(x))]
+        except (ValueError, TypeError):
+            pass   # 不是合法 JSON，走下面的容错解析
+    # 2/3) 含引号：优先提取引号片段（JSON 片段、带引号逗号串都能吃下）
+    if '"' in s or "'" in s:
+        quoted = re.findall(r"""["']([^"'\n]{1,64}?)["']""", s)
+        out = []
+        for x in quoted:
+            t = _normalize_star_term(x)
+            if t:
+                out.append(t)
+        if out:
+            return out
+    # 4) 纯分隔符串
+    out = []
+    for piece in _STAR_SPLIT_RE.split(s):
+        t = _normalize_star_term(piece)
+        if t:
+            out.append(t)
+    return out
+
+
+@router.get("/api/v1/star-terms")
+def star_terms_list():
+    """词库清单（含停用条目，便于面板管理）。"""
+    from ..models import star_terms
+
+    with database.engine.connect() as conn:
+        rows = conn.execute(
+            select(star_terms).order_by(star_terms.c.id.desc())
+        ).mappings().all()
+    from .. import related
+
+    return {
+        "code": 1,
+        "infer_mode": config.RELATED_STAR_INFER_MODE,
+        "factor": config.RELATED_STAR_SIM_FACTOR,
+        "active": related.reload_star_terms(),
+        "list": [
+            {
+                "id": r["id"], "term": r["term"], "note": r["note"] or "",
+                "enabled": bool(r["enabled"]),
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.post("/api/v1/star-terms")
+def star_terms_add(payload: dict):
+    """
+    批量添加词条。输入格式自动识别：
+      JSON 数组 / 带引号的 JSON 片段（"名字", 一行一个）/
+      逗号、全角逗号、顿号、竖线、换行分隔的纯文本 —— 一次粘贴大量名字即可。
+    已存在的名字自动跳过（幂等）。返回 (added, skipped)。
+    """
+    from ..models import star_terms
+
+    from .. import related
+
+    terms = _parse_star_terms_input((payload or {}).get("terms"))
+    note = str((payload or {}).get("note") or "")[:255]
+    # 同一批内去重，保持顺序
+    seen, ordered = set(), []
+    for t in terms:
+        if t not in seen:
+            seen.add(t)
+            ordered.append(t)
+    if not ordered:
+        raise HTTPException(status_code=400, detail="没有可添加的词条")
+    added, skipped = 0, 0
+    with database.write_txn() as conn:
+        for t in ordered:
+            try:
+                conn.execute(star_terms.insert().values(term=t, note=note, enabled=1))
+                added += 1
+            except Exception:
+                skipped += 1   # 唯一键冲突 = 已存在
+    related.reload_star_terms()
+    return {
+        "code": 1,
+        "added": added,
+        "skipped": skipped,
+        "active": related.reload_star_terms(),
+        "msg": f"已添加 {added} 个词条（跳过已存在 {skipped} 个）"
+               "。需要点「重算推荐」或等每日校准后生效",
+    }
+
+
+@router.patch("/api/v1/star-terms/{term_id}")
+def star_terms_update(term_id: int, payload: dict):
+    """修改词条（名字/备注/启停）。"""
+    from ..models import star_terms
+
+    from .. import related
+
+    fields = payload or {}
+    changes: dict = {}
+    if fields.get("term") is not None:
+        t = _normalize_star_term(str(fields["term"]))
+        if not t:
+            raise HTTPException(status_code=400, detail="词条不能为空")
+        changes["term"] = t
+    if fields.get("note") is not None:
+        changes["note"] = str(fields["note"])[:255]
+    if fields.get("enabled") is not None:
+        changes["enabled"] = 1 if fields["enabled"] else 0
+    if not changes:
+        raise HTTPException(status_code=400, detail="没有需要修改的字段")
+    with database.write_txn() as conn:
+        res = conn.execute(
+            star_terms.update().where(star_terms.c.id == term_id).values(**changes)
+        )
+        if not (res.rowcount or 0):
+            raise HTTPException(status_code=404, detail=f"词条不存在: {term_id}")
+    related.reload_star_terms()
+    return {"code": 1, "updated": sorted(changes), "active": related.reload_star_terms()}
+
+
+@router.delete("/api/v1/star-terms/{term_id}")
+def star_terms_delete(term_id: int):
+    """删除词条。"""
+    from ..models import star_terms
+
+    from .. import related
+
+    with database.write_txn() as conn:
+        res = conn.execute(star_terms.delete().where(star_terms.c.id == term_id))
+        if not (res.rowcount or 0):
+            raise HTTPException(status_code=404, detail=f"词条不存在: {term_id}")
+    related.reload_star_terms()
+    return {"code": 1, "deleted": term_id, "active": related.reload_star_terms()}
+
+
+@router.post("/api/v1/star-terms/recompute")
+def star_terms_recompute():
+    """词库变更后重算全部源站的相关推荐（后台执行，串行避免抢 IO）。"""
+    from .. import related
+
+    with database.engine.connect() as conn:
+        targets = [r[0] for r in conn.execute(
+            select(sources.c.slug).where(sources.c.enabled == 1, sources.c.total_videos > 0)
+        ).all()]
+
+    def _worker():
+        for s in targets:
+            related.recompute_source_safe(s, reason="star_terms_changed")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return {"code": 1, "targets": targets, "msg": f"重算已受理: {len(targets)} 个源站"}
+
+
+@router.get("/api/v1/related/status")
+def related_status():
+    """各源站相关推荐覆盖率（管理/验收核对：videos / computed / coverage%）。"""
+    from .. import related
+
+    return {"code": 1, "algo_version": config.RELATED_ALGO_VERSION, "list": related.coverage_all()}
+
+
+@router.post("/api/v1/maintenance/related-recompute")
+def related_recompute(
+    slug: str = Query("all", description="源站 slug；all=全部启用源站"),
+):
+    """手动触发相关推荐重算（后台执行）。算法调参后先用它验证，再考虑改 RELATED_ALGO_VERSION。"""
+    from .. import related
+
+    if slug and slug != "all":
+        slug = validate_slug(slug)
+        _require_table(slug)
+        targets = [slug]
+    else:
+        with database.engine.connect() as conn:
+            targets = [r[0] for r in conn.execute(
+                select(sources.c.slug).where(
+                    sources.c.enabled == 1, sources.c.total_videos > 0
+                )
+            ).all()]
+
+    def _worker():
+        for s in targets:
+            related.recompute_source_safe(s, reason="manual_recompute")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return {"code": 1, "targets": targets, "msg": f"相关推荐重算已受理: {len(targets)} 个源站"}
+
+
+# ---------------------------------------------------------------------------
 # 苹果 CMS 兼容接口：/api/v1/{slug}?ac=list|detail
 # ---------------------------------------------------------------------------
 @router.get("/api/v1/{slug}")
@@ -1375,19 +1676,28 @@ def maccms_compat(
                        table.c.content, table.c.play_url)
                 .where(table.c.vod_id.in_(id_list))
             ).mappings().all()
+            items = []
+            for r in rows:
+                item = {
+                    "vod_id": r["vod_id"], "type_id": r["type_id"], "type_name": r["type_name"],
+                    "vod_name": r["name"], "vod_pic": r["pic"], "vod_remarks": r["remarks"],
+                    "vod_time": r["vod_time"], "vod_content": r["content"],
+                    "vod_play_url": r["play_url"], "vod_play_from": "vodsync",
+                    "vod_play_list": parse_play_url(r["play_url"]),
+                }
+                if config.RELATED_IN_DETAIL:
+                    try:
+                        cards, fb = _related_cards(slug, src["name"], r["vod_id"],
+                                                   config.RELATED_LIMIT_DEFAULT, table)
+                        item["vod_related"] = cards
+                        item["vod_related_fallback"] = fb
+                    except Exception as e:  # 推荐挂了不能连累采集端详情
+                        log.warning("[%s] ac=detail 附带推荐失败（忽略）: %s", slug, e)
+                items.append(item)
             return {
                 "code": 1, "page": 1, "pagecount": 1, "limit": page_size,
-                "total": len(rows), "class": class_list,
-                "list": [
-                    {
-                        "vod_id": r["vod_id"], "type_id": r["type_id"], "type_name": r["type_name"],
-                        "vod_name": r["name"], "vod_pic": r["pic"], "vod_remarks": r["remarks"],
-                        "vod_time": r["vod_time"], "vod_content": r["content"],
-                        "vod_play_url": r["play_url"], "vod_play_from": "vodsync",
-                        "vod_play_list": parse_play_url(r["play_url"]),
-                    }
-                    for r in rows
-                ],
+                "total": len(items), "class": class_list,
+                "list": items,
             }
 
         detail = ac == "detail"

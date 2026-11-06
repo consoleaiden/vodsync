@@ -14,6 +14,7 @@
 import json
 import logging
 import random
+import re
 import threading
 import time
 import urllib.parse
@@ -24,6 +25,56 @@ import httpx
 from . import config
 
 log = logging.getLogger("vodsync.maccms")
+
+
+# ---------------------------------------------------------------------------
+# 占位值清洗（v1.9.0，相关推荐前置）
+#
+# 苹果 CMS 源站里大量「演员=内详」「导演=未知」「地区=暂无」这类占位值。
+# 不清洗的话，几百部片共享同一个假演员「内详」，相关推荐会出现成片成片的虚假命中。
+# 这里在**抓取入库时**就清成空串；清洗表可在环境变量里扩展（RELATED_PLACEHOLDERS）。
+# ---------------------------------------------------------------------------
+_PLACEHOLDER_DEFAULTS = "内详,未知,暂无,暂缺,不详,不详,无,待定,待补,更多,点击查看,角色介绍,n/a,na,tba,none,null,-,—,/,0"
+
+
+def _placeholder_set() -> set:
+    raw = getattr(config, "RELATED_PLACEHOLDERS", "") or _PLACEHOLDER_DEFAULTS
+    return {x.strip().lower() for x in raw.split(",") if x.strip()}
+
+
+_PLACEHOLDERS = None   # 惰性初始化（读环境变量配置）
+
+
+def _is_placeholder(value: str) -> bool:
+    global _PLACEHOLDERS
+    if _PLACEHOLDERS is None:
+        _PLACEHOLDERS = _placeholder_set()
+    return value.strip().lower() in _PLACEHOLDERS
+
+
+def _split_persons(raw: str) -> list:
+    """演职员串拆分：兼容 逗号/顿号/斜杠/$/换行 分隔（各源站写法不一）。"""
+    return [p for p in re.split(r"[,，、/\\\$\r\n]+", raw or "") if p.strip()]
+
+
+def clean_person_field(raw: str, max_chars: int = 500) -> str:
+    """演职员字段清洗：拆分 → 去占位值 → 去重 → 逗号重组。"""
+    if not raw:
+        return ""
+    seen, keep = set(), []
+    for p in _split_persons(raw):
+        p = p.strip()
+        if not p or _is_placeholder(p) or p in seen:
+            continue
+        seen.add(p)
+        keep.append(p)
+    return ",".join(keep)[:max_chars]
+
+
+def clean_scalar(raw: str, max_chars: int = 64) -> str:
+    """标量字段（地区/年代）清洗：去空白；占位值存空串。"""
+    v = (raw or "").strip()
+    return "" if _is_placeholder(v) else v[:max_chars]
 
 
 class MacCmsError(Exception):
@@ -282,5 +333,12 @@ class MacCmsClient:
             "remarks": (item.get("vod_remarks") or "").strip()[:120],
             "content": (item.get("vod_content") or "").strip(),
             "play_url": (item.get("vod_play_url") or "").strip(),
+            # ---- 相关推荐信号字段（v1.9.0）：入库前清洗占位值 ----
+            "vod_actor": clean_person_field(item.get("vod_actor") or "", 500),
+            "vod_director": clean_person_field(item.get("vod_director") or "", 250),
+            "vod_writer": clean_person_field(item.get("vod_writer") or "", 250),
+            "vod_area": clean_scalar(item.get("vod_area"), 60),
+            "vod_year": clean_scalar(str(item.get("vod_year") or ""), 15),
+            "vod_tag": clean_person_field(item.get("vod_tag") or "", 250),
             "vod_time": (item.get("vod_time") or "").strip()[:19],
         }

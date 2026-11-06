@@ -387,6 +387,7 @@ def update_custom_source(slug: str, **fields) -> dict:
         if database.table_exists(table.name):
             with database.write_txn() as conn:
                 conn.execute(table.delete())
+        delete_related_rows(slug)
         log.info("源站 %s 的 API 地址已变更，历史数据已清空", slug)
 
     return {"slug": slug, "updated": sorted(changes), "data_reset": reset_data}
@@ -414,6 +415,7 @@ def delete_custom_source(slug: str, drop_table: bool = True) -> dict:
         table = build_vod_table(slug)
         table.drop(database.engine, checkfirst=True)
         forget_vod_table(slug)
+    delete_related_rows(slug)
     log.info("自定义源站已删除: %s（数据表%s）", slug, "已删除" if drop_table else "保留")
     return {"slug": slug, "dropped": bool(drop_table)}
 
@@ -482,7 +484,13 @@ def set_auto_sync_bulk(enabled: bool, slugs: list = None) -> int:
 # ---------------------------------------------------------------------------
 # 批量 UPSERT（PostgreSQL 的 ON CONFLICT；测试后端 SQLite 同语法）
 # ---------------------------------------------------------------------------
-_UPSERT_COLS = ["vod_id", "type_id", "type_name", "name", "pic", "remarks", "content", "play_url", "vod_time"]
+_UPSERT_COLS = [
+    "vod_id", "type_id", "type_name", "name", "pic", "remarks",
+    "content", "play_url",
+    # 相关推荐信号字段（v1.9.0）：重跑全量回填时能把老行补上这些列
+    "vod_actor", "vod_director", "vod_writer", "vod_area", "vod_year", "vod_tag",
+    "vod_time",
+]
 
 
 def upsert_batch(slug: str, rows: list) -> tuple:
@@ -515,6 +523,12 @@ def upsert_batch(slug: str, rows: list) -> tuple:
                 remarks=bindparam("remarks"),
                 content=bindparam("content"),
                 play_url=bindparam("play_url"),
+                vod_actor=bindparam("vod_actor"),
+                vod_director=bindparam("vod_director"),
+                vod_writer=bindparam("vod_writer"),
+                vod_area=bindparam("vod_area"),
+                vod_year=bindparam("vod_year"),
+                vod_tag=bindparam("vod_tag"),
                 vod_time=bindparam("vod_time"),
             )
         )
@@ -524,6 +538,30 @@ def upsert_batch(slug: str, rows: list) -> tuple:
         conn.execute(stmt, rows)
     inserted = sum(1 for i in ids if i not in existing)
     return inserted, len(ids) - inserted
+
+
+def _note_touched(stats: dict, rows: list):
+    """
+    记录本轮真正写进库的 vod_id（相关推荐增量重算的依据）。
+    上限 RELATED_TOUCHED_CAP：全量同步本来就触发整站重算，不依赖这份清单。
+    """
+    if not rows:
+        return
+    t = stats.setdefault("touched", [])
+    cap = max(0, config.RELATED_TOUCHED_CAP - len(t))
+    if cap:
+        t.extend(r["vod_id"] for r in rows[:cap])
+
+
+def delete_related_rows(slug: str):
+    """删除某源站的全部推荐结果（删源站/清数据时调用；表不存在则跳过）。"""
+    from .models import vod_related
+
+    try:
+        with database.write_txn() as conn:
+            conn.execute(vod_related.delete().where(vod_related.c.slug == slug))
+    except Exception as e:
+        log.warning("[%s] 清理推荐结果失败（忽略）: %s", slug, e)
 
 
 def fetch_class_map(payload: dict, class_map: dict) -> dict:
@@ -615,6 +653,7 @@ def full_sync(slug: str, client: MacCmsClient) -> dict:
             results.sort(key=lambda x: x["page"])
             for res in results:
                 ins, upd = upsert_batch(slug, res["rows"])
+                _note_touched(stats, res["rows"])
                 stats["fetched"] += len(res["rows"])
                 stats["inserted"] += ins
                 stats["updated"] += upd
@@ -958,6 +997,7 @@ def incremental_sync(slug: str, client: MacCmsClient) -> dict:
             if row and row["vod_id"] in chunk_ids:
                 rows.append(row)
         ins, upd = upsert_batch(slug, rows)
+        _note_touched(stats, rows)
         stats["inserted"] += ins
         stats["updated"] += upd
         written_times.extend(r["vod_time"] for r in rows if r.get("vod_time"))
@@ -1182,6 +1222,7 @@ def sync_source(slug: str, mode: str = "auto") -> dict:
                     status = "success"
                 _finish_log(log_id, status, stats)
                 _apply_health(slug, status, stats)
+                _kick_related(slug, mode, stats)
                 return {"slug": slug, "mode": mode, "status": status, **stats}
             except Exception as e:
                 log.exception("[%s] 同步失败", slug)
@@ -1273,6 +1314,44 @@ def sync_all(force_mode: str = "auto") -> list:
     log.info("同步结束: 成功 %d（其中不完整 %d）/ 失败 %d",
              ok, partial, len(results) - ok)
     return results
+
+
+def _kick_related(slug: str, mode: str, stats: dict):
+    """
+    同步结束后触发相关推荐重算（后台线程，绝不阻塞/影响同步结果本身）。
+      - full   ：数据基本全变了，直接整站重算
+      - 增量   ：只重算本轮 touched 的视频（其旧推荐结果里引用它们的条目，
+                 引用按 id 存储、卡片读取时实时补齐，无需连带重算）
+    """
+    if not config.RELATED_ENABLED:
+        return
+    if mode == "full":
+        threading.Thread(target=_related_full_worker, args=(slug,), daemon=True).start()
+        return
+    touched = stats.get("touched") or []
+    if touched:
+        threading.Thread(
+            target=_related_ids_worker, args=(slug, list(dict.fromkeys(touched))),
+            daemon=True,
+        ).start()
+
+
+def _related_full_worker(slug: str):
+    from . import related
+
+    try:
+        related.recompute_source_safe(slug, reason="after_full_sync")
+    except Exception:
+        log.exception("[%s] 相关推荐整站重算失败（忽略）", slug)
+
+
+def _related_ids_worker(slug: str, ids: list):
+    from . import related
+
+    try:
+        related.recompute_ids_safe(slug, ids, reason="after_incremental")
+    except Exception:
+        log.exception("[%s] 相关推荐增量重算失败（忽略）", slug)
 
 
 def _start_log(slug: str, mode: str) -> int:

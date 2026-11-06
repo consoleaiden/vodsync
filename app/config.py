@@ -199,3 +199,96 @@ LOGIN_LOCK_MINUTES = int(os.environ.get("LOGIN_LOCK_MINUTES", "5"))
 # 只有确实部署在 Nginx / Traefik / 群晖反代之后（且反代会覆盖 XFF）才打开。
 # 打开后取 XFF 的**最后一跳**（信任的代理追加的那一段），而不是第一段。
 TRUST_PROXY = os.environ.get("TRUST_PROXY", "false").lower() == "true"
+
+# ---------------------------------------------------------------------------
+# 相关推荐（v1.9.0，服务端预计算）—— 全部可调参数集中在这里，改环境变量即可调优
+#
+# 数据现状：vod_tag/vod_class 基本缺失，演职员/地区/年代大量缺失，标题是唯一
+# 全量信号。算法按「缺失即权重重分配」设计：某视频只有 标题+演员+年代 可用时，
+# 权重自动归一为 标题/演员/年代 按原始占比摊分，字段越稀疏标题占比越高。
+# ---------------------------------------------------------------------------
+RELATED_ENABLED = os.environ.get("RELATED_ENABLED", "true").lower() == "true"
+# 算法版本：改了这个值，启动时会清空 vod_related 全表并触发全量重算
+RELATED_ALGO_VERSION = os.environ.get("RELATED_ALGO_VERSION", "1")
+# 推荐条数：默认与上限（客户端请求 limit 超过上限按上限截断）
+RELATED_LIMIT_DEFAULT = int(os.environ.get("RELATED_LIMIT_DEFAULT", "12"))
+RELATED_LIMIT_MAX = int(os.environ.get("RELATED_LIMIT_MAX", "20"))
+# 命中阈值：候选得分低于该值不进推荐列表；零命中时走兜底链（保证列表非空）
+RELATED_MIN_SCORE = float(os.environ.get("RELATED_MIN_SCORE", "0.15"))
+# 标题相似度双阈值（防两字短标题误伤）：LCS 公共子串 < 该字数 且 bigram Jaccard
+# < JACCARD 阈值时，标题项直接计 0
+RELATED_TITLE_LCS_MIN = int(os.environ.get("RELATED_TITLE_LCS_MIN", "3"))
+RELATED_TITLE_JACCARD_MIN = float(os.environ.get("RELATED_TITLE_JACCARD_MIN", "0.45"))
+# 倒排索引候选集上限：只对「与目标共享信号 token 最多的前 N 个候选」打分
+RELATED_CANDIDATE_CAP = int(os.environ.get("RELATED_CANDIDATE_CAP", "600"))
+# 表行数 <= 该值时跳过倒排索引直接全量两两比较（更精确，小表完全无压力）
+RELATED_BRUTE_FORCE_MAX = int(os.environ.get("RELATED_BRUTE_FORCE_MAX", "3000"))
+# 超大表的降级阈值：行数超过后只用 标题/分类/年代 计算并丢弃演职员存储（内存保护）
+RELATED_MAX_ROWS_PER_SOURCE = int(os.environ.get("RELATED_MAX_ROWS_PER_SOURCE", "200000"))
+# 重算时一次写入 vod_related 的批大小
+RELATED_WRITE_BATCH = int(os.environ.get("RELATED_WRITE_BATCH", "500"))
+# 每日校准：把 computed_at 超过 N 天的源站重算一遍（兜底/下架条目刷新）
+RELATED_CALIBRATION_DAYS = int(os.environ.get("RELATED_CALIBRATION_DAYS", "1"))
+RELATED_CALIBRATION_HOUR = int(os.environ.get("RELATED_CALIBRATION_HOUR", "4"))
+RELATED_CALIBRATION_MINUTE = int(os.environ.get("RELATED_CALIBRATION_MINUTE", "30"))
+# 每次校准最多重算多少个源站（夜里跑，别抢白天同步的 IO）
+RELATED_CALIBRATION_BUDGET = int(os.environ.get("RELATED_CALIBRATION_BUDGET", "3"))
+# 详情响应是否附带 related 数组（ac=detail 与 REST 详情接口，纯新增字段，老客户端无感）
+RELATED_IN_DETAIL = os.environ.get("RELATED_IN_DETAIL", "true").lower() == "true"
+# 增量同步收集的「受影响 ID」上限（超过截断，全量同步会走整站重算不依赖它）
+RELATED_TOUCHED_CAP = int(os.environ.get("RELATED_TOUCHED_CAP", "20000"))
+
+# 基础权重表（逗号分隔 key:value）。缺失字段自动把权重按比例摊给其余字段，
+# 所以这里配的是「字段齐全时的理想占比」，不需要为数据稀疏调整它。
+# 可用 key: class / actor / director / writer / area / year / title
+RELATED_WEIGHTS = os.environ.get(
+    "RELATED_WEIGHTS",
+    "class:0.30,actor:0.20,director:0.05,writer:0.05,area:0.10,year:0.10,title:0.20",
+)
+# 占位值表（逗号分隔，比较时忽略大小写）。演职员/地区/年代命中即视为缺失。
+RELATED_PLACEHOLDERS = os.environ.get(
+    "RELATED_PLACEHOLDERS",
+    "内详,未知,暂无,暂缺,不详,无,待定,待补,更多,点击查看,角色介绍,n/a,na,tba,none,null,-,—,/,0",
+)
+# 标题噪声剥离（逗号分隔的正则，逐条依次 sub）。别把「上/下/终章」这类序号写进来，
+# 它们由序号逻辑单独处理（保留但降权）。
+RELATED_NOISE_PATTERNS = os.environ.get(
+    "RELATED_NOISE_PATTERNS",
+    "[（(【\\[][^）)】\\]]{0,12}[）)】\\]],完整版|国语版|粤语版|国语|粤语|中字|双语| Thai |泰语|韩语|日语版,"
+    "抢先版|修正版|修复版|枪版|蓝光|超清|高清|标清|4k|1080p|720p|hd|bd|tc|ts|cam|"
+    "第\\s*\\d+\\s*季|第\\s*[一二三四五六七八九十]+\\s*季|season\\s*\\d+|s\\d{1,2}$|"
+    "第\\s*\\d+\\s*部|第\\s*[一二三四五六七八九十]+\\s*部|终章|完结篇|大结局|先行版|加长版",
+)
+# 年份差惩罚：候选与目标年份都已知且相差超过 N 年 → 标题分 ×0.6（翻拍/同名不同片）
+RELATED_YEAR_GAP_PENALTY_YEARS = int(os.environ.get("RELATED_YEAR_GAP_PENALTY_YEARS", "6"))
+RELATED_YEAR_GAP_FACTOR = float(os.environ.get("RELATED_YEAR_GAP_FACTOR", "0.6"))
+# 年代相邻得分：年份相等=1.0，相差 1 年=0.5（同系列续作），相差 >=2 计 0
+RELATED_YEAR_ADJACENT_SCORE = float(os.environ.get("RELATED_YEAR_ADJACENT_SCORE", "0.5"))
+# 序号（季/部/上下集）不一致时标题分乘的惩罚系数
+RELATED_ORDINAL_MISMATCH_FACTOR = float(os.environ.get("RELATED_ORDINAL_MISMATCH_FACTOR", "0.5"))
+
+# 明星词库（面板设置页可维护）：词库中的主演名会扫描缺失演员信息视频的
+# 标题与简介，命中即推断为演员信号参与匹配。
+#   off          关闭推断
+#   when_missing 只对 vod_actor 为空的视频推断（默认，不覆盖源站真实数据）
+#   always       真实演员与推断演员合并（谨慎使用，推断分带降权）
+# 推断强度分级（用户规则：标题提到主演 + 其它字段缺失/稀少 → 相关性非常高）：
+#   强推断 strong：命中出现在【标题】且该视频稀疏（area/year/type 非空数
+#                  <= RELATED_STAR_STRONG_MAX_FIELDS）→ 打分不打折（等价真实演员）
+#   弱推断 inf   ：仅简介命中，或标题命中但字段较齐全 → 打分乘 STAR_SIM_FACTOR
+RELATED_STAR_INFER_MODE = os.environ.get("RELATED_STAR_INFER_MODE", "when_missing")
+RELATED_STAR_STRONG_MAX_FIELDS = int(os.environ.get("RELATED_STAR_STRONG_MAX_FIELDS", "1"))
+# 推断演员参与的匹配，相似度乘以该系数（<1 表示弱信号；强推断不受此系数影响）
+RELATED_STAR_SIM_FACTOR = float(os.environ.get("RELATED_STAR_SIM_FACTOR", "0.7"))
+
+# ---------------------------------------------------------------------------
+# 存量字段回填（v1.9.0）
+#
+# 场景：升级前已全量同步的库，演员/地区/年代列全是空的（旧抓取逻辑没存）。
+# 方案：每晚凌晨对「还有字段缺失」的源站重跑一遍全量同步 —— UPSERT 幂等，
+# 只是把新字段补进去；按小站优先，每晚 N 个站，几个晚上自然补完。
+# 不着急的话也可以手动 POST /api/v1/sync/{slug}?mode=full 逐站补。
+# ---------------------------------------------------------------------------
+FIELD_BACKFILL_ENABLED = os.environ.get("FIELD_BACKFILL_ENABLED", "true").lower() == "true"
+FIELD_BACKFILL_SOURCES_PER_NIGHT = int(os.environ.get("FIELD_BACKFILL_SOURCES_PER_NIGHT", "2"))
+FIELD_BACKFILL_START_HOUR = int(os.environ.get("FIELD_BACKFILL_START_HOUR", "2"))

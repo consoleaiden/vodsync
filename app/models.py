@@ -109,6 +109,43 @@ sync_logs = Table(
 )
 
 # ---------------------------------------------------------------------------
+# 明星词库（v1.9.0 可选增强）
+#
+# 用户维护的主演名单：这些名字常出现在缺失演员字段视频的标题/简介里。
+# 预计算时扫描 标题+简介 命中词库 → 推断为演员信号（带降权系数，防「提及≠主演」误伤）。
+# 面板设置页提供增删改；修改后需触发推荐重算才生效（每日校准也会兜底）。
+# ---------------------------------------------------------------------------
+star_terms = Table(
+    "star_terms",
+    META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("term", String(64), nullable=False, unique=True),   # 演员名（去重）
+    Column("note", String(255), default=""),                   # 备注（可空）
+    Column("enabled", Integer, default=1, server_default="1"), # 停用后不参与推断
+    Column("created_at", DateTime, server_default=func.now()),
+)
+
+# ---------------------------------------------------------------------------
+# 相关推荐预计算表（v1.9.0）
+#
+# 每个源站独立计算；related_json 只存精简引用（vod_id + score + 兜底标记），
+# 卡片字段（封面/备注/分类）读取时按 id 实时补齐 —— 好处：
+#   1. JSON 最小，写入快（全量重算 220 万行也只写 id）；
+#   2. 封面/备注更新后推荐卡片自动跟着新，不会出现「推荐位上是旧图」；
+#   3. 推荐条目被源站下架时，读取时补齐查不到 → 自然从列表里消失，无需清理。
+# algo_version 用于算法升级：版本变了启动时清空旧结果，全量重算。
+# ---------------------------------------------------------------------------
+vod_related = Table(
+    "vod_related",
+    META,
+    Column("slug", String(64), primary_key=True),
+    Column("vod_id", Integer, primary_key=True),
+    Column("related_json", Text, default=""),
+    Column("computed_at", DateTime, server_default=func.now()),
+    Column("algo_version", String(16), default=""),
+)
+
+# ---------------------------------------------------------------------------
 # vod_{slug} 动态表缓存：避免重复构建 Table 对象
 # ---------------------------------------------------------------------------
 _vod_table_cache: dict = {}
@@ -145,6 +182,15 @@ def build_vod_table(slug: str) -> Table:
         Column("remarks", String(128), default=""),
         Column("content", Text, default=""),
         Column("play_url", Text, default=""),
+        # ---- 相关推荐信号字段（v1.9.0）----
+        # 抓取阶段已做占位词清洗（"内详"/"未知"/"暂无" 等存为空串）。
+        # 演职员以逗号分隔存储；老库通过 database._migrate() 自动补列。
+        Column("vod_actor", String(512), default=""),
+        Column("vod_director", String(255), default=""),
+        Column("vod_writer", String(255), default=""),
+        Column("vod_area", String(64), default=""),
+        Column("vod_year", String(16), default=""),
+        Column("vod_tag", String(255), default=""),
         Column("vod_time", String(32), default=""),
         Column("synced_at", DateTime, server_default=func.now()),
         UniqueConstraint("vod_id", name=f"uk_vod_{slug}"),

@@ -31,7 +31,7 @@ app = FastAPI(
         "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，"
         "并对外提供统一的视频列表/详情 API（source 参数区分源站）。"
     ),
-    version="1.8.1",
+    version="1.9.0",
 )
 
 app.include_router(router)
@@ -209,6 +209,17 @@ def _bootstrap():
                 log.exception("启动时数据维护失败（不影响服务）")
 
         start_scheduler()
+
+        # 相关推荐存量补齐（v1.9.0）：对覆盖率不满的源站逐站后台计算。
+        # 标题是唯一全量信号且权重自动重分配，所以**当天即可用**；
+        # 演员/地区/年代字段由夜间回填任务分批补上，推荐质量随之提升。
+        if config.RELATED_ENABLED:
+            try:
+                from . import related
+
+                related.startup_backfill()
+            except Exception:
+                log.exception("相关推荐启动补齐检查失败（不影响服务）")
 
         # 续跑上次没做完的全量同步（有断点的源站）。
         # 放在最后：先让服务能正常响应，再由这个线程按并发闸门慢慢跑。

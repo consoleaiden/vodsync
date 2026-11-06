@@ -3,7 +3,7 @@
 > **本文档的用途**：把 VodSync 服务作为后端，交由 AI（或 AI 编程助手）开发客户端 App。
 > 文档自包含：只读本文即可完成全部对接，**不需要**阅读服务端源码。
 >
-> 对应服务版本：**v1.5.0** ｜ 文档版本：`2026-10-31` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.9.0** ｜ 文档版本：`2026-11-06` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 **目录**
 
@@ -270,6 +270,12 @@ type PlayLine = {
 | 27 | POST | `/api/v1/auth/settings` | 鉴权 | 开关访问控制（开启时自动换 Token） |
 | 28 | GET | `/api/v1/auth/token` | 鉴权 | 读取当前 Token（需登录） |
 | 29 | POST | `/api/v1/auth/token` | 鉴权 | 重置 Token（旧 Token 立即失效） |
+| 30 | GET | `/api/v1/related` | 数据 | **相关推荐**（预计算直读，P95<50ms）v1.9.0 |
+| 31 | GET | `/api/v1/related/status` | 管理 | 各源站推荐覆盖率 v1.9.0 |
+| 32 | GET/POST | `/api/v1/star-terms` | 管理 | 明星词库查询/批量添加（面板用）v1.9.0 |
+| 33 | PATCH/DELETE | `/api/v1/star-terms/{id}` | 管理 | 词条改名/启停/删除（面板用）v1.9.0 |
+| 34 | POST | `/api/v1/star-terms/recompute` | 管理 | 词库变更后全量重算推荐（面板用）v1.9.0 |
+| 35 | POST | `/api/v1/maintenance/related-recompute` | 管理 | 手动重算指定/全部源站推荐 v1.9.0 |
 
 > 第 23–29 项是**管理面板自己用的**，客户端 App 只需要 Token（见 2.1），不必实现这些接口。
 > `/api/v1/auth/login` 与 `/api/v1/auth/state` 免鉴权，其余四项需要登录会话 cookie。
@@ -913,6 +919,65 @@ DELETE /api/v1/sources/myhd/custom?confirm=myhd&drop_table=true
 
 ---
 
+### 4.20 GET `/api/v1/related` — 相关推荐（v1.9.0）★详情页推荐栏
+
+```
+GET /api/v1/related?slug=jkun&id=134369
+GET /api/v1/related?slug=jkun&id=134369&limit=8
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `slug` | 必填 | 源站 slug |
+| `id` | 必填 | 视频 vod_id |
+| `limit` | `12` | 推荐条数（1~`RELATED_LIMIT_MAX`=20） |
+
+响应：
+
+```json
+{
+  "code": 1, "slug": "jkun", "vod_id": 134369, "limit": 12,
+  "fallback": false,
+  "computed_at": "2026-11-06T04:30:12",
+  "algo_version": "1",
+  "list": [
+    { "vod_id": 135001, "vod_name": "流浪地球2", "vod_pic": "https://...",
+      "vod_remarks": "HD国语", "type_name": "科幻片",
+      "source": "jkun", "source_name": "优质资源", "score": 0.88, "mode": "match" }
+  ]
+}
+```
+
+要点：
+
+- **直读预计算表 + 一次 IN 补卡片字段**，P95 < 50ms（实测 0.3ms）；预计算缺失时自动实时兜底
+- `fallback=true` 表示整条列表来自兜底链（同分类→同地区/年代→最新收录），客户端可弱化展示；
+  列表**永远非空**（只要视频本身存在）
+- `mode`: `match`=真实得分命中 / `fallback`=兜底条目；`source`/`source_name` 供跨站跳转
+- 视频不存在返回 `404` 标准错误结构（不 500）
+- REST 详情与 `?ac=detail&ids=` 响应附带 `related` / `related_fallback` 字段
+  （`RELATED_IN_DETAIL=true` 默认开启），客户端可省一次请求
+- 服务端在同步结束 / 每日校准 / 算法版本变更时自动重算，客户端无需关心
+
+---
+
+### 4.21 明星词库（v1.9.0，管理面板专用）
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| GET | `/api/v1/star-terms` | 词库清单 + `infer_mode`/`factor`/`active` 生效数 |
+| POST | `/api/v1/star-terms` | 批量添加。`{"terms": "..."}` **格式自动识别**：JSON 数组 / 带引号片段 `"名字",` / 逗号、全角逗号、顿号、竖线、换行分隔 |
+| PATCH | `/api/v1/star-terms/{id}` | 改名/备注/启停：`{"term": "...", "note": "...", "enabled": false}` |
+| DELETE | `/api/v1/star-terms/{id}` | 删除词条 |
+| POST | `/api/v1/star-terms/recompute` | 词库变更后对全部源站重算推荐（后台） |
+| POST | `/api/v1/maintenance/related-recompute?slug=all` | 手动重算指定/全部源站推荐 |
+
+推断规则（服务端自动执行）：词库主演名会扫描**缺失演员信息**视频的标题与简介——
+标题命中且字段稀疏 → **强信号不打折**；仅简介命中 → 弱信号 ×`RELATED_STAR_SIM_FACTOR`(0.7)。
+所有算法参数（权重表 `RELATED_WEIGHTS`、阈值、Top N 等）均为环境变量，见 10.2。
+
+---
+
 ## 5. 状态语义与推荐 UI（最容易做错的部分）
 
 ### 5.1 单源站状态判定（按顺序）
@@ -1229,7 +1294,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.8.1（当前） | 源站健康度退避：`/api/v1/sources` 新增 `fail_streak` / `skip_until`；大面积失败（页失败率≥50% 或整轮异常）按 60min→2h→4h→…（封顶 24h）指数退避，调度器跳过未到期的站（手动触发不受限），成功即清零；增量索引失败页在本次运行内重试（`PAGE_MAX_ATTEMPTS` 轮）；连续 2 批整批失败早停；日志行带失败原因分布（如 `timeout×1900, http_403×778`） |
+| v1.9.0（当前） | **相关推荐（服务端预计算）**：`GET /api/v1/related`（预计算直读 P95<50ms，fallback 兜底列表非空）；REST 详情与 `ac=detail` 附带 `related` 数组（`RELATED_IN_DETAIL` 可关）；`vod_{slug}` 新增 `vod_actor/vod_director/vod_writer/vod_area/vod_year/vod_tag` 列（存量库自动补列）；详情卡片字段不变、只增；新增明星词库管理接口与 `related/status`、`maintenance/related-recompute` |
+| v1.8.1 | 源站健康度退避：`/api/v1/sources` 新增 `fail_streak` / `skip_until`；大面积失败（页失败率≥50% 或整轮异常）按 60min→2h→4h→…（封顶 24h）指数退避，调度器跳过未到期的站（手动触发不受限），成功即清零；增量索引失败页在本次运行内重试（`PAGE_MAX_ATTEMPTS` 轮）；连续 2 批整批失败早停；日志行带失败原因分布（如 `timeout×1900, http_403×778`） |
 | v1.8.0 | 新增自定义源站：`POST /api/v1/sources/custom`、`PATCH/DELETE /api/v1/sources/{slug}/custom`、`POST /api/v1/sources/probe`；`/api/v1/sources` 增加 `origin` 字段（`latest` / `custom`） |
 | v1.4.1 | 服务端稳定性修复：同步并发闸门（超出排队）、同源站防重入、连接池可配、`/healthz` 池满时仍 200 + `degraded`、过载统一 503；新增 `queued`、`db_pool`、`sync_load` 字段 |
 | v1.4.0 | 服务端新增中转代理降级（源站不可达自动走代理）；新增 `synced` 字段，修正未同步站进度误显示 100 |
