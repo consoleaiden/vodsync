@@ -506,6 +506,23 @@ vodsync/
   性能基准 `scripts/bench_v190_related.py`
 - 版本号 1.8.1 → 1.9.0
 
+**升级步骤（v1.8.x → v1.9.0）**：
+
+1. 拉取新镜像并重启：
+   ```bash
+   cd /volume2/docker/vodsync
+   sudo docker compose pull vodsync && sudo docker compose up -d
+   ```
+2. 启动时自动完成迁移，无需手动改表：存量 `vod_*` 表自动补 6 个新列（PG `ADD COLUMN`），自动建 `vod_related` / `star_terms` 表
+3. 观察两条日志确认存量补齐在推进：
+   - 启动后数分钟内：`相关推荐: 启动补齐 N 个源站`（存量推荐当天可用，标题是全量信号）
+   - 每晚凌晨 2 点起：`[字段回填]`（每晚默认补 2 个站的演员/地区/年代，几个晚上补完；想加快改 `FIELD_BACKFILL_SOURCES_PER_NIGHT`）
+4. （可选）想立刻补某个站的字段：`POST /api/v1/sync/{slug}?mode=full`
+5. （可选）到面板 **⚙ 设置 → 明星词库** 批量粘贴主演名单增强缺失字段的匹配；改完点「重算推荐」生效
+6. 客户端接入：`GET /api/v1/related?slug=<源站>&id=<vod_id>`，或直接读详情响应里新增的 `related` 数组（无需改请求）
+
+**新增配置**：见 `.env.example` 的「相关推荐（v1.9.0）」与「存量字段回填」两段，全部有默认值，不配也能正常跑。
+
 ### v1.1.0
 - 新增 **Web 管理面板**（`/`）：概览统计、全量同步进度条、单站/全站手动触发、条数校准、源站日志、跨源搜索
 - 新增 **聚合搜索接口** `GET /api/v1/search`：线程池并行查询各源站表 + 内存归并分页，单源失败隔离，LIKE 通配符转义
