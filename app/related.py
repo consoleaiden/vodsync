@@ -9,23 +9,28 @@
 
 算法要点（与需求规格一一对应）
 ----------------------------
-1. 权重重分配：某字段缺失（含占位值）时，其权重按比例摊给其余有效字段，
-   不计 0 分 —— 字段越稀疏，标题占比自动越高。
-2. 标题相似度：0.6 × 归一化标题 LCS 公共子串占比 + 0.4 × bigram Jaccard；
+1. 权重重分配 + **证据先验**（v1.10.0）：某字段缺失（含占位值）时不计 0 分，而是
+   按「缺失权重占比」注入一份中性先验 —— 稀疏数据不再自动封顶到 1.0，
+   字段齐全才算「很像」。公式与动机见 config.RELATED_EVIDENCE_PRIOR。
+2. 标题相似度：0.6 × 归一化标题 LCS / max(len) + 0.4 × bigram Jaccard；
    双阈值门控（LCS >= 3 字 或 Jaccard >= 0.45）防两字短标题误伤。
 3. 归一化：NFKC 全角转半角 → 繁转简（可选依赖 opencc）→ 剥离噪声后缀
-   （国语/4K/HD/完整版...，正则表可配置）→ 序号（季/部/终章）摘出降权处理。
+   （国语/4K/HD/完整版...，正则表可配置）→ 序号（季/部/终章）摘出降权处理；
+   演职员名同样归一（v1.10.0 / A3，繁体站与简体站能共享演员信号）。
 4. 倒排索引剪枝：按 标题 bigram/演员/导演/编剧/地区/年代/分类 建 token 索引，
    候选只取与目标共享 token 最多的前 CANDIDATE_CAP 个；小表直接全量两两比较。
-5. 去重：同 (归一化标题, 年代) 只保留最新一条参与候选（同片重复收录不是推荐）。
-6. 翻拍惩罚：年份差 > 6 年 → 标题分 ×0.6；序号不一致（第一季 vs 第二季）→ ×0.5。
-7. 兜底链：得分命中不足时依次 同分类最近更新 → 同地区/年代 → 全站最新，
-   条目带 mode=fallback 标记，前端栏位永远有内容。
+5. 内容信号门控（v1.10.0）：只有 标题/演员/导演/编剧 命中才算「相似」，
+   仅同分类+同地区+同年代的配对走兜底链（带 m=fb），不进匹配位。
+6. 去重：同 (归一化标题, 年代) 只保留最新一条参与候选（同片重复收录不是推荐）。
+7. 翻拍惩罚：年份差 > 6 年 → 标题分 ×0.6；序号不一致（第一季 vs 第二季）→ ×0.5。
+8. 兜底链：得分命中不足时依次 同分类最近更新 → 同地区/年代 → 全站最新，
+   条目带 mode=fallback 标记且最多 RELATED_FALLBACK_LIMIT 条，前端可分区展示。
 
 存储
 ----
-vod_related.related_json 只存精简引用 [{"v": vid, "s": score, "m": mode}]，
+vod_related.related_json 只存精简引用 [{"v": vid, "s": score, "m": mode, "r": reason}]，
 卡片字段读取时按 id 实时补齐（封面/备注永远是新的，被下架的条目自然消失）。
+读路径按 algo_version 过滤（v1.10.0）：算法改了之后旧结果不会被当成新结果返回。
 
 所有可调参数集中在 config.py（RELATED_*），改环境变量即可调优，不用改代码。
 """
@@ -223,7 +228,9 @@ def title_similarity(na: str, oa: frozenset, ya: str, bga: frozenset,
         l = _lcs_len(na, nb)
         if l < config.RELATED_TITLE_LCS_MIN and ja < config.RELATED_TITLE_JACCARD_MIN:
             return 0.0
-        base = 0.6 * (l / min(len(na), len(nb))) + 0.4 * ja
+        # 分母用 max(len)（v1.10.0 / A6）：原来用 min(len)，「英雄」vs「英雄本色」
+        # 会拿到 0.8 的高分 —— 短标题被长标题整体包含一律高分，是误配来源。
+        base = 0.6 * (l / max(len(na), len(nb))) + 0.4 * ja
     if ya and yb and ya != yb:
         try:
             if abs(int(ya[:4]) - int(yb[:4])) > config.RELATED_YEAR_GAP_PENALTY_YEARS:
@@ -239,12 +246,50 @@ def _split_set(raw: str) -> frozenset:
     return frozenset(p for p in (raw or "").split(",") if p)
 
 
+# 名字归一化缓存：演员/导演名在 220 万行里高度重复，NFKC + opencc 每次都做太浪费。
+# 缓存上限 5 万条（约 5MB），超了整体清空（简单、无锁、不影响正确性）。
+_norm_cache: dict = {}
+_NORM_CACHE_MAX = 50000
+
+
+def _norm_person(name: str) -> str:
+    """演职员名单项归一化（NFKC + 小写 + 繁转简），带进程内缓存。"""
+    v = _norm_cache.get(name)
+    if v is not None:
+        return v
+    v = _star_norm(name).strip()
+    if len(_norm_cache) >= _NORM_CACHE_MAX:
+        _norm_cache.clear()
+    _norm_cache[name] = v
+    return v
+
+
+def _split_norm_set(raw: str) -> frozenset:
+    """
+    演职员串 → 归一化集合（v1.10.0 / A3）。
+
+    旧实现是原样切分，于是繁体站（吳京）与简体站（吴京）在「相关推荐」里永远
+    不共享演员，而「明星作品」侧走了归一化 —— 同一个概念两套口径必然漂移。
+    """
+    return frozenset(
+        t for t in (_norm_person(p) for p in (raw or "").split(",")) if t
+    )
+
+
 def _set_sim(sa: frozenset, sb: frozenset):
-    """集合交集占比（按较小集合算，演员名单长短不一更公平）。返回 None=任一方缺失。"""
+    """
+    集合相似度（余弦形式）：inter / sqrt(|a|·|b|)。返回 None=任一方缺失。
+
+    为什么不用 min(len) 作分母（v1.10.0 / A2）：目标 10 位演员、候选只有 1 位
+    且是客串时 min 版得 1.0（客串被当主演）。余弦版对「名单长短悬殊」天然打折
+    （1 vs 10 → 0.32），且对调两侧结果相同（推荐关系对称）。
+    """
     if not sa or not sb:
         return None
     inter = len(sa & sb)
-    return inter / min(len(sa), len(sb)) if inter else 0.0
+    if not inter:
+        return 0.0
+    return inter / ((len(sa) * len(sb)) ** 0.5)
 
 
 def _scalar_sim(a: str, b: str):
@@ -268,6 +313,19 @@ SCORE_PLAN = sorted(
 )
 TOTAL_WEIGHT = sum(w for _, w in SCORE_PLAN)
 
+# 证据先验与门控参数（模块加载时定值；改环境变量需重启，与权重表一致）
+_PRIOR = max(0.0, config.RELATED_EVIDENCE_PRIOR)
+_NEUTRAL = max(0.0, min(1.0, config.RELATED_EVIDENCE_NEUTRAL))
+_MIN_EVIDENCE_W = max(0.0, config.RELATED_MIN_EVIDENCE_WEIGHT)
+_REQUIRE_CONTENT = bool(config.RELATED_REQUIRE_CONTENT_SIGNAL)
+_TITLE_CONTENT_MIN = max(0.0, config.RELATED_TITLE_CONTENT_MIN)
+# 「内容信号」= 明确指向内容的字段；分类/地区/年代只是语境，单独命中不算相似
+_CONTENT_KINDS = (_K_TITLE, _K_ACTOR, _K_DIRECTOR, _K_WRITER)
+_REASON_LABEL = {
+    _K_TITLE: "title", _K_ACTOR: "actor", _K_DIRECTOR: "director",
+    _K_WRITER: "writer", _K_CLASS: "class", _K_AREA: "area", _K_YEAR: "year",
+}
+
 # 演员信号可信度系数（按 asrc 分级；配对取两侧较小值）：
 #   real=1.0 源站真实数据；strong=1.0 标题命中+字段稀疏（用户规则：相关性非常高）；
 #   inf=STAR_SIM_FACTOR 弱信号（仅简介命中 / 标题命中但字段齐全）
@@ -279,15 +337,24 @@ _ASRC_FACTOR = {
 }
 
 
-def _score_one(target: dict, cand: dict) -> float:
+def _score_one(target: dict, cand: dict) -> tuple:
     """
-    加权打分。缺失字段（sim=None）不计分子也不计分母 —— 这就是「权重重分配」：
-    只有 标题+演员+年代 可用时，总权重自动归一为这三项的占比和。
+    加权打分，返回 (score, reason)。
+
+    score 由三部分组成（v1.10.0 / A1）：
+      ① 可用字段的加权相似度和（缺失字段不计 0 分，这点与 v1.9 相同）
+      ② 证据先验：按「缺失权重占比」注入一份中性分，字段越少先验越重
+          —— 稀疏数据不再因为分母变小而把单个弱信号放大到接近 1.0
+      ③ 两道门控：可用权重下限、内容信号必须有（否则按「无关」处理，走兜底链）
+
+    reason 是贡献最大的两个信号标签（"title,actor"），客户端可用于卡片副标题。
     """
     min_score = config.RELATED_MIN_SCORE
     total = 0.0
     total_w = 0.0
     remaining = TOTAL_WEIGHT
+    content = False
+    best = []
     ta = target["actor"]; td = target["director"]; tw = target["writer"]
     for kind, w in SCORE_PLAN:
         if kind == _K_TITLE:
@@ -327,9 +394,29 @@ def _score_one(target: dict, cand: dict) -> float:
         total_w += w
         total += w * sim
         remaining -= w
-        if total + remaining < min_score:   # 上界也够不到 → 无关候选提前放弃
-            return 0.0
-    return total / total_w if total_w > 0 else 0.0
+        if sim > 0:
+            if kind in _CONTENT_KINDS:
+                if kind != _K_TITLE or sim >= _TITLE_CONTENT_MIN:
+                    content = True
+            # 排在前面的优先展示：内容信号 > 语境信号，同层按贡献大小
+            best.append((1 if kind in _CONTENT_KINDS else 0, w * sim, _REASON_LABEL[kind]))
+        # 上界：剩余字段全按 1.0 计 + 当前先验（分母随后只会变大）→ 安全剪枝
+        if TOTAL_WEIGHT > 0:
+            p = _PRIOR * (TOTAL_WEIGHT - total_w) / TOTAL_WEIGHT
+            if total + remaining + p * _NEUTRAL < min_score * (total_w + p):
+                return 0.0, ""
+    if total_w <= 0:
+        return 0.0, ""
+    if _MIN_EVIDENCE_W and total_w < _MIN_EVIDENCE_W:
+        return 0.0, ""           # 证据太少（只有分类/地区/年代）
+    if _REQUIRE_CONTENT and not content:
+        return 0.0, ""           # 没有内容信号命中 → 不算「相似」，交给兜底链
+    p = _PRIOR * (TOTAL_WEIGHT - total_w) / TOTAL_WEIGHT
+    score = (total + p * _NEUTRAL) / (total_w + p) if (total_w + p) > 0 else 0.0
+    if score < min_score:
+        return 0.0, ""
+    best.sort(reverse=True)
+    return score, ",".join(item[2] for item in best[:2])
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +451,7 @@ def reload_star_terms() -> int:
     别名与主名进同一个 pattern（按长度降序，长名优先），但命中后统一归一到主名：
     star_map.term / vod_tag 只存主名，避免「同演员多译名/写法」把作品拆散。
     """
+    global _star_loaded
     with database.engine.connect() as conn:
         rows = conn.execute(
             select(star_terms.c.term, star_terms.c.aliases).where(star_terms.c.enabled == 1)
@@ -391,6 +479,7 @@ def reload_star_terms() -> int:
     if mains:
         log.info("明星词库已加载 %d 个主名 / %d 个匹配变体（含别名）",
                  len(mains), len(variants))
+    _star_loaded = True
     return len(mains)
 
 
@@ -398,13 +487,29 @@ def star_pattern():
     """惰性加载词库正则（进程内首次使用时读库；增删改后由 API 调 reload 失效重载）。"""
     global _star_loaded
     if not _star_loaded:
-        _star_loaded = True
         try:
             reload_star_terms()
+            _star_loaded = True
         except Exception:
             log.exception("明星词库加载失败（按无词库处理）")
     with _locks_guard:
         return _star_cache["pattern"]
+
+
+def star_stats() -> dict:
+    """
+    当前已加载词库的统计（不重新读库）。
+
+    v1.10.0 / P11：面板每次 GET /star-terms 都调 reload_star_terms()，等于把万级
+    词库重新读一遍 + 重新编译正则（约 10ms + 内存抖动），面板一刷新就抖一下。
+    读接口只要「当前生效多少条」，直接返回缓存值即可。
+    """
+    star_pattern()
+    with _locks_guard:
+        return {
+            "count": _star_cache.get("count", 0),
+            "variants": _star_cache.get("variants", 0),
+        }
 
 
 def star_alias_map() -> dict:
@@ -436,6 +541,18 @@ def canon_hits(raw_hits) -> set:
     return {m.get(h, h) for h in raw_hits}
 
 
+_NEGATIVE_RE = None
+
+
+def _negative_re():
+    """标题「否定词」正则（访谈/花絮/盘点/预告…）—— 命中后标题推断降为弱信号。"""
+    global _NEGATIVE_RE
+    if _NEGATIVE_RE is None:
+        pats = [p.strip() for p in (config.RELATED_STAR_NEGATIVE_PATTERNS or "").split(",") if p.strip()]
+        _NEGATIVE_RE = re.compile("|".join(re.escape(p) for p in pats), re.IGNORECASE) if pats else False
+    return _NEGATIVE_RE or None
+
+
 def _infer_strength(name_raw: str, content: str, area: str, year: str, type_name: str, pattern):
     """
     明星词库推断，返回 (演员集合, asrc)。
@@ -443,19 +560,24 @@ def _infer_strength(name_raw: str, content: str, area: str, year: str, type_name
       real    源站有真实演员数据（不做推断）
       strong  标题命中词库 + 视频字段稀疏（area/year/type 非空数 <= 阈值）
               → 相关性非常高，打分不打折
-      inf     仅简介命中，或标题命中但字段较齐全 → 弱信号，打分降权
+      inf     仅简介命中，或标题命中但字段较齐全，或标题带否定词（访谈/盘点/
+              预告/同款…，v1.10.0 / A5）→ 弱信号，打分降权
       none    无任何演员信号
     """
     if pattern is None:
         return frozenset(), "none"
-    title_hits = frozenset(canon_hits(pattern.findall(_star_norm(name_raw or ""))))
+    norm_name = _star_norm(name_raw or "")
+    title_hits = frozenset(canon_hits(pattern.findall(norm_name)))
     if not title_hits:
         c_hits = frozenset(canon_hits(pattern.findall(_star_norm((content or "")[:2000]))))
         return c_hits, ("inf" if c_hits else "none")
     sparse = sum(1 for v in (area, year, type_name) if v) <= config.RELATED_STAR_STRONG_MAX_FIELDS
+    neg = _negative_re()
+    if neg is not None and neg.search(norm_name):
+        sparse = False      # 「吴京的访谈」≠「吴京主演」：否定词强制降级
     if sparse:
         return title_hits, "strong"
-    # 标题命中但字段齐全 → 弱信号；顺带合并简介里的命中
+    # 标题命中但字段齐全（或带否定词）→ 弱信号；顺带合并简介里的命中
     c_hits = frozenset(canon_hits(pattern.findall(_star_norm((content or "")[:2000]))))
     return title_hits | c_hits, "inf"
 
@@ -480,10 +602,12 @@ def _feat(vod_id, name_raw, type_name, area, year, actor_set, director, writer,
         "area": area or "",
         "year": year or "",
         "yi": yi,                # 预转 int，打分时不再反复 int()
-        "actor": actor_set,
+        # 演职员名统一归一化（v1.10.0 / A3）：繁体站与简体站能共享演员信号，
+        # 且与 star_tags 侧口径一致（那边一直走 _star_norm）。带缓存，重复名不重算。
+        "actor": frozenset(t for t in (_norm_person(x) for x in actor_set) if t),
         "asrc": asrc,            # real=源站真实数据 / inf=明星词库推断（打分降权）
-        "director": _split_set(director),
-        "writer": _split_set(writer),
+        "director": _split_norm_set(director),
+        "writer": _split_norm_set(writer),
         "time": vod_time or "",
     }
 
@@ -517,6 +641,11 @@ def _dup_key(f: dict) -> tuple:
 _compute_locks: dict = {}
 _locks_guard = threading.Lock()
 
+# 全局重算闸门（v1.10.0 / P5）：52 个源站同步完各自起线程整站重算，
+# 单源 20 万行 ≈ 300MB 特征，叠加起来能到 GB 级。这里限制同时计算的源站数，
+# 多出来的排队（每个源站已有自己的锁，排队只是延后，不会重复计算）。
+_recompute_sem = threading.Semaphore(max(1, config.RELATED_RECOMPUTE_CONCURRENCY))
+
 
 def _slug_lock(slug: str):
     with _locks_guard:
@@ -525,9 +654,123 @@ def _slug_lock(slug: str):
         return _compute_locks[slug]
 
 
-def _load_feats(slug: str):
+# ---------------------------------------------------------------------------
+# 增量重算合并（v1.10.0 / P5）
+#
+# 增量同步一轮会分批触发很多次 touched（每 50 条详情一批），每次重算都要
+# 全量加载该站特征 + 建倒排 —— 同一份数据在一轮同步里被加载几十遍。
+# 这里把窗口期内的 id 攒起来合并成一次；累计量超过整站比例时直接整站重算。
+# ---------------------------------------------------------------------------
+_incr_pending: dict = {}
+_incr_lock = threading.Lock()
+_incr_thread_started = False
+
+
+def _incr_worker():
+    while True:
+        time.sleep(1.0)
+        try:
+            flush_incremental()
+        except Exception:
+            log.exception("增量推荐重算合并失败（忽略，等下一轮）")
+
+
+def _ensure_incr_thread():
+    global _incr_thread_started
+    with _incr_lock:
+        if _incr_thread_started:
+            return
+        _incr_thread_started = True
+    threading.Thread(target=_incr_worker, daemon=True, name="related-incr").start()
+
+
+def queue_recompute_ids(slug: str, ids, reason: str = "") -> int:
+    """
+    增量重算入队（窗口内合并）。返回本次入队的 id 数。
+
+    RELATED_INCREMENT_DEBOUNCE_SECONDS = 0 时退回「立刻重算」的旧行为。
+    """
+    if not config.RELATED_ENABLED:
+        return 0
+    ids = [int(i) for i in (ids or []) if i]
+    if not ids:
+        return 0
+    if config.RELATED_INCREMENT_DEBOUNCE_SECONDS <= 0:
+        recompute_ids_safe(slug, ids, reason=reason or "incremental")
+        return len(ids)
+    now = time.time()
+    with _incr_lock:
+        item = _incr_pending.get(slug)
+        if item is None:
+            item = {
+                "ids": set(),
+                "deadline": now + config.RELATED_INCREMENT_DEBOUNCE_SECONDS,
+                "reason": reason or "incremental",
+            }
+            _incr_pending[slug] = item
+        item["ids"].update(ids)
+    _ensure_incr_thread()
+    return len(ids)
+
+
+def pending_incremental() -> dict:
+    """当前排队中的增量重算（面板/排障用）：{slug: 待处理 id 数}。"""
+    with _incr_lock:
+        return {s: len(v["ids"]) for s, v in _incr_pending.items()}
+
+
+def flush_incremental(force: bool = False) -> list:
+    """
+    处理到期的增量重算。force=True 时无视窗口立即处理（测试/关闭服务前用）。
+    返回本次实际处理的 [(slug, ids 数)]。
+    """
+    now = time.time()
+    due = []
+    with _incr_lock:
+        for slug, item in list(_incr_pending.items()):
+            if force or item["deadline"] <= now:
+                due.append((slug, sorted(item["ids"]), item["reason"]))
+                del _incr_pending[slug]
+    done = []
+    for slug, ids, reason in due:
+        if not ids:
+            continue
+        rows = _source_rows(build_vod_table(slug))
+        if rows and len(ids) >= rows * config.RELATED_INCREMENT_FULL_RATIO:
+            # 改动量已接近整站：逐个目标算不如直接整站重算一遍（还能顺带清掉
+            # 那些因为下架/改名而失去推荐的条目）
+            log.info("[%s] 增量累计 %d/%d 条，改为整站重算（%s）", slug, len(ids), rows, reason)
+            recompute_source_safe(slug, reason=f"{reason}_bulk")
+        else:
+            recompute_ids_safe(slug, ids, reason=reason)
+        done.append((slug, len(ids)))
+    return done
+
+
+def _source_rows(table) -> int:
+    """
+    该源站行数（用于轻量模式判断）。
+
+    v1.10.0 / P4：旧实现用「第一页行数 > 阈值」判断，而第一页只有 2000 行 →
+    20 万行的站永远不会进入轻量模式，照样把 300MB+ 全量读进内存。
+    count(*) 在 PG 上是一次顺序扫描（20 万行约 20~30ms），相对整站加载可以忽略。
+    """
+    try:
+        with database.engine.connect() as conn:
+            return int(conn.execute(select(func.count()).select_from(table)).scalar() or 0)
+    except Exception as e:
+        log.warning("统计 %s 行数失败（按未知处理）: %s", table.name, e)
+        return 0
+
+
+def _load_feats(slug: str, light: bool = None):
     """
     流式加载全表特征 + 构建候选索引。
+
+    v1.10.0 两处改动：
+      - 分页从 OFFSET 改 keyset（`vod_id > last_id`）：PG 上 OFFSET 每页都要重扫
+        前面所有行，20 万行 = 100 页，累计 O(n²/chunk)；
+      - 轻量模式改为按真实行数判断（见 _source_rows），超大表只读必要列。
 
     返回 (kept, dup_list, postings, by_time, dup_ids)
       kept      去重后的特征列表（同 (标题,年代) 只留最新一条）—— 候选池
@@ -537,75 +780,81 @@ def _load_feats(slug: str):
       dup_ids   被去重条目的 vod_id 集合（统计用）
     """
     table = build_vod_table(slug)
-    cols = (
+    total_rows = _source_rows(table)
+    if light is None:
+        light = total_rows > config.RELATED_MAX_ROWS_PER_SOURCE
+    cols = [
         table.c.vod_id, table.c.name, table.c.type_name, table.c.vod_area,
-        table.c.vod_year, table.c.vod_actor, table.c.vod_director,
-        table.c.vod_writer, table.c.vod_time, table.c.content,
-    )
+        table.c.vod_year, table.c.vod_time,
+    ]
+    if not light:
+        cols += [table.c.vod_actor, table.c.vod_director, table.c.vod_writer, table.c.content]
     # 明星词库（可选）：off 时不取 content，省一次大文本传输
     star_mode = (config.RELATED_STAR_INFER_MODE or "off").lower()
     use_star = star_mode in ("when_missing", "always")
-    pattern = star_pattern() if use_star else None
-    feats, dup_map = [], {}
+    pattern = star_pattern() if (use_star and not light) else None
+    feats = []
     kept, dup_list = [], []
-    light = False
     chunk = 2000
-    offset = 0
+    last_id = -1
     while True:
         with database.engine.connect() as conn:
             rows = conn.execute(
-                select(*cols).order_by(table.c.vod_id).offset(offset).limit(chunk)
+                select(*cols).where(table.c.vod_id > last_id)
+                .order_by(table.c.vod_id).limit(chunk)
             ).mappings().all()
         if not rows:
             break
-        if offset == 0 and len(rows) > config.RELATED_MAX_ROWS_PER_SOURCE:
-            light = True   # 超大表：丢弃演职员信号（内存保护），标题/分类/年代仍可用
-        offset += chunk
+        last_id = rows[-1]["vod_id"]
         for r in rows:
-            actor_raw = "" if light else (r["vod_actor"] or "")
-            inf_set, asrc = frozenset(), "none"
-            if pattern is not None and (star_mode == "always" or not actor_raw):
-                inf_set, asrc = _infer_strength(
-                    r["name"], "" if light else (r["content"] or ""),
-                    r["vod_area"] or "", r["vod_year"] or "", r["type_name"] or "",
-                    pattern,
+            if light:
+                f = _feat(
+                    r["vod_id"], r["name"], r["type_name"], r["vod_area"],
+                    r["vod_year"], frozenset(), "", "", r["vod_time"], asrc="none",
                 )
-            if actor_raw:
-                actor_set = _split_set(actor_raw)
-                if star_mode == "always" and inf_set:
-                    actor_set = actor_set | inf_set   # 合并模式：真实 + 推断
-                asrc = "real"                         # 有真实数据以真实为准
-            elif inf_set:
-                actor_set = inf_set
             else:
-                actor_set = frozenset()
-            f = _feat(
-                r["vod_id"], r["name"], r["type_name"], r["vod_area"], r["vod_year"],
-                actor_set,
-                "" if light else r["vod_director"],
-                "" if light else r["vod_writer"],
-                r["vod_time"],
-                asrc=asrc,
-            )
+                actor_raw = r["vod_actor"] or ""
+                inf_set, asrc = frozenset(), "none"
+                if pattern is not None and (star_mode == "always" or not actor_raw):
+                    inf_set, asrc = _infer_strength(
+                        r["name"], r["content"] or "",
+                        r["vod_area"] or "", r["vod_year"] or "", r["type_name"] or "",
+                        pattern,
+                    )
+                if actor_raw:
+                    actor_set = _split_set(actor_raw)
+                    if star_mode == "always" and inf_set:
+                        actor_set = actor_set | inf_set   # 合并模式：真实 + 推断
+                    asrc = "real"                         # 有真实数据以真实为准
+                elif inf_set:
+                    actor_set = inf_set
+                else:
+                    actor_set = frozenset()
+                f = _feat(
+                    r["vod_id"], r["name"], r["type_name"], r["vod_area"],
+                    r["vod_year"], actor_set, r["vod_director"], r["vod_writer"],
+                    r["vod_time"], asrc=asrc,
+                )
             if not f["name"] and not f["raw"]:
                 continue
             feats.append(f)
-        if light:
-            break   # 轻量模式一次性读标题即可，再分块没有意义
     if light:
-        log.info("[%s] 相关推荐进入轻量模式（行数 > %d），只用标题/分类/年代",
-                 slug, config.RELATED_MAX_ROWS_PER_SOURCE)
+        log.info("[%s] 相关推荐进入轻量模式（约 %d 行 > %d），只用标题/分类/年代",
+                 slug, total_rows, config.RELATED_MAX_ROWS_PER_SOURCE)
 
     # 同片去重：同 (标题,年代) 只留 vod_time 最新的一条进候选池
+    dup_map_keys = set()
     for f in sorted(feats, key=lambda x: (x["time"], x["id"]), reverse=True):
         k = _dup_key(f)
-        if k in dup_map:
+        if k in dup_map_keys:
             dup_list.append(f)
             continue
-        dup_map[k] = f
+        dup_map_keys.add(k)
         kept.append(f)
-    kept.reverse()   # 恢复按 id 稳定顺序
-    dup_list.reverse()
+    # v1.10.0 / C4：显式按 id 升序（原来的 reverse() 得到的是「按时间升序」，
+    # 与注释不符，也让 Counter 平票时的选择依赖意外顺序）。
+    kept.sort(key=lambda x: x["id"])
+    dup_list.sort(key=lambda x: x["id"])
     dup_ids = {f["id"] for f in dup_list}
 
     postings = None
@@ -634,7 +883,9 @@ def _candidates(target: dict, feats: list, postings, dup_ids: set) -> list:
     cap = config.RELATED_CANDIDATE_CAP
     items = [(t, plist) for t, plist in
              ((t, postings.get(t)) for t in _tokens(target)) if plist]
-    items.sort(key=lambda x: len(x[1]))
+    # 先按链长、再按 token 字典序：同一份数据每次跑出来的候选顺序必须一致
+    # （否则 Counter 平票时选中谁取决于集合遍历顺序，见 v1.10.0 / C4、A7）
+    items.sort(key=lambda x: (len(x[1]), x[0]))
     votes = Counter()
     seen = set()
     stop = cap * 2
@@ -645,7 +896,7 @@ def _candidates(target: dict, feats: list, postings, dup_ids: set) -> list:
             votes[i] += 1
         if len(seen) >= stop:
             break
-    picked = [i for i, _ in votes.most_common(cap)]
+    picked = [i for i, _c in sorted(votes.items(), key=lambda kv: (-kv[1], kv[0]))[:cap]]
     return [
         feats[i] for i in picked
         if feats[i]["id"] != target["id"] and _dup_key(feats[i]) != tk
@@ -653,13 +904,15 @@ def _candidates(target: dict, feats: list, postings, dup_ids: set) -> list:
 
 
 def _rank(target: dict, cands: list) -> list:
-    """打分 → 阈值过滤 → 降序。返回 [(feat, score)]。"""
+    """打分 → 阈值过滤 → 降序。返回 [(feat, score, reason)]。"""
     scored = []
     for c in cands:
-        s = _score_one(target, c)
-        if s >= config.RELATED_MIN_SCORE:
-            scored.append((c, round(s, 4)))
-    scored.sort(key=lambda x: -x[1])
+        s, reason = _score_one(target, c)
+        if s > 0:
+            scored.append((c, round(s, 4), reason))
+    # 同分时按「更新年份降序、id 升序」定序 —— 排序稳定可复现，
+    # 客户端每次刷新不会看到「同一批片子乱跳」（v1.10.0 / A7）。
+    scored.sort(key=lambda x: (-x[1], -(x[0]["yi"] or 0), x[0]["id"]))
     return scored
 
 
@@ -669,6 +922,10 @@ def _fallback_ids(target: dict, by_time: list, limit: int) -> list:
       ① 同分类最近更新 → ② 同地区/同年代最近更新 → ③ 全站最新收录
     跳过：自身 + 与目标同 (标题,年代,序号) 的重复收录条目（同片不是推荐，
     兜底也不能把同片的另一条记录塞进来）。
+
+    注意：兜底只在「零命中」时整条启用，不与真命中混排（见 compute_source）。
+    「命中不足时用兜底补位」被明确否决 —— 推荐位里混入同分类随机片，
+    观感比少几条更差（REVIEW A4）。
     """
     tk = _dup_key(target)
     seen = {target["id"]}
@@ -726,6 +983,9 @@ def compute_source(slug: str, only_ids: list = None, reason: str = "") -> dict:
     计算（或重算）一个源站的相关推荐。
     only_ids 为空 = 全站计算；否则只算指定目标（增量重算，索引仍需全量加载）。
     返回统计信息。失败抛异常由调用方兜底（旧结果不会被破坏）。
+
+    v1.10.0：进入前先过全局并发闸门（RELATED_RECOMPUTE_CONCURRENCY），
+    多个源站同时同步完也不会一起把内存拉满。
     """
     if not config.RELATED_ENABLED:
         return {"skipped": "related_disabled"}
@@ -735,7 +995,10 @@ def compute_source(slug: str, only_ids: list = None, reason: str = "") -> dict:
         log.info("[%s] 相关推荐已有计算任务在跑，本次跳过（%s）", slug, reason or "manual")
         return {"skipped": "busy"}
     started = time.time()
+    holding_sem = False
     try:
+        _recompute_sem.acquire()
+        holding_sem = True
         kept, dup_list, postings, by_time, dup_ids = _load_feats(slug)
         if not kept and not dup_list:
             return {"computed": 0, "total": 0}
@@ -751,6 +1014,7 @@ def compute_source(slug: str, only_ids: list = None, reason: str = "") -> dict:
                     wanted.append(dup_by_id[i])
             targets = wanted
         limit = config.RELATED_LIMIT_DEFAULT
+        fb_limit = min(limit, max(0, config.RELATED_FALLBACK_LIMIT))
         n_fallback = 0
         written, batch = 0, []
         total = len(targets)
@@ -758,12 +1022,17 @@ def compute_source(slug: str, only_ids: list = None, reason: str = "") -> dict:
             scored = _rank(target, _candidates(target, kept, postings, dup_ids))
             if scored:
                 # 有真实命中：按规格 3.3，直接用得分列表（<=12 条），不掺兜底
-                entries = [{"v": f["id"], "s": s} for f, s in scored[:limit]]
+                entries = [
+                    {"v": f["id"], "s": s, **({"r": r} if r else {})}
+                    for f, s, r in scored[:limit]
+                ]
             else:
-                # 零命中：整条走兜底链（宁可返回兜底，也不允许返回空）
+                # 零命中：整条走兜底链（宁可返回兜底，也不允许返回空）。
+                # v1.10.0：兜底最多 RELATED_FALLBACK_LIMIT 条，避免真命中与
+                # 「同分类最新」混满一屏，客户端可单独渲染成「猜你想看」。
                 entries = [
                     {"v": f["id"], "s": 0.0, "m": "fb"}
-                    for f in _fallback_ids(target, by_time, limit)
+                    for f in _fallback_ids(target, by_time, fb_limit)
                 ]
                 n_fallback += len(entries)
             if entries:
@@ -780,11 +1049,14 @@ def compute_source(slug: str, only_ids: list = None, reason: str = "") -> dict:
         stats = {
             "slug": slug, "computed": written, "total": total,
             "fallback_entries": n_fallback, "duplicates": len(dup_ids),
+            "algo_version": config.RELATED_ALGO_VERSION,
             "elapsed_ms": int((time.time() - started) * 1000),
         }
         log.info("[%s] 相关推荐完成: %s%s", slug, stats, f" ({reason})" if reason else "")
         return stats
     finally:
+        if holding_sem:
+            _recompute_sem.release()
         lock.release()
 
 
@@ -810,8 +1082,15 @@ def recompute_ids_safe(slug: str, ids: list, reason: str = ""):
 # 存量补齐与校准
 # ---------------------------------------------------------------------------
 def reset_algo_version() -> int:
-    """算法版本变化时清空旧结果（启动时调用）。返回删除行数。"""
-    with database.engine.connect() as conn:
+    """
+    算法版本变化时清空旧结果（启动时调用）。返回删除行数。
+
+    v1.10.0 / B2 修复：旧实现用 `engine.connect()` 做 DELETE。SQLAlchemy 2.0 的
+    Connection 是「commit as you go」—— 不 commit 就在归还连接时回滚，
+    但 rowcount 照样返回 1（日志还在说「清空 N 条」）。实测清空 1 行后表里仍剩 2 行，
+    于是改算法版本完全不生效。写操作必须走 write_txn（读才用 connect）。
+    """
+    with database.write_txn() as conn:
         n = conn.execute(
             vod_related.delete().where(vod_related.c.algo_version != config.RELATED_ALGO_VERSION)
         ).rowcount or 0
@@ -822,41 +1101,79 @@ def reset_algo_version() -> int:
 
 
 def coverage(slug: str) -> dict:
-    """单源站覆盖率（面板/验收用）：videos / computed / covered%。"""
+    """
+    单源站覆盖率（面板/验收用）：videos / computed / covered%。
+
+    v1.10.0：只统计**当前算法版本**的结果 —— 读路径已按版本过滤，
+    覆盖率若还数全部行，会给出「100% 覆盖但推荐读不到」的假象。
+    """
     table = build_vod_table(slug)
     if not database.table_exists(table.name):
         return {"slug": slug, "videos": 0, "computed": 0, "coverage": 0.0}
     with database.engine.connect() as conn:
         videos = conn.execute(select(func.count()).select_from(table)).scalar() or 0
         computed = conn.execute(
-            select(func.count()).select_from(vod_related).where(vod_related.c.slug == slug)
+            select(func.count()).select_from(vod_related).where(
+                vod_related.c.slug == slug,
+                vod_related.c.algo_version == config.RELATED_ALGO_VERSION,
+            )
         ).scalar() or 0
     pct = round(computed * 100 / videos, 1) if videos else 0.0
     return {"slug": slug, "videos": videos, "computed": computed, "coverage": pct}
 
 
 def coverage_all() -> list:
-    """全部源站的推荐覆盖率（管理接口 / 验收核对用）。"""
+    """
+    全部源站的推荐覆盖率（管理接口 / 验收核对用）。
+
+    v1.10.0 / P13：一行 GROUP BY 拿到所有站的已算条数，不再逐站 count(*)。
+    视频数直接取 sources.total_videos（同步链路一直在维护），只有该值为 0 时才
+    回落到 count(*) —— 面板点一次「状态」从 100+ 次全表扫降到 2 次查询。
+    """
     with database.engine.connect() as conn:
-        slugs = [r[0] for r in conn.execute(
-            select(sources.c.slug).where(sources.c.enabled == 1).order_by(sources.c.id)
-        ).all()]
-    return [coverage(s) for s in slugs]
+        rows = conn.execute(
+            select(sources.c.slug, sources.c.total_videos)
+            .where(sources.c.enabled == 1).order_by(sources.c.id)
+        ).all()
+        computed = dict(conn.execute(
+            select(vod_related.c.slug, func.count())
+            .where(vod_related.c.algo_version == config.RELATED_ALGO_VERSION)
+            .group_by(vod_related.c.slug)
+        ).all())
+    out = []
+    for slug, tv in rows:
+        table = build_vod_table(slug)
+        if not database.table_exists(table.name):
+            out.append({"slug": slug, "videos": 0, "computed": 0, "coverage": 0.0})
+            continue
+        videos = int(tv or 0)
+        if videos <= 0:
+            with database.engine.connect() as conn:
+                videos = int(conn.execute(select(func.count()).select_from(table)).scalar() or 0)
+        n = int(computed.get(slug, 0))
+        pct = round(n * 100 / videos, 1) if videos else 0.0
+        out.append({"slug": slug, "videos": videos, "computed": n, "coverage": pct})
+    return out
 
 
 def sources_needing_compute() -> list:
-    """有数据但还没有（或有旧版本）推荐结果的源站 —— 启动补齐/每日校准用。"""
+    """
+    有数据但还没有（或有旧版本）推荐结果的源站 —— 启动补齐/每日校准用。
+
+    v1.10.0 / P9：一次拿到「各站已算条数」+ sources 里的视频数，内存里比较即可；
+    旧实现是 source 数 × 2 次 count 查询，启动 30~60s 内调度器都还没起来。
+    """
     with database.engine.connect() as conn:
         rows = conn.execute(
             select(sources.c.slug, sources.c.total_videos)
             .where(sources.c.enabled == 1, sources.c.total_videos > 0)
         ).all()
-    out = []
-    for slug, _tv in rows:
-        cov = coverage(slug)
-        if cov["computed"] < cov["videos"]:
-            out.append(slug)
-    return out
+        computed = dict(conn.execute(
+            select(vod_related.c.slug, func.count())
+            .where(vod_related.c.algo_version == config.RELATED_ALGO_VERSION)
+            .group_by(vod_related.c.slug)
+        ).all())
+    return [slug for slug, tv in rows if int(computed.get(slug, 0)) < int(tv or 0)]
 
 
 def startup_backfill():
@@ -896,7 +1213,11 @@ def daily_calibration(budget: int = None) -> dict:
 # 读取路径（API 层调用）
 # ---------------------------------------------------------------------------
 def _fallback_live(slug: str, table, vod_id: int, limit: int) -> list:
-    """预计算结果缺失时的实时兜底（单条 SQL，走不到预计算表的新视频也能立刻有推荐）。"""
+    """
+    预计算结果缺失时的实时兜底（单条 SQL，走不到预计算表的新视频也能立刻有推荐）。
+    v1.10.0：条数同样按 RELATED_FALLBACK_LIMIT 收敛，保持两条路径行为一致。
+    """
+    limit = max(1, min(limit, config.RELATED_FALLBACK_LIMIT or limit))
     with database.engine.connect() as conn:
         row = conn.execute(
             select(table.c.vod_id, table.c.type_name, table.c.vod_area, table.c.vod_year)
@@ -936,13 +1257,17 @@ def get_related_entries(slug: str, vod_id: int, limit: int, table) -> tuple:
     返回 (entries, fallback)：entries = [{"v":..,"s":..,"m":..}]（按分降序）。
     fallback 标记来源有二：预计算时零命中走了兜底链（条目 m=fb），
     或该视频还没有预计算结果（本次实时兜底）。
+
+    v1.10.0：按 algo_version 过滤（B2 的读侧自证）—— 算法升级后即使旧行还没被
+    清掉/覆盖，也不会被当成新结果返回给客户端。
     """
     entries = []
-    has_row = False
     with database.engine.connect() as conn:
         row = conn.execute(
             select(vod_related.c.related_json).where(
-                vod_related.c.slug == slug, vod_related.c.vod_id == vod_id
+                vod_related.c.slug == slug,
+                vod_related.c.vod_id == vod_id,
+                vod_related.c.algo_version == config.RELATED_ALGO_VERSION,
             )
         ).first()
     if row and row[0]:
@@ -995,5 +1320,7 @@ def enrich_cards(slug: str, source_name: str, entries: list, table) -> list:
             "source_name": source_name,
             "score": e.get("s", 0.0),
             "mode": e.get("m") or ("fallback" if e.get("s", 0) <= 0 else "match"),
+            # 命中原因（v1.10.0，纯新增）：如 "title,actor" / "director"
+            "reason": e.get("r") or "",
         })
     return cards

@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.9.3"
+    "version": "1.10.0"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -186,7 +186,7 @@
     "/api/v1/categories": {
       "get": {
         "summary": "Categories",
-        "description": "分类清单（type_id / type_name 去重 + 各分类条数）。\n\n用法：\n  /api/v1/categories?source=jkun          单源站分类\n  /api/v1/categories?source=jkun,t1       多源合并（同名分类会合并计数）\n  /api/v1/categories                      全部源站合并\n拿到 type_id 后即可用 GET /api/v1/videos?source=..&type_id=.. 按分类翻页。",
+        "description": "分类清单（type_id / type_name 去重 + 各分类条数）。\n\n用法：\n  /api/v1/categories?source=jkun          单源站分类\n  /api/v1/categories?source=jkun,t1       多源合并（同名分类会合并计数）\n  /api/v1/categories                      全部源站合并\n拿到 type_id 后即可用 GET /api/v1/videos?source=..&type_id=.. 按分类翻页。\n\nv1.10.0（纯新增）：响应带 `cached`（true = 命中本地缓存，分类几乎不变，\n默认缓存 CATEGORIES_CACHE_SECONDS=300 秒）。客户端无需处理，仅供排查。",
         "operationId": "categories_api_v1_categories_get",
         "parameters": [
           {
@@ -1023,7 +1023,7 @@
     "/api/v1/videos": {
       "get": {
         "summary": "Video List",
-        "description": "视频列表 / 批量详情。\n\n四种用法：\n  1. 列表：      /api/v1/videos?source=jkun&page=1&page_size=20\n  2. 批量详情：  /api/v1/videos?source=jkun&ids=134369       （含 vod_play_url）\n  3. 完整列表：  /api/v1/videos?source=jkun&ac=detail         （列表带播放地址）\n  4. 分类浏览：  /api/v1/videos?source=jkun&type_id=6         （配合 /api/v1/categories）",
+        "description": "视频列表 / 批量详情。\n\n四种用法：\n  1. 列表：      /api/v1/videos?source=jkun&page=1&page_size=20\n  2. 批量详情：  /api/v1/videos?source=jkun&ids=134369       （含 vod_play_url）\n  3. 完整列表：  /api/v1/videos?source=jkun&ac=detail         （列表带播放地址）\n  4. 分类浏览：  /api/v1/videos?source=jkun&type_id=6         （配合 /api/v1/categories）\n\nv1.10.0（纯新增）：不带筛选条件的全站列表（无 wd / type_id / type_name / ids）\n的 `total` 改为估值，并在响应里带 `total_approximate: true`。\n出处是 sources.total_videos（后台同步一直维护），省掉 52 张表各跑一次 count(*)。\n`pagecount` 随之由估值算出，翻到末页可能有 1~2 页偏差；带筛选时仍是精确值。\n客户端若做「共 N 条 / 最后一页」的强展示，请判断该字段后自行降级为「约 N 条」。",
         "operationId": "video_list_api_v1_videos_get",
         "parameters": [
           {
@@ -1304,7 +1304,7 @@
     "/api/v1/related": {
       "get": {
         "summary": "Related Videos",
-        "description": "视频相关推荐（预计算结果直读，P95 < 50ms）。\n\n返回 {code, slug, vod_id, fallback, computed_at, list}：\n  - list 为对齐视频卡片结构的数组（含 source/source_name/score），\n    source 用于客户端跨站点击跳转\n  - fallback=true 表示该条目来自兜底链（同分类/同地区年代/最新收录），\n    客户端可按需弱化展示；列表永远非空（只要该视频本身存在）\n  - 视频不存在返回 404 标准错误结构",
+        "description": "视频相关推荐（预计算结果直读，P95 < 50ms）。\n\n返回 {code, slug, vod_id, limit, fallback, computed_at, algo_version, list}：\n  - list 为对齐视频卡片结构的数组（含 source/source_name/score），\n    source 用于客户端跨站点击跳转\n  - fallback=true 表示**整条列表**都来自兜底链（同分类/同地区年代/最新收录），\n    客户端可按需弱化展示或改成「猜你想看」；列表永远非空（只要该视频本身存在）\n  - 视频不存在返回 404 标准错误结构\n\nv1.10.0 变更（对接需注意，均为纯新增或语义收紧）：\n  - 新增 `algo_version`：当前算法版本。与旧值不同的缓存建议直接丢弃。\n  - 卡片新增 `reason`：命中原因，逗号分隔，如 \"title,actor\" / \"director\"。\n    兜底条目为空串。可按它做「因为你也看过…」这类展示，也可忽略。\n  - 语义收紧：**仅同分类+同地区+同年代的配对不再进推荐位**（旧版会给这类\n    配对 0.667 的高分，属于 Bug 级误判）。同一部片不会出现在自己的推荐里。\n  - 零命中时的兜底条数从 12 条降到 6 条（RELATED_FALLBACK_LIMIT），\n    不与真命中混排；`fallback=true` 时 `score` 恒为 0、`mode` 为 \"fallback\"。",
         "operationId": "related_videos_api_v1_related_get",
         "parameters": [
           {
@@ -1370,7 +1370,7 @@
     "/api/v1/star-terms": {
       "get": {
         "summary": "Star Terms List",
-        "description": "词库清单（含停用条目，便于面板管理）。",
+        "description": "词库清单（含停用条目，便于面板管理）。\n\nv1.10.0：`active` 改为返回**进程内当前生效的启用条数**（不再每次请求都\n重新编译词库正则）。刚写完词库时增删改接口会立即 reload，因此 `active`\n在一次写请求之后就是新值；多副本部署时其他实例最迟在下次重启/定时任务后一致。",
         "operationId": "star_terms_list_api_v1_star_terms_get",
         "responses": {
           "200": {
@@ -1527,7 +1527,7 @@
     "/api/v1/star/related": {
       "get": {
         "summary": "Star Related Api",
-        "description": "返回与目标视频共享明星（词库 tag 交集）的其他视频。\n目标视频的明星 = star_map 里的映射（真实演员 ∩ 词库 + 标题命中推断）。",
+        "description": "返回与目标视频共享明星（词库 tag 交集）的其他视频。\n目标视频的明星 = star_map 里的映射（真实演员 ∩ 词库 + 标题命中推断）。\n\nv1.10.0：`truncated` 改成精确判定 —— 老实现用 `count(distinct vod_id)` 判\n「是否还有更多」，代价是多扫一遍；现在多取 1 条来判断，`truncated` 因此\n可以是 false（旧版在命中不足限制条数时也恒为 true，客户端「加载更多」按钮\n会一直亮着却点不出新内容）。",
         "operationId": "star_related_api_api_v1_star_related_get",
         "parameters": [
           {

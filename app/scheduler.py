@@ -52,7 +52,7 @@ def _job_housekeeping():
 
 def _job_related_calibration():
     """相关推荐每日校准：重算 computed_at 过期 / 覆盖率不满的源站（预算内）。"""
-    from . import related
+    from . import related, syncer
 
     if pause.is_paused("incremental"):
         log.info("相关推荐校准已跳过: 增量同步处于暂停状态")
@@ -61,6 +61,12 @@ def _job_related_calibration():
         related.daily_calibration()
     except Exception:
         log.exception("相关推荐每日校准失败")
+    try:
+        # 精确条数校准（v1.10.0 / P9）：白天 /videos 的 total 用 SUM(total_videos)
+        # 估值（快），每晚把真值重算一遍（52 次 count(*)，凌晨不打扰用户）。
+        syncer.refresh_counts()
+    except Exception:
+        log.exception("条数校准失败（估值继续沿用，不影响功能）")
 
 
 def _job_field_backfill():
@@ -109,10 +115,16 @@ def _job_field_backfill():
 
 def _job_star_tags_nightly():
     """
-    明星 Tag 每晚重建（v1.9.1）：小站优先重建 STAR_TAG_NIGHTLY_BUDGET 个源站。
-    全量幂等 —— 字段回填补上的真实演员会进入映射；词库新增的名字也会
-    重新评估历史未命中标题。全部源站都映射过则跳过（白天同步已增量维护）。
+    明星 Tag 每晚重建（v1.9.1 / v1.10.0 修 C1）：每次重建 STAR_TAG_NIGHTLY_BUDGET 个源站。
+
+    选站策略（v1.10.0 换了判据）：旧实现用 `mapped >= tv` 判断「已覆盖」，
+    而 mapped 是 star_map 的**行数**、一部片常映射 2~5 个明星 → mapped 天然 ≥ tv
+    → 夜间重建几乎永不执行。现在改为「按上次重建时间轮转」：
+      从未映射过的站优先 → 其次最久没重建的站 → 同条件小站优先。
+    这样每个源站都会被轮到，而不是永远捶同一批。
     """
+    from datetime import datetime, timedelta
+
     from sqlalchemy import func, select
 
     from . import star_tags
@@ -125,17 +137,30 @@ def _job_star_tags_nightly():
             rows = conn.execute(
                 select(sources.c.slug, sources.c.total_videos)
                 .where(sources.c.enabled == 1, sources.c.total_videos > 0)
-                .order_by(sources.c.total_videos)
             ).all()
-            mapped = dict(conn.execute(
-                select(star_map.c.slug, func.count()).group_by(star_map.c.slug)
-            ).all())
-        done = []
+            # 每站：映射到的**去重视频数** + 最近一次重建时间
+            stats = {
+                s: (int(n), last)
+                for s, n, last in conn.execute(
+                    select(
+                        star_map.c.slug,
+                        func.count(func.distinct(star_map.c.vod_id)),
+                        func.max(star_map.c.computed_at),
+                    ).group_by(star_map.c.slug)
+                ).all()
+            }
+        now = datetime.now()
+        min_interval = timedelta(hours=max(0, config.STAR_TAG_NIGHTLY_MIN_INTERVAL_HOURS))
+        candidates = []
         for slug, tv in rows:
-            if len(done) >= config.STAR_TAG_NIGHTLY_BUDGET:
-                break
-            if mapped.get(slug, 0) >= tv:      # 已覆盖（映射条数 >= 视频数），跳过
+            mapped, last = stats.get(slug, (0, None))
+            if last is not None and now - last < min_interval:
                 continue
+            # (从未映射=0, 上次重建时间, 视频数) 升序 → 需要重建的排前面
+            candidates.append(((0 if mapped == 0 else 1, last or datetime.min, tv or 0), slug))
+        candidates.sort(key=lambda x: x[0])
+        done = []
+        for _key, slug in candidates[: config.STAR_TAG_NIGHTLY_BUDGET]:
             star_tags.rebuild_source_safe(slug, reason="nightly")
             done.append(slug)
         if done:

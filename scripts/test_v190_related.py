@@ -183,13 +183,17 @@ def main():
     check("101 推荐含 112（同名不同记录但年相同→去重键相同，不应出现）", 112 not in ids, ids)
     check("101 推荐含同分类的 102（流浪地球2）", 102 in ids, ids)
     check("101 推荐含同演员的 103（战狼2·吴京）", 103 in ids, ids)
-    check("101 推荐含同分类的 104（星际穿越）", 104 in ids, ids)
+    # v1.10.0 契约变更（A1-3 内容信号门控）：只有同分类/同地区/同年代、没有任何
+    # 内容信号（标题/演员/导演/编剧）的候选不再进推荐位，改走兜底链。
+    check("101 不再推荐「仅同分类」的 104（星际穿越，无内容信号）", 104 not in ids, ids)
     check("101 不会推荐重复收录的 111（同片）", 111 not in ids, ids)
     scores = {e["v"]: e["s"] for e in rel}
-    check("演员+分类命中分高于纯分类（102 > 104）",
-          102 in scores and 104 in scores and scores[102] > scores[104],
-          f"102={scores.get(102)} 104={scores.get(104)}")
+    check("演员+标题命中分高于纯演员命中（102 > 103）",
+          102 in scores and 103 in scores and scores[102] > scores[103],
+          f"102={scores.get(102)} 103={scores.get(103)}")
     check("所有命中分 >= 阈值", all(e["s"] >= 0.15 or e.get("m") == "fb" for e in rel), rel[:5])
+    check("命中条目带 reason（展示用命中原因）",
+          all(e.get("r") for e in rel if e.get("m") != "fb"), rel[:3])
 
     # D2 仅标题系列 → 命中同系列
     rel = related_of(105)
@@ -322,16 +326,19 @@ def main():
     check("简介命中（弱信号）不误配到国产权（分类不同且降权后不过阈）",
           130 not in [x for x in ids if x in scores], ids)
 
-    # G3 停用词条 → 演员推断信号消失（分值从 演员+分类 降至 纯分类 0.6）
+    # G3 停用词条 → 演员推断信号消失
+    # v1.10.0 契约变更：只有「同分类、无内容信号」的配对不再计 0.6 分进推荐位，
+    # 而是整条走兜底链（带 m=fb）—— 「推荐位里是同分类随机片」比「没有推荐」更差。
     tid = client.get("/api/v1/star-terms").json()["list"]
     target = next(x for x in tid if x["term"] == "最美宝儿")
     r = client.patch(f"/api/v1/star-terms/{target['id']}", json={"enabled": False})
     check("停用词条", r.status_code == 200, r.text[:120])
     related.compute_source(SLUG, only_ids=[130], reason="test_star_off")
     rel = related_of(130)
-    scores_after = {e["v"]: e["s"] for e in rel if e.get("m") != "fb"}
-    check("停用后演员信号消失（131 分值降为纯分类命中 0.6）",
-          131 in scores_after and abs(scores_after[131] - 0.6) < 0.02, scores_after)
+    match_ids = [e["v"] for e in rel if e.get("m") != "fb"]
+    fb_ids = [e["v"] for e in rel if e.get("m") == "fb"]
+    check("停用后 131 不再以「仅同分类」身份进推荐位", 131 not in match_ids, rel)
+    check("停用后 130 走兜底链且非空", bool(fb_ids), rel)
 
     # G4 删除词条
     r = client.delete(f"/api/v1/star-terms/{target['id']}")

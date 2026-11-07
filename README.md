@@ -392,6 +392,12 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
 | `MERGE_MAX_PER_TABLE` | 3000 | **列表归并每表最多取多少行**（决定能精确翻到第几页，超出回退慢路径） |
 | `MERGE_CONCURRENCY` | 4 | 列表归并的并行度（每线程占一个连接，别超过 `DB_POOL_SIZE`） |
 | `TOTAL_CACHE_SECONDS` | 60 | 列表 total 的缓存秒数（0 = 每次实时 count） |
+| `TOTAL_APPROXIMATE_ENABLED` | true | 无筛选列表的 total 用 `SUM(sources.total_videos)` 估值（响应带 `total_approximate`） |
+| `CATEGORIES_CACHE_SECONDS` | 300 | 分类清单缓存秒数（0 = 不缓存） |
+| `PG_TRGM_ENABLED` | true | 启动后台建 `pg_trgm` GIN 搜索索引（不锁表；无权限只记日志） |
+| `RELATED_ALGO_VERSION` | 2 | 算法版本，改动即清空旧结果并重算（回滚到 1.9.x 请设回 `1`） |
+| `RELATED_RECOMPUTE_CONCURRENCY` | 2 | 全局同时整站重算的源站数（内存紧设 1） |
+| `RELATED_FALLBACK_LIMIT` | 6 | 零命中时的兜底条数 |
 | `HOUSEKEEPING_ENABLED` | true | 是否定时清理同步日志 / 回收 WAL |
 | `HOUSEKEEPING_INTERVAL_MINUTES` | 60 | 维护任务间隔 |
 | `SYNC_LOG_RETENTION_DAYS` | 30 | 同步日志保留天数（`running` 行不删） |
@@ -517,6 +523,43 @@ vodsync/
 ```
 
 ## 变更记录
+
+### v1.10.0
+按 `docs/REVIEW_2026-11-07.md` 第 8 节把 W1~W4 四个批次一次落地：4 个数据级 Bug、
+6 项算法修正、13 项性能优化、7 项次要 Bug。**接口只加字段、不改结构**，
+完整对接说明见 [`docs/UPGRADE_2026-11-07_v1.10.0.md`](docs/UPGRADE_2026-11-07_v1.10.0.md)。
+
+- **数据级修复**
+  - B1 批量加词条改 `ON CONFLICT DO NOTHING`：PG 上"含重复名字 → 整批 500、一个字没进"修掉
+  - B2 `reset_algo_version` 补事务：旧实现 DELETE 不 commit（日志说清空了、实际没删），改算法版本完全不生效
+  - B3 缺演员行重建时按当前词库重算 tag（不命中则清空）：词库删人后旧 `vod_tag` 不再永久残留
+  - B4 源站响应编码兜底（utf-8-sig → charset → gb18030 → big5）：GBK 站点不再把片名写成 `����` 入库
+- **算法（`RELATED_ALGO_VERSION` 1→2）**
+  - 证据先验：缺失字段按缺失权重注入中性分，修掉"稀疏数据得分通胀"
+    （旧版「仅同分类+同地区+同年代」得 0.714，高于「同导演同演员」的 0.368 —— 推荐位退化成同分类列表）
+  - 内容信号门控：只有 标题/演员/导演/编剧 命中才算相似；权重改为 title 0.35 / class 0.15
+  - 演员集合余弦相似度、标题相似度分母改 `max(len)`、明星否定词（访谈/花絮/盘点…）
+  - 兜底从 12 条降到 6 条，且不再与真命中混排
+- **性能**
+  - `RELATED_CANDIDATE_CAP` 600→140、`RELATED_BRUTE_FORCE_MAX` 3000→400：1 万行整站重算 **8.3s（0.83 ms/条），较旧默认快 3.9×**
+  - `_load_feats` 改 keyset 分页（内存恒定 27MB/万行）；全局重算闸门 + 增量重算窗口合并（60s）
+  - 52 处固定开销：`list_tables` 一次取全、`COUNT(*) FILTER` 合并计数、分类清单缓存、启动只校准空条数
+  - `pg_trgm` GIN 索引（后台 `CREATE INDEX CONCURRENTLY`，不锁表）：`name LIKE '%词%'` 走索引
+  - 无筛选列表 `total` 改用 `SUM(sources.total_videos)` 估值（响应带 `total_approximate`），夜间校准精确值
+- **接口（纯新增 + 两处语义修正）**
+  - `/api/v1/related` 新增 `algo_version`、卡片 `reason`（命中原因）
+  - `/api/v1/videos` 新增 `total_approximate`；`/api/v1/categories` 新增 `cached`
+  - `/api/v1/star/related` 的 `truncated` 改精确判定（不再恒 true）
+  - `/api/v1/star-terms` 的 `active` 改为进程内生效数（不再每次重编译词库）
+- **测试**：新增 `scripts/test_v194_integrity.py`（62 项）；`test_v190_related` 按新契约调整为 58 项；
+  全量回归 13/19/17/54/14/42/42/66/36/58/31/39/15/62 全绿
+- 版本号 1.9.3 → 1.10.0
+
+**升级步骤（v1.9.3 → v1.10.0）**：`docker compose pull vodsync && docker compose up -d`。
+无数据库结构变更，但**会清空并重算全部推荐结果**（算法版本 1→2）：启动日志出现
+`算法版本已变更（当前 2），清空 N 条旧推荐结果`，随后按源站串行补齐（单站 20 万行约 3~7 分钟，
+52 站预计数小时）。期间 `/api/v1/related` 走实时兜底（`fallback=true`，仍非空），功能不降级。
+`pg_trgm` 扩展若建不出来只会记 warning，搜索退化为顺序扫描。回滚见「镜像版本与回滚」。
 
 ### v1.9.3
 镜像版本化 + 版本探针：每次构建都打版本号 tag，回滚有据可依。

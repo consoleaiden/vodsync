@@ -133,18 +133,22 @@ def _scan_and_collect(slug: str, pattern, library: frozenset) -> dict:
         batch_tag, batch_map = [], []
         for r in rows:
             hits, src = _hits_for_row(r["name"], r["vod_actor"], pattern, library)
-            if not hits:
-                continue
-            hits = sorted(hits)[: config.STAR_TAG_MAX_PER_VIDEO]
+            if src == "title":
+                # 缺演员行的 vod_tag 由词库推断独占：命中则写入，没命中则清空。
+                # v1.10.0 / B3：旧实现只在 hits 非空时回写，词库删改后旧 tag 永久
+                # 残留（且 upsert 的 COALESCE 保护让它连重新同步都洗不掉）。
+                hits = sorted(hits)[: config.STAR_TAG_MAX_PER_VIDEO]
+                new_tag = ",".join(hits)
+                cur_tag = r["vod_tag"] or ""
+                if cur_tag != new_tag and (new_tag or config.STAR_TAG_CLEAR_STALE):
+                    batch_tag.append({"vid": r["vod_id"], "tag": new_tag})
+            else:
+                hits = sorted(hits)[: config.STAR_TAG_MAX_PER_VIDEO]
             for h in hits:
                 batch_map.append(
                     {"slug": slug, "vod_id": r["vod_id"], "term": h,
                      "src": src, "computed_at": now}
                 )
-            if src == "title":
-                new_tag = ",".join(hits)
-                if (r["vod_tag"] or "") != new_tag:
-                    batch_tag.append({"vid": r["vod_id"], "tag": new_tag})
         if batch_tag:
             _flush_tag_updates(table, batch_tag)
             tag_rows.extend(batch_tag)
@@ -186,7 +190,7 @@ def update_ids(slug: str, ids: list) -> dict:
     增量回填：只重算指定 vod_id（增量同步的 touched ids）。
     先删这些 id 的旧映射，再按当前数据重算插入 + 回写 tag。
     """
-    ids = list(dict.fromkeys(int(i) for i in ids if i))[: config.RELATED_TOUCHED_CAP]
+    ids = list(dict.fromkeys(int(i) for i in ids if i))[: config.STAR_TAG_TOUCHED_CAP]
     if not ids:
         return {"updated": 0}
     pattern = star_pattern()
@@ -350,19 +354,18 @@ def star_related(slug: str, vod_id: int = 0, name: str = "", limit: int = 20):
             star_map.c.term.in_(terms),
             star_map.c.vod_id != target_id,
         ]
-        # 候选总量（截断判断）：distinct 视频数，不受 limit 影响
-        total_cand = conn.execute(
-            select(func.count(func.distinct(star_map.c.vod_id))).where(*cond)
-        ).scalar() or 0
-
-        # 候选：共享任一明星的其他视频，按重叠明星数降序（走 idx_star_map_term）
+        # 候选：共享任一明星的其他视频，按重叠明星数降序（走 idx_star_map_term）。
+        # v1.10.0 / P12：多取 1 条即可判断「有没有被截断」，不再为每次请求做
+        # count(distinct vod_id)（8 位明星 × 各几千部 = 数万行扫描）。
         cand = conn.execute(
             select(star_map.c.vod_id, func.count().label("ov"))
             .where(*cond)
             .group_by(star_map.c.vod_id)
-            .order_by(func.count().desc())
-            .limit(limit)
+            .order_by(func.count().desc(), star_map.c.vod_id.asc())
+            .limit(limit + 1)
         ).all()
+        truncated = len(cand) > limit
+        cand = cand[:limit]
         if not cand:
             return {"target": {"vod_id": target_id, "vod_name": target[1]},
                     "stars": terms, "star_counts": star_counts,
@@ -416,7 +419,7 @@ def star_related(slug: str, vod_id: int = 0, name: str = "", limit: int = 20):
     out = out[:limit]
     return {"target": {"vod_id": target_id, "vod_name": target[1]},
             "stars": terms, "star_counts": star_counts,
-            "truncated": total_cand > len(out), "list": out}
+            "truncated": bool(truncated), "list": out}
 
 
 def star_works(slug: str, term: str, limit: int = 30, exclude_id: int = 0) -> dict:
@@ -473,37 +476,52 @@ def star_works(slug: str, term: str, limit: int = 30, exclude_id: int = 0) -> di
 
 
 def status_all() -> list:
-    """各源站明星 tag 覆盖情况（面板/核对用）。"""
+    """
+    各源站明星 tag 覆盖情况（面板/核对用）。
+
+    v1.10.0 / P13：表存在性一次取全、只用一个连接、视频数与「缺演员数」合并成
+    一次扫描（PG/SQLite 均支持 COUNT(*) FILTER）。旧实现每站 3 次查询 + 3 次借连接。
+    注意 videos 仍取真实 count(*)（不用 sources.total_videos）—— 这是核对用的
+    统计接口，数字必须和库里的行对得上。
+    """
     from .models import sources
 
-    out = []
     with database.engine.connect() as conn:
-        slugs = [r[0] for r in conn.execute(
-            select(sources.c.slug).where(sources.c.enabled == 1)
-        ).all()]
+        rows = conn.execute(
+            select(sources.c.slug)
+            .where(sources.c.enabled == 1).order_by(sources.c.id)
+        ).all()
         map_counts = dict(conn.execute(
-            select(star_map.c.slug, func.count())
-            .group_by(star_map.c.slug)
+            select(star_map.c.slug, func.count()).group_by(star_map.c.slug)
         ).all())
-    for slug in slugs:
-        table = build_vod_table(slug)
-        if not database.table_exists(table.name):
-            continue
-        with database.engine.connect() as conn:
-            videos = conn.execute(
-                select(func.count()).select_from(table)
-            ).scalar() or 0
-            no_actor = conn.execute(
-                select(func.count()).select_from(table).where(
-                    or_(table.c.vod_actor == "", table.c.vod_actor.is_(None))
-                )
-            ).scalar() or 0
-        out.append({
-            "slug": slug,
-            "videos": videos,
-            "no_actor_videos": no_actor,
-            "star_mapped": map_counts.get(slug, 0),
-        })
+        existing = database.list_tables("vod_")
+        out = []
+        for (slug,) in rows:
+            table = build_vod_table(slug)
+            if table.name not in existing:
+                continue
+            no_actor_cond = or_(table.c.vod_actor == "", table.c.vod_actor.is_(None))
+            try:
+                videos, no_actor = conn.execute(
+                    select(
+                        func.count(),
+                        func.count().filter(no_actor_cond),
+                    ).select_from(table)
+                ).first() or (0, 0)
+            except Exception:
+                # 老版本 SQLite 不支持 FILTER：退回两次统计
+                videos = conn.execute(
+                    select(func.count()).select_from(table)
+                ).scalar() or 0
+                no_actor = conn.execute(
+                    select(func.count()).select_from(table).where(no_actor_cond)
+                ).scalar() or 0
+            out.append({
+                "slug": slug,
+                "videos": int(videos or 0),
+                "no_actor_videos": int(no_actor or 0),
+                "star_mapped": map_counts.get(slug, 0),
+            })
     return out
 
 
@@ -553,7 +571,7 @@ def untracked_terms(slug: str = "", limit: int = 100, sample: int = 0) -> dict:
                     sources.c.enabled == 1, sources.c.total_videos > 0
                 ).order_by(sources.c.total_videos.desc())
             ).all()]
-    slugs = [s for s in slugs if database.table_exists(build_vod_table(s).name)]
+    slugs = [s for s in slugs if build_vod_table(s).name in database.list_tables("vod_")]
     if not slugs:
         return {"sample_titles": 0, "candidates": []}
 

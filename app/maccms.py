@@ -96,6 +96,50 @@ def build_url(api: str, params: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 响应解码（v1.10.0 / B4）
+#
+# 旧实现 `decode("utf-8", errors="replace")`：GBK 源站的中文字节会被替换成
+# U+FFFD，而 JSON 结构（ASCII 部分）仍然合法 → json.loads 成功、不报错，
+# 整站片名变成「����」并一路 UPSERT 进库，把之前正常的数据覆盖掉。
+# 现在的顺序：UTF-8(含 BOM) → Content-Type 里的 charset → gb18030（GBK 超集）→ big5。
+# 全部失败或结果里仍含 U+FFFD 时抛异常（宁可漏一页并重试，也不污染整站）。
+# ---------------------------------------------------------------------------
+_CHARSET_RE = re.compile(r"charset\s*=\s*[\"']?([\w\-]+)", re.IGNORECASE)
+
+
+def decode_payload(raw: bytes, content_type: str = "") -> dict:
+    """把响应字节解成 JSON 对象（带编码兜底与乱码检测）。"""
+    text = None
+    try:
+        text = raw.decode("utf-8-sig")          # 顺带吃掉 BOM
+    except UnicodeDecodeError:
+        text = None
+    if text is None:
+        cands = []
+        m = _CHARSET_RE.search(content_type or "")
+        if m:
+            cands.append(m.group(1).lower())
+        cands += ["gb18030", "big5"]
+        for enc in cands:
+            try:
+                text = raw.decode(enc)
+                log.info("源站响应非 UTF-8，已按 %s 解码", enc)
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+    if text is None:
+        raise MacCmsError("响应编码无法识别（utf-8/gb18030/big5 均失败），本页丢弃")
+    text = text.lstrip("\ufeff")
+    if "\ufffd" in text:
+        # 走到这里说明解码时用了 replace 或有字节被丢弃 —— 中文已被破坏
+        raise MacCmsError("响应含不可解码字节（疑似编码错误），本页丢弃以免污染片名")
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise MacCmsError("响应不是 JSON 对象（可能命中了错误页）")
+    return data
+
+
+# ---------------------------------------------------------------------------
 # 中转代理：路由拼装、偏好记忆、并发闸门、观测计数
 #
 # 目标地址必须整体 URL 编码后再作为 url 参数传入，否则上游参数里的 & 会被
@@ -272,11 +316,8 @@ class MacCmsClient:
                     # 风控/限流：当前路由重试无意义，立即换路由
                     raise _RouteFailed(f"HTTP {resp.status_code}（拒绝访问/限流）")
                 resp.raise_for_status()
-                # 部分源站返回 GBK/带 BOM 的 JSON，做容错解码
-                data = json.loads(resp.content.decode("utf-8", errors="replace").lstrip("﻿"))
-                if not isinstance(data, dict):
-                    raise MacCmsError("响应不是 JSON 对象（可能命中了错误页）")
-                return data
+                # 部分源站返回 GBK/带 BOM 的 JSON，做容错解码（见 decode_payload）
+                return decode_payload(resp.content, resp.headers.get("content-type", ""))
 
             except (httpx.ConnectError, httpx.ConnectTimeout) as e:
                 # 主机不可达：换路由，不浪费重试次数

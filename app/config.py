@@ -121,6 +121,23 @@ MERGE_CONCURRENCY = int(os.environ.get("MERGE_CONCURRENCY", "4"))
 # 无筛选条件时 total 的缓存秒数。total 只用于算 pagecount/展示，
 # 后台同步写入会造成最多这么多秒的偏差，属可接受（每次请求都全表 count 才是问题）。
 TOTAL_CACHE_SECONDS = int(os.environ.get("TOTAL_CACHE_SECONDS", "60"))
+# total 近似（v1.10.0 / P7）：不带筛选条件的「全站列表」直接用
+# SUM(sources.total_videos)（后台同步一直在维护的数字，几十字节）代替
+# 52 张表各跑一次 count(*)（PG 上是 52 次全表扫，220 万行首次 1~3s）。
+# 响应里会带 total_approximate=true 让客户端知道它是个估值；带筛选条件时仍走精确统计。
+TOTAL_APPROXIMATE_ENABLED = (
+    os.environ.get("TOTAL_APPROXIMATE_ENABLED", "true").lower() == "true"
+)
+
+# 分类清单缓存秒数（v1.10.0 / P10）：/api/v1/categories 不带参数时要对 52 张表做
+# GROUP BY type_id/type_name，几百 ms 起步，而分类几乎不变 —— 缓存 5 分钟。
+CATEGORIES_CACHE_SECONDS = int(os.environ.get("CATEGORIES_CACHE_SECONDS", "300"))
+
+# 搜索索引（v1.10.0 / P8）：PG 的 pg_trgm GIN 索引能让 `name LIKE '%关键词%'`
+# 走索引（默认 B-tree 对左模糊完全无效，长尾词只能全表扫）。
+# 启动时后台建（CREATE INDEX CONCURRENTLY，不锁表、不阻塞服务），建过即跳过。
+# 需要数据库允许 CREATE EXTENSION；没权限时只记一条日志，搜索退化为顺序扫描（功能不变）。
+PG_TRGM_ENABLED = os.environ.get("PG_TRGM_ENABLED", "true").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # 数据维护（sync_logs 清理 / 测试后端的 WAL checkpoint）
@@ -208,21 +225,48 @@ TRUST_PROXY = os.environ.get("TRUST_PROXY", "false").lower() == "true"
 # 权重自动归一为 标题/演员/年代 按原始占比摊分，字段越稀疏标题占比越高。
 # ---------------------------------------------------------------------------
 RELATED_ENABLED = os.environ.get("RELATED_ENABLED", "true").lower() == "true"
-# 算法版本：改了这个值，启动时会清空 vod_related 全表并触发全量重算
-RELATED_ALGO_VERSION = os.environ.get("RELATED_ALGO_VERSION", "1")
+# 算法版本：改了这个值，启动时会清空 vod_related 旧版本行并触发全量重算。
+#   1 → v1.9.x 的「纯权重重分配」
+#   2 → v1.10.0 起：证据先验 + 内容信号门控 + 演员余弦相似度（读路径按版本过滤）
+RELATED_ALGO_VERSION = os.environ.get("RELATED_ALGO_VERSION", "2")
 # 推荐条数：默认与上限（客户端请求 limit 超过上限按上限截断）
 RELATED_LIMIT_DEFAULT = int(os.environ.get("RELATED_LIMIT_DEFAULT", "12"))
 RELATED_LIMIT_MAX = int(os.environ.get("RELATED_LIMIT_MAX", "20"))
-# 命中阈值：候选得分低于该值不进推荐列表；零命中时走兜底链（保证列表非空）
+# 命中阈值：候选得分低于该值不进推荐列表；零命中时走兜底链（保证列表非空）。
+# 注意：v1.10.0 起分数带「证据先验」地板（约 0.2），阈值再往下调已无意义，
+# 想放宽/收紧请用下面 RELATED_REQUIRE_CONTENT_SIGNAL 与各项权重。
 RELATED_MIN_SCORE = float(os.environ.get("RELATED_MIN_SCORE", "0.15"))
+# ---- 证据先验（v1.10.0 / A1）----
+# 旧公式 score = Σ(w·sim)/Σ(w) 只对「双方都有值」的字段求和，字段越少单个弱信号
+# 越接近 1.0 —— 实测「同分类+同年代、标题毫不相干」得 0.667，反而高过
+# 「流浪地球 vs 流浪地球2」的 0.383（排序反转）。
+# 新公式：缺失字段按「缺失权重占比」注入一份中性先验，稀疏数据不再自动封顶：
+#   prior = LAMBDA × (缺失权重 / 总权重)
+#   score = (Σ w·sim + prior × NEUTRAL) / (Σ w + prior)
+RELATED_EVIDENCE_PRIOR = float(os.environ.get("RELATED_EVIDENCE_PRIOR", "0.6"))
+RELATED_EVIDENCE_NEUTRAL = float(os.environ.get("RELATED_EVIDENCE_NEUTRAL", "0.4"))
+# ---- 内容信号门控（v1.10.0 / A1-3）----
+# 只有「标题/演员/导演/编剧」命中才算相似；仅同分类+同地区+同年代的配对
+# 一律不进推荐位（走兜底链，带 m=fb），避免「推荐位里全是同分类随机片」。
+RELATED_REQUIRE_CONTENT_SIGNAL = (
+    os.environ.get("RELATED_REQUIRE_CONTENT_SIGNAL", "true").lower() == "true"
+)
+# 标题相似度达到该值才计入「内容信号」（低于它的标题命中只能当加分项）
+RELATED_TITLE_CONTENT_MIN = float(os.environ.get("RELATED_TITLE_CONTENT_MIN", "0.15"))
+# 可用权重下限：低于该值直接判无关（兜底链接手）。仅用于关掉内容门控时的兜底防线
+RELATED_MIN_EVIDENCE_WEIGHT = float(os.environ.get("RELATED_MIN_EVIDENCE_WEIGHT", "0.35"))
 # 标题相似度双阈值（防两字短标题误伤）：LCS 公共子串 < 该字数 且 bigram Jaccard
 # < JACCARD 阈值时，标题项直接计 0
 RELATED_TITLE_LCS_MIN = int(os.environ.get("RELATED_TITLE_LCS_MIN", "3"))
 RELATED_TITLE_JACCARD_MIN = float(os.environ.get("RELATED_TITLE_JACCARD_MIN", "0.45"))
-# 倒排索引候选集上限：只对「与目标共享信号 token 最多的前 N 个候选」打分
-RELATED_CANDIDATE_CAP = int(os.environ.get("RELATED_CANDIDATE_CAP", "600"))
-# 表行数 <= 该值时跳过倒排索引直接全量两两比较（更精确，小表完全无压力）
-RELATED_BRUTE_FORCE_MAX = int(os.environ.get("RELATED_BRUTE_FORCE_MAX", "3000"))
+# 倒排索引候选集上限：只对「与目标共享信号 token 最多的前 N 个候选」打分。
+# v1.10.0 实测：cap 600→140 让 1 万行的整站重算 27.2s→6.0s（4.5×），
+# Top12 结果基本不变（Top 只要 12 条，给 140 个候选已远超所需）。
+RELATED_CANDIDATE_CAP = int(os.environ.get("RELATED_CANDIDATE_CAP", "140"))
+# 表行数 <= 该值时跳过倒排索引直接全量两两比较。
+# v1.10.0：3000→400。旧阈值是个性能悬崖 —— 3000 行走 O(n²) 要比 1 万行走倒排还慢
+# （实测 18.2s vs 27s/万行，单条 6.08ms vs 2.72ms）。
+RELATED_BRUTE_FORCE_MAX = int(os.environ.get("RELATED_BRUTE_FORCE_MAX", "400"))
 # 超大表的降级阈值：行数超过后只用 标题/分类/年代 计算并丢弃演职员存储（内存保护）
 RELATED_MAX_ROWS_PER_SOURCE = int(os.environ.get("RELATED_MAX_ROWS_PER_SOURCE", "200000"))
 # 重算时一次写入 vod_related 的批大小
@@ -237,13 +281,30 @@ RELATED_CALIBRATION_BUDGET = int(os.environ.get("RELATED_CALIBRATION_BUDGET", "3
 RELATED_IN_DETAIL = os.environ.get("RELATED_IN_DETAIL", "true").lower() == "true"
 # 增量同步收集的「受影响 ID」上限（超过截断，全量同步会走整站重算不依赖它）
 RELATED_TOUCHED_CAP = int(os.environ.get("RELATED_TOUCHED_CAP", "20000"))
+# 兜底链条数上限（v1.10.0 / A4）：零命中时最多补几条「猜你想看」。
+# 旧实现一次补满 12 条同分类最新，和真命中混在一栏，用户分不清。
+RELATED_FALLBACK_LIMIT = int(os.environ.get("RELATED_FALLBACK_LIMIT", "6"))
 
-# 基础权重表（逗号分隔 key:value）。缺失字段自动把权重按比例摊给其余字段，
-# 所以这里配的是「字段齐全时的理想占比」，不需要为数据稀疏调整它。
+# ---- 重算并发闸门与增量合并（v1.10.0 / P5）----
+# 52 个源站同步完各自起线程整站重算，叠加时内存可达 GB 级（单源 20 万行 ≈ 300MB）。
+# 全局最多几个源站同时算（超出的排队，按源站加锁串行）。
+RELATED_RECOMPUTE_CONCURRENCY = int(os.environ.get("RELATED_RECOMPUTE_CONCURRENCY", "2"))
+# 增量重算合并窗口（秒）：窗口内的多次 touched 合并成一次重算。
+# 增量同步一轮会分批触发很多次，每次都全量加载特征纯属浪费；合并后每个源站
+# 每个窗口最多加载一次（0 = 关闭合并，退回旧行为）。
+RELATED_INCREMENT_DEBOUNCE_SECONDS = int(
+    os.environ.get("RELATED_INCREMENT_DEBOUNCE_SECONDS", "60")
+)
+# 窗口内累计的 id 超过「该源站行数 × 该比例」时，直接整站重算（比逐个小批更划算）
+RELATED_INCREMENT_FULL_RATIO = float(os.environ.get("RELATED_INCREMENT_FULL_RATIO", "0.3"))
+
+# 基础权重表（逗号分隔 key:value）。
+# v1.10.0 调整（A1-2）：标题是唯一全量信号 → 0.20→0.35；分类（52 站共用十几个大类，
+# 几乎不含区分信息）0.30→0.15；地区/年代降为语境信号 0.05。
 # 可用 key: class / actor / director / writer / area / year / title
 RELATED_WEIGHTS = os.environ.get(
     "RELATED_WEIGHTS",
-    "class:0.30,actor:0.20,director:0.05,writer:0.05,area:0.10,year:0.10,title:0.20",
+    "class:0.15,actor:0.20,director:0.05,writer:0.05,area:0.05,year:0.05,title:0.35",
 )
 # 占位值表（逗号分隔，比较时忽略大小写）。演职员/地区/年代命中即视为缺失。
 RELATED_PLACEHOLDERS = os.environ.get(
@@ -280,6 +341,14 @@ RELATED_STAR_INFER_MODE = os.environ.get("RELATED_STAR_INFER_MODE", "when_missin
 RELATED_STAR_STRONG_MAX_FIELDS = int(os.environ.get("RELATED_STAR_STRONG_MAX_FIELDS", "1"))
 # 推断演员参与的匹配，相似度乘以该系数（<1 表示弱信号；强推断不受此系数影响）
 RELATED_STAR_SIM_FACTOR = float(os.environ.get("RELATED_STAR_SIM_FACTOR", "0.7"))
+# 标题命中词库的「否定词」（v1.10.0 / A5）：正则，逗号分隔。
+# 「吴京的访谈」「盘点吴京十大名场面」「吴京同款」这类标题虽然提到明星，
+# 但显然不是他主演，命中后强制降为弱信号（inf），不享受 strong 的不打折待遇。
+RELATED_STAR_NEGATIVE_PATTERNS = os.environ.get(
+    "RELATED_STAR_NEGATIVE_PATTERNS",
+    "访谈,专访,花絮,幕后,解说,盘点,合集,混剪,预告,同款,致敬,恶搞,吐槽,影评,"
+    "reaction,采访,纪录片",
+)
 
 # ---------------------------------------------------------------------------
 # 存量字段回填（v1.9.0）
@@ -307,8 +376,20 @@ STAR_TAG_AUTO_AFTER_SYNC = os.environ.get("STAR_TAG_AUTO_AFTER_SYNC", "true").lo
 STAR_TAG_NIGHTLY_BUDGET = int(os.environ.get("STAR_TAG_NIGHTLY_BUDGET", "2"))
 STAR_TAG_NIGHTLY_HOUR = int(os.environ.get("STAR_TAG_NIGHTLY_HOUR", "3"))
 STAR_TAG_NIGHTLY_MINUTE = int(os.environ.get("STAR_TAG_NIGHTLY_MINUTE", "40"))
+# 同一源站两次夜间重建的最小间隔（小时）。配合「按上次重建时间轮转」，
+# 保证每个源站都能轮到，而不是每晚捶同一批小站（v1.10.0 / C1）。
+STAR_TAG_NIGHTLY_MIN_INTERVAL_HOURS = int(
+    os.environ.get("STAR_TAG_NIGHTLY_MIN_INTERVAL_HOURS", "20")
+)
 # 单视频最多写入的明星数（防超长溢出 vod_tag VARCHAR(255)）
 STAR_TAG_MAX_PER_VIDEO = int(os.environ.get("STAR_TAG_MAX_PER_VIDEO", "5"))
+# 重建时清掉「旧推断残留」tag（v1.10.0 / B3）：
+# 旧实现只在命中词库时才回写 vod_tag，词库删改后旧值永久残留，而 upsert 的
+# COALESCE(NULLIF()) 保护又让它连源站重同步都洗不掉。开启后，缺演员的行
+# 每次重建都会按当前词库重算 tag（命中则写入，不命中则清空）。
+STAR_TAG_CLEAR_STALE = os.environ.get("STAR_TAG_CLEAR_STALE", "true").lower() == "true"
+# 增量回填单次处理的 id 上限（v1.10.0 / C11：与推荐用的 RELATED_TOUCHED_CAP 解耦）
+STAR_TAG_TOUCHED_CAP = int(os.environ.get("STAR_TAG_TOUCHED_CAP", "50000"))
 # 扫描批大小（keyset 分页步长，内存恒定）
 STAR_TAG_BATCH_SIZE = int(os.environ.get("STAR_TAG_BATCH_SIZE", "2000"))
 # 明星相关视频 API 默认/上限条数

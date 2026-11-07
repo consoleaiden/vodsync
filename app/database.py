@@ -219,3 +219,49 @@ def list_tables(prefix: str = "") -> set:
 
 def is_sqlite() -> bool:
     return _is_sqlite
+
+
+# ---------------------------------------------------------------------------
+# 搜索索引（v1.10.0 / P8）
+#
+# `name LIKE '%关键词%'` 用不上 B-tree（左模糊），52 张表各扫一遍就是秒级。
+# pg_trgm 的 GIN 索引让它走索引：长尾词从秒级降到 ms 级。
+#
+# 为什么放在后台线程里做：
+#   - CREATE INDEX CONCURRENTLY 不锁表，但 200 万行仍要几十秒到几分钟；
+#   - 启动时同步执行会把服务卡在启动阶段（调度器都起不来）。
+# 幂等：IF NOT EXISTS，建过即跳过；不能建（权限/版本）只记一条日志，
+# 搜索退化为顺序扫描 —— 功能不变，只是慢。
+# ---------------------------------------------------------------------------
+def ensure_search_indexes() -> dict:
+    """为每张 vod_* 表建 name 的 pg_trgm GIN 索引（幂等、后台调用）。"""
+    if _is_sqlite:
+        return {"skipped": "sqlite"}
+    if not config.PG_TRGM_ENABLED:
+        return {"skipped": "disabled"}
+    try:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+    except Exception as e:
+        log.warning("pg_trgm 不可用（搜索将走顺序扫描，功能不受影响）: %s", str(e)[:200])
+        return {"error": "extension_unavailable"}
+
+    created, failed = [], 0
+    for tname in sorted(list_tables("vod_")):
+        if tname == "vod_related":
+            continue
+        idx = f"idx_trgm_{tname}"
+        try:
+            with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                conn.execute(text(
+                    f'CREATE INDEX CONCURRENTLY IF NOT EXISTS "{idx}" '
+                    f'ON "{tname}" USING gin (name gin_trgm_ops)'
+                ))
+            created.append(tname)
+        except Exception as e:
+            failed += 1
+            log.warning("建搜索索引失败 %s: %s", tname, str(e)[:160])
+    if created:
+        log.info("搜索索引已就绪（pg_trgm GIN）: %d 张表%s",
+                 len(created), f"，失败 {failed} 张" if failed else "")
+    return {"created": len(created), "failed": failed}

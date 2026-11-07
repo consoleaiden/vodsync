@@ -96,15 +96,57 @@ def _count_one(slug: str, wd: str, type_name: str, type_id: int, existing: set) 
         return 0, True
 
 
+def _approx_total(slugs: list):
+    """
+    total 的近似值（v1.10.0 / P7）：SUM(sources.total_videos)。
+
+    不带筛选条件时，精确 total 要对 52 张表各跑一次 count(*)（PG 上是 52 次全表扫，
+    220 万行首次 1~3s，而且 TOTAL_CACHE_SECONDS 一到又重来）。sources.total_videos
+    是同步链路一直在维护的数字，读它只要一次小表查询 —— 响应里会带
+    total_approximate=true，客户端据此决定是否把它当精确分页依据。
+    任一源站没有登记（或全部为 0）时返回 None，调用方回落到精确统计。
+    """
+    if not config.TOTAL_APPROXIMATE_ENABLED or not slugs:
+        return None
+    from .models import sources
+
+    try:
+        with database.engine.connect() as conn:
+            rows = conn.execute(
+                select(sources.c.slug, sources.c.total_videos)
+                .where(sources.c.slug.in_(slugs))
+            ).all()
+    except Exception as e:
+        log.warning("读取 total 估值失败（回落精确统计）: %s", e)
+        return None
+    m = {r[0]: int(r[1] or 0) for r in rows}
+    total = sum(m.get(s, 0) for s in slugs)
+    return total if total > 0 else None
+
+
 def _total(slugs: list, wd: str, type_name: str, type_id: int, existing: set) -> tuple:
-    """并行统计总行数，返回 (total, partial, from_cache)。"""
+    """
+    统计总行数，返回 (total, partial, from_cache, approximate)。
+
+    无筛选条件时优先用 SUM(sources.total_videos) 估值（见 _approx_total）；
+    有筛选条件时只能精确统计（条件不同无法复用）。
+    """
     cacheable = config.TOTAL_CACHE_SECONDS > 0 and not wd and not type_name and not type_id
     key = tuple(slugs)
     if cacheable:
         with _total_lock:
             hit = _total_cache.get(key)
         if hit and hit[0] > time.time():
-            return hit[1], hit[2], True
+            return hit[1], hit[2], True, hit[3]
+
+    if cacheable:
+        approx = _approx_total(slugs)
+        if approx is not None:
+            with _total_lock:
+                if len(_total_cache) > _TOTAL_CACHE_MAX_KEYS:
+                    _total_cache.clear()
+                _total_cache[key] = (time.time() + config.TOTAL_CACHE_SECONDS, approx, False, True)
+            return approx, False, False, True
 
     total, partial = 0, False
     workers = max(1, min(config.MERGE_CONCURRENCY, len(slugs)))
@@ -119,8 +161,8 @@ def _total(slugs: list, wd: str, type_name: str, type_id: int, existing: set) ->
         with _total_lock:
             if len(_total_cache) > _TOTAL_CACHE_MAX_KEYS:
                 _total_cache.clear()
-            _total_cache[key] = (time.time() + config.TOTAL_CACHE_SECONDS, total, partial)
-    return total, partial, False
+            _total_cache[key] = (time.time() + config.TOTAL_CACHE_SECONDS, total, partial, False)
+    return total, partial, False, False
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +240,7 @@ def merged_page(
 
     existing = database.list_tables("vod_")
     live = [s for s in slugs if build_vod_table(s).name in existing]
-    total, partial, from_cache = _total(slugs, wd, type_name, type_id, existing)
+    total, partial, from_cache, approx = _total(slugs, wd, type_name, type_id, existing)
     pagecount = (total + page_size - 1) // page_size
 
     collected: list = []
@@ -234,6 +276,7 @@ def merged_page(
         "failed": failed,
         "strategy": "merge",
         "total_cached": from_cache,
+        "total_approximate": bool(approx),
         "tables": len(live),
         "elapsed_ms": int((time.time() - started) * 1000),
     }
@@ -259,22 +302,18 @@ def union_page(
     existing = database.list_tables("vod_")
 
     union_parts = []
-    params: dict = {}
-    for i, slug in enumerate(slugs):
+    for slug in slugs:
         table = build_vod_table(slug)
         if table.name not in existing:
             continue
         where = []
         if wd:
-            tpl = f"%{_esc_like(wd)}%"
-            where.append(table.c.name.like(tpl, escape="\\"))
-            params[f"wd_{i}"] = tpl
+            # 值已在 SQL 里内联（转义过），不再构造 params 字典（v1.10.0 / C13 死代码清理）
+            where.append(table.c.name.like(f"%{_esc_like(wd)}%", escape="\\"))
         if type_name:
             where.append(table.c.type_name == type_name)
-            params[f"tn_{i}"] = type_name
         if type_id:
             where.append(table.c.type_id == type_id)
-            params[f"ti_{i}"] = type_id
         cols = [
             table.c.vod_id,
             table.c.type_id,
@@ -292,20 +331,19 @@ def union_page(
     if not union_parts:
         return {
             "total": 0, "pagecount": 0, "rows": [], "partial": False, "failed": [],
-            "strategy": "union", "total_cached": False, "tables": 0,
-            "elapsed_ms": int((time.time() - started) * 1000),
+            "strategy": "union", "total_cached": False, "total_approximate": False,
+            "tables": 0, "elapsed_ms": int((time.time() - started) * 1000),
         }
 
     merged = union_all(*union_parts).subquery()
     with database.engine.connect() as conn:
-        total = conn.execute(select(func.count()).select_from(merged), params).scalar() or 0
+        total = conn.execute(select(func.count()).select_from(merged)).scalar() or 0
         pagecount = (total + page_size - 1) // page_size
         rows = conn.execute(
             select(merged)
             .order_by(literal_column("vod_time").desc(), literal_column("vod_id").desc())
             .offset((page - 1) * page_size)
-            .limit(page_size),
-            params,
+            .limit(page_size)
         ).mappings().all()
 
     return {
@@ -316,6 +354,7 @@ def union_page(
         "failed": [],
         "strategy": "union",
         "total_cached": False,
+        "total_approximate": False,
         "tables": len(union_parts),
         "elapsed_ms": int((time.time() - started) * 1000),
     }

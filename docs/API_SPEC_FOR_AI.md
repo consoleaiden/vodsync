@@ -3,7 +3,7 @@
 > **本文档的用途**：把 VodSync 服务作为后端，交由 AI（或 AI 编程助手）开发客户端 App。
 > 文档自包含：只读本文即可完成全部对接，**不需要**阅读服务端源码。
 >
-> 对应服务版本：**v1.9.3** ｜ 文档版本：`2026-11-07` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.10.0** ｜ 文档版本：`2026-11-07` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 **目录**
 
@@ -290,7 +290,7 @@ type PlayLine = {
 ### 4.1 GET `/healthz`
 
 ```json
-{ "status": "ok", "db": true, "version": "1.9.3", "build": "7b4458781508a9055d84a0f744d5ce1327db984d", "time": "2026-10-30T16:09:53.527655" }
+{ "status": "ok", "db": true, "version": "1.10.0", "build": "7b4458781508a9055d84a0f744d5ce1327db984d", "time": "2026-10-30T16:09:53.527655" }
 ```
 
 用途：服务可用性探测 + 判断是否启用 API Key（见 2.1）。
@@ -948,11 +948,12 @@ GET /api/v1/related?slug=jkun&id=134369&limit=8
   "code": 1, "slug": "jkun", "vod_id": 134369, "limit": 12,
   "fallback": false,
   "computed_at": "2026-11-06T04:30:12",
-  "algo_version": "1",
+  "algo_version": "2",
   "list": [
     { "vod_id": 135001, "vod_name": "流浪地球2", "vod_pic": "https://...",
       "vod_remarks": "HD国语", "type_name": "科幻片",
-      "source": "jkun", "source_name": "优质资源", "score": 0.88, "mode": "match" }
+      "source": "jkun", "source_name": "优质资源", "score": 0.69, "mode": "match",
+      "reason": "title,class" }
   ]
 }
 ```
@@ -960,9 +961,15 @@ GET /api/v1/related?slug=jkun&id=134369&limit=8
 要点：
 
 - **直读预计算表 + 一次 IN 补卡片字段**，P95 < 50ms（实测 0.3ms）；预计算缺失时自动实时兜底
-- `fallback=true` 表示整条列表来自兜底链（同分类→同地区/年代→最新收录），客户端可弱化展示；
+- `fallback=true` 表示**整条列表**来自兜底链（同分类→同地区/年代→最新收录），客户端可弱化展示；
   列表**永远非空**（只要视频本身存在）
 - `mode`: `match`=真实得分命中 / `fallback`=兜底条目；`source`/`source_name` 供跨站跳转
+- `algo_version`（v1.10.0 新增）：当前算法版本。缓存时建议带上它，版本变化即失效
+- `reason`（v1.10.0 新增，卡片级）：命中原因，逗号分隔，取值 `title` / `actor` / `director` /
+  `writer` / `class` / `area` / `year`，按贡献排序；兜底条目为空串。
+  可直接做「因为你也看过…」副标题，忽略也不影响渲染
+- **v1.10.0 语义收紧**（见 11 版本记录）：仅同分类/同地区/同年代的配对**不再进推荐位**
+  （旧版给这类不相关配对 0.667 的高分）；零命中时兜底从 12 条降为 6 条，且不与真命中混排
 - 视频不存在返回 `404` 标准错误结构（不 500）
 - REST 详情与 `?ac=detail&ids=` 响应附带 `related` / `related_fallback` 字段
   （`RELATED_IN_DETAIL=true` 默认开启），客户端可省一次请求
@@ -1016,7 +1023,7 @@ GET /api/v1/related?slug=jkun&id=134369&limit=8
 - 排序：`overlap` 重叠明星数降序，同分按更新时间降序；已下架视频自动跳过
 - 查询走 `star_map` 的 `(slug, term)` 索引，毫秒级
 - **v1.9.2 新增字段（纯新增，向后兼容）**：`star_counts` = `{明星名: 本源站作品数}`
-  （降序，Tab 角标用）；`truncated` = 候选总数超 `limit` 时为 true。`stars` 仍是 `string[]`
+  （降序，Tab 角标用）；`truncated` = 候选总数超 `limit` 时为 true（v1.10.0 起精确判定，命中不足时为 `false`，客户端「加载更多」不会再空转）。`stars` 仍是 `string[]`
 - `name` 路径健壮性（v1.9.2）：前后/中间空格、全半角差异、LIKE 通配符转义；
   确实找不到保持 404（客户端主走 `vod_id`）
 - 无明星 → `stars` 与 `list` 为空数组；目标视频不存在 → `404` 标准错误
@@ -1376,6 +1383,17 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 | `PROXY_ENABLED` / `PROXY_URLS` | true / 2 个内置代理 | 直连失败后自动走中转代理（`{proxy}?url=<urlencode(目标)>`） |
 | `PROXY_PREF_TTL_MINUTES` | 30 | "该源站需走代理"的记忆时长 |
 | `MERGE_MAX_PER_TABLE` / `MERGE_CONCURRENCY` | 3000 / 4 | 多源列表归并：每表最多取多少行、并行度 |
+| `TOTAL_APPROXIMATE_ENABLED` | true | v1.10.0：无筛选列表的 `total` 用 `SUM(sources.total_videos)` 估值（省 52 次 count），响应带 `total_approximate` |
+| `CATEGORIES_CACHE_SECONDS` | 300 | v1.10.0：`/api/v1/categories` 结果缓存秒数 |
+| `PG_TRGM_ENABLED` | true | v1.10.0：启动后台建 `pg_trgm` GIN 索引（`CREATE INDEX CONCURRENTLY`，不锁表；无权限仅记日志） |
+| `RELATED_ALGO_VERSION` | 2 | v1.10.0 起默认 2（证据先验 + 内容信号门控 + 演员余弦）；改动即触发清旧结果并全量重算 |
+| `RELATED_EVIDENCE_PRIOR` / `RELATED_EVIDENCE_NEUTRAL` | 0.6 / 0.4 | v1.10.0：证据先验强度与中性分（解决稀疏字段得分通胀） |
+| `RELATED_REQUIRE_CONTENT_SIGNAL` | true | v1.10.0：仅标题/演员/导演/编剧命中才算相似，纯分类+地区+年代不进推荐位 |
+| `RELATED_CANDIDATE_CAP` / `RELATED_BRUTE_FORCE_MAX` | 140 / 400 | v1.10.0：倒排候选上限、小表全量比较阈值（旧值 600/3000 是性能悬崖） |
+| `RELATED_FALLBACK_LIMIT` | 6 | v1.10.0：零命中时兜底条数上限（原为 12，与真命中混排） |
+| `RELATED_RECOMPUTE_CONCURRENCY` | 2 | v1.10.0：全局最多几个源站同时整站重算（防内存叠加） |
+| `RELATED_INCREMENT_DEBOUNCE_SECONDS` / `RELATED_INCREMENT_FULL_RATIO` | 60 / 0.3 | v1.10.0：增量重算合并窗口；窗口内累计 id 超整站比例则直接整站重算 |
+| `STAR_TAG_CLEAR_STALE` | true | v1.10.0：缺演员的行按当前词库重算 tag（不命中则清空，修掉旧推断残留） |
 | `DATABASE_URL` | `postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync` | PostgreSQL（v1.7.0 起固定） |
 
 > 中转代理是**服务端行为**，对客户端完全透明：App 调用的接口路径、字段、状态码都不变，只是原本拿不到数据的源站现在能同步成功。
@@ -1384,7 +1402,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.9.3（当前） | `GET /healthz` 新增 `version` / `build`（镜像构建提交 SHA），便于升级/回滚核对与报障定位；无新增/变更业务接口，**客户端无需改动** |
+| v1.10.0（当前） | **算法与性能升级（无破坏性字段变更）**：`/api/v1/related` 新增 `algo_version` 与卡片级 `reason`（命中原因）；仅同分类/同地区/同年代的配对不再进推荐位、兜底条数降为 6 条且不与真命中混排；`/api/v1/videos` 无筛选时 `total` 改为估值并带 `total_approximate`；`/api/v1/categories` 新增 `cached`；`/api/v1/star/related` 的 `truncated` 改精确判定；`/api/v1/star-terms` 的 `active` 改为进程内生效数。详见 `UPGRADE_2026-11-07_v1.10.0.md` |
+| v1.9.3 | `GET /healthz` 新增 `version` / `build`（镜像构建提交 SHA），便于升级/回滚核对与报障定位；无新增/变更业务接口，**客户端无需改动** |
 | v1.9.2 | **按明星查作品**：`GET /api/v1/star/works`（明星为中心，`total` 不受 limit 影响，无映射返回 200+空列表）；`star/related` 新增 `star_counts`（明星→作品数，Tab 角标）与 `truncated`（截断标志），`stars` 结构不变；`name` 匹配健壮性（空格/全半角/LIKE 转义）；词库 `aliases` 别名归一主名；`star/tags/untracked` 未入词库高频词统计 |
 | v1.9.1 | **明星作品推荐**：词库明星名回填缺失演员视频的 `vod_tag`（单正则一次扫描，O(标题长) 与词库大小解耦）；新表 `star_map` 明星-视频倒排映射（`src=actor/title` 可信度标记）；`GET /api/v1/star/related` 共享明星视频（走索引毫秒级）；`maintenance/star-tags` 手动重建、`star/tags/status` 覆盖统计；UPSERT 空 `vod_tag` 不覆盖本地推断值；同步后自动维护 + 每晚小站优先重建 |
 | v1.9.0 | **相关推荐（服务端预计算）**：`GET /api/v1/related`（预计算直读 P95<50ms，fallback 兜底列表非空）；REST 详情与 `ac=detail` 附带 `related` 数组（`RELATED_IN_DETAIL` 可关）；`vod_{slug}` 新增 `vod_actor/vod_director/vod_writer/vod_area/vod_year/vod_tag` 列（存量库自动补列）；详情卡片字段不变、只增；新增明星词库管理接口与 `related/status`、`maintenance/related-recompute` |

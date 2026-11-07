@@ -146,6 +146,8 @@ App 初始化时调用一次，得到全部可用源站及其对接路径。
 
 ### 3.2 GET `/api/v1/categories` — 分类清单
 
+> v1.10.0：响应多一个 `cached`（`true`=命中服务端缓存，默认 5 分钟）。纯诊断字段，客户端忽略即可。
+
 **参数**：`source`（可选，多源逗号分隔；留空合并全部源站）
 
 **响应**：
@@ -225,6 +227,10 @@ GET /api/v1/videos?source=jkun&type_name=电影
 
 **播放地址使用建议**：优先取 `vod_play_list[*].episodes[*].url`（已结构化）；`vod_play_url` 是源站原始串仅作兜底。地址多为 m3u8 直链，可直接交给播放器内核。
 
+> **v1.10.0：`total` 可能是估值。** 不带 `wd` / `type_id` / `type_name` / `ids` 的全站列表，`total` 改为取 `SUM(sources.total_videos)`（后台同步一直维护的数字），并在响应里带 `"total_approximate": true`，省掉 52 张表各跑一次 `count(*)`。
+> 影响：`total` 与 `pagecount` 可能有 1~2 页级别的偏差（翻到最末页才看得出来）。带筛选条件时仍是精确值。
+> 建议：需要「共 N 条」这类强展示时，判断到 `total_approximate` 就把文案降级为「约 N 条」，或只展示已加载的条数。
+
 **错误**：
 - `ids` 无数字格式错误 → 400
 - `ids` 均未命中 → 404（detail 中提示改用搜索接口确认 vod_id）
@@ -283,7 +289,7 @@ GET /api/v1/jkun?ac=list&wd=三体     # 搜索
 
 响应结构：`{code, msg, page, pagecount, limit, total, class:[{type_id,type_name}], list:[...]}`，`ac=detail` 时 list 元素含 `vod_content / vod_play_url / vod_play_from / vod_play_list`。
 
-### 3.7 推荐与明星接口（v1.9.0 / v1.9.2）
+### 3.7 推荐与明星接口（v1.9.0 / v1.9.2 / v1.10.0）
 
 > 详情页推荐栏的三层数据来源：`related`（内容相似）→ `star/related`（全部 Tab）→ `star/works`（单个明星 Tab）。
 
@@ -292,8 +298,17 @@ GET /api/v1/jkun?ac=list&wd=三体     # 搜索
 ```bash
 GET /api/v1/related?slug=jkun&id=134369&limit=12
 ```
-返回 `{code, slug, vod_id, limit, fallback, list:[{vod_id, vod_name, vod_pic, vod_remarks, type_name, source, source_name, score, mode}]}`。
+返回 `{code, slug, vod_id, limit, fallback, computed_at, algo_version, list:[{vod_id, vod_name, vod_pic, vod_remarks, type_name, source, source_name, score, mode, reason}]}`。
 列表**永远非空**（零命中走兜底链）；`fallback=true` 表示整条来自兜底（同分类→同地区/年代→最新），客户端可弱化展示。未知 `slug`/`id` → 404。
+
+v1.10.0 追加两个字段（纯新增，老代码忽略即可）：
+
+| 字段 | 说明 |
+|---|---|
+| `algo_version` | 当前算法版本（字符串，本版为 `"2"`）。做本地缓存时把它放进 key，算法升级后缓存自动失效 |
+| `list[].reason` | 该条命中的原因，逗号分隔，如 `title,actor` / `director`；兜底条目为空串。可做「因为你也看过…」副标题 |
+
+**行为变化（升级需知）**：仅「同分类+同地区+同年代」而不共享任何标题/演职员信号的配对，本版起不再进推荐位（旧版会给这类不相关影片 0.667 的高分，是误判）。零命中时兜底条数从 12 条降为 6 条，且不再与真命中混排 —— 所以推荐栏偶尔会比以前短，属正常。
 
 #### GET `/api/v1/star/related` — 明星维度（详情页「全部」Tab，v1.9.2 增强）
 
@@ -321,7 +336,7 @@ GET /api/v1/star/related?slug=jkun&name=流浪地球      # 名称兜底（先�
 |---|---|
 | `stars` | **string[]**，本视频命中的明星（结构未变，向后兼容） |
 | `star_counts` | **v1.9.2 新增**：`{明星名: 作品数}`，按作品数降序 —— Tab 角标用 |
-| `truncated` | **v1.9.2 新增**：候选总数超过 `limit` 被截断时为 `true`（提示「查看更多」） |
+| `truncated` | **v1.9.2 新增**：候选总数超过 `limit` 被截断时为 `true`（提示「查看更多」）。**v1.10.0 起改为精确判定**：命中不足 `limit` 时为 `false`，不会再出现「按钮常亮但点不出内容」 |
 | `list[].match_stars` | 该条与目标重叠的明星名 |
 | `list[].overlap` | 重叠明星数，列表按它降序、同分按更新时间降序 |
 

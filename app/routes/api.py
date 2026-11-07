@@ -19,7 +19,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
-from sqlalchemy import func, select, text
+from sqlalchemy import bindparam, func, select, text
 
 from .. import __version__, auth, config, database
 from ..models import build_vod_table, sources, sync_logs
@@ -200,6 +200,11 @@ def _maccms_class_map(conn, table):
     return [{"type_id": r[0], "type_name": r[1]} for r in rows if r[1]]
 
 
+def _esc_like(kw: str) -> str:
+    """转义 LIKE 通配符（\\ % _），避免用户输入变成全表匹配。"""
+    return kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _query_vods(
     conn,
     table,
@@ -211,12 +216,12 @@ def _query_vods(
 ):
     """通用分页查询：按更新时间倒序。返回 (total, pagecount, items)。"""
     where = []
-    params: dict = {}
     if type_id:
         where.append(table.c.type_id == type_id)
     if wd:
-        where.append(table.c.name.like(f"%{wd}%"))
-        params["wd"] = f"%{wd}%"
+        # v1.10.0 / C3：原来没转义通配符，搜 `%` 或 `_` 会变成全表匹配；
+        # 另外 params 里存了值却从没绑定（死代码），一并去掉。
+        where.append(table.c.name.like(f"%{_esc_like(wd)}%", escape="\\"))
 
     base = select(table).where(*where) if where else select(table)
     total = conn.execute(
@@ -304,6 +309,18 @@ def _detail_item(source: str, row) -> dict:
 # ---------------------------------------------------------------------------
 # 分类接口：供客户端做「分类浏览」入口
 # ---------------------------------------------------------------------------
+# 分类清单缓存（v1.10.0 / P10）：不带参数时要做 52 次 GROUP BY（几百 ms），
+# 而分类几乎不变 —— 缓存 CATEGORIES_CACHE_SECONDS 秒，面板/App 反复进入分类页不再打库。
+_categories_cache: dict = {}
+_categories_lock = threading.Lock()
+
+
+def reset_categories_cache() -> None:
+    """清空分类缓存（同步/删源站后由调用方按需触发）。"""
+    with _categories_lock:
+        _categories_cache.clear()
+
+
 @router.get("/api/v1/categories")
 def categories(
     source: str = Query("", description="源站 slug，逗号分隔多源；留空=全部源站合并"),
@@ -316,6 +333,9 @@ def categories(
       /api/v1/categories?source=jkun,t1       多源合并（同名分类会合并计数）
       /api/v1/categories                      全部源站合并
     拿到 type_id 后即可用 GET /api/v1/videos?source=..&type_id=.. 按分类翻页。
+
+    v1.10.0（纯新增）：响应带 `cached`（true = 命中本地缓存，分类几乎不变，
+    默认缓存 CATEGORIES_CACHE_SECONDS=300 秒）。客户端无需处理，仅供排查。
     """
     from collections import defaultdict
 
@@ -329,11 +349,20 @@ def categories(
                 select(sources.c.slug).where(sources.c.enabled == 1)
             ).all()]
 
+    cache_key = (tuple(slugs), source)
+    ttl = config.CATEGORIES_CACHE_SECONDS
+    if ttl > 0:
+        with _categories_lock:
+            hit = _categories_cache.get(cache_key)
+        if hit and hit[0] > time.time():
+            return {"code": 1, "total": len(hit[1]), "list": hit[1], "cached": True}
+
     merged: dict = defaultdict(lambda: {"type_id": None, "type_name": "", "count": 0, "sources": []})
+    existing = database.list_tables("vod_")   # v1.10.0 / P6：一次取全，别逐表往返
     with database.engine.connect() as conn:
         for slug in slugs:
             table = build_vod_table(slug)
-            if not database.table_exists(table.name):
+            if table.name not in existing:
                 continue
             rows = conn.execute(
                 select(table.c.type_id, table.c.type_name, func.count())
@@ -358,7 +387,12 @@ def categories(
         ),
         key=lambda x: (x["type_id"] or 0),
     )
-    return {"code": 1, "total": len(items), "list": items}
+    if ttl > 0:
+        with _categories_lock:
+            if len(_categories_cache) > 32:
+                _categories_cache.clear()
+            _categories_cache[cache_key] = (time.time() + ttl, items)
+    return {"code": 1, "total": len(items), "list": items, "cached": False}
 
 
 # ---------------------------------------------------------------------------
@@ -1097,6 +1131,12 @@ def video_list(
       2. 批量详情：  /api/v1/videos?source=jkun&ids=134369       （含 vod_play_url）
       3. 完整列表：  /api/v1/videos?source=jkun&ac=detail         （列表带播放地址）
       4. 分类浏览：  /api/v1/videos?source=jkun&type_id=6         （配合 /api/v1/categories）
+
+    v1.10.0（纯新增）：不带筛选条件的全站列表（无 wd / type_id / type_name / ids）
+    的 `total` 改为估值，并在响应里带 `total_approximate: true`。
+    出处是 sources.total_videos（后台同步一直维护），省掉 52 张表各跑一次 count(*)。
+    `pagecount` 随之由估值算出，翻到末页可能有 1~2 页偏差；带筛选时仍是精确值。
+    客户端若做「共 N 条 / 最后一页」的强展示，请判断该字段后自行降级为「约 N 条」。
     """
     page, page_size = paging
     # 参数归一化：兼容 `&?ac=detail` 这类多打问号的写法
@@ -1134,10 +1174,11 @@ def video_list(
                 detail="ids 参数格式错误，应为逗号分隔的数字，例如 ids=134369 或 ids=1,2,3",
             )
         items: list = []
+        existing = database.list_tables("vod_")
         with database.engine.connect() as conn:
             for slug in slugs:
                 table = build_vod_table(slug)
-                if not database.table_exists(table.name):
+                if table.name not in existing:
                     continue
                 found = {
                     r["vod_id"]: r
@@ -1201,6 +1242,10 @@ def video_list(
     if result["partial"]:
         resp["total_is_partial"] = True
         resp["sources_failed"] = result["failed"]
+    # v1.10.0：不带筛选条件时 total 取自 SUM(sources.total_videos)（近似值）。
+    # 客户端据此决定分页依据：近似时请以「本页条数 == page_size 就继续翻」为准。
+    if result.get("total_approximate"):
+        resp["total_approximate"] = True
     resp["query_ms"] = result["elapsed_ms"]
     return resp
 
@@ -1284,14 +1329,14 @@ def aggregate_search(
         raise HTTPException(status_code=404, detail="没有可搜索的源站，请先同步数据")
 
     # 转义 LIKE 通配符，避免用户输入 % _ 造成全表匹配
-    esc = kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    pattern = f"%{esc}%"
+    pattern = f"%{_esc_like(kw)}%"
+    existing = database.list_tables("vod_")     # v1.10.0 / P6：一次取全，别每源站一次往返
 
     def search_one(slug: str) -> tuple:
         """查询单个源站表，返回 (slug, rows, truncated, error)。"""
         try:
             table = build_vod_table(slug)
-            if not database.table_exists(table.name):
+            if table.name not in existing:
                 return slug, [], False, None
             where = [table.c.name.like(pattern, escape="\\")]
             if type_name:
@@ -1388,12 +1433,21 @@ def related_videos(
     """
     视频相关推荐（预计算结果直读，P95 < 50ms）。
 
-    返回 {code, slug, vod_id, fallback, computed_at, list}：
+    返回 {code, slug, vod_id, limit, fallback, computed_at, algo_version, list}：
       - list 为对齐视频卡片结构的数组（含 source/source_name/score），
         source 用于客户端跨站点击跳转
-      - fallback=true 表示该条目来自兜底链（同分类/同地区年代/最新收录），
-        客户端可按需弱化展示；列表永远非空（只要该视频本身存在）
+      - fallback=true 表示**整条列表**都来自兜底链（同分类/同地区年代/最新收录），
+        客户端可按需弱化展示或改成「猜你想看」；列表永远非空（只要该视频本身存在）
       - 视频不存在返回 404 标准错误结构
+
+    v1.10.0 变更（对接需注意，均为纯新增或语义收紧）：
+      - 新增 `algo_version`：当前算法版本。与旧值不同的缓存建议直接丢弃。
+      - 卡片新增 `reason`：命中原因，逗号分隔，如 "title,actor" / "director"。
+        兜底条目为空串。可按它做「因为你也看过…」这类展示，也可忽略。
+      - 语义收紧：**仅同分类+同地区+同年代的配对不再进推荐位**（旧版会给这类
+        配对 0.667 的高分，属于 Bug 级误判）。同一部片不会出现在自己的推荐里。
+      - 零命中时的兜底条数从 12 条降到 6 条（RELATED_FALLBACK_LIMIT），
+        不与真命中混排；`fallback=true` 时 `score` 恒为 0、`mode` 为 "fallback"。
     """
     src, table = _require_table(slug)
     with database.engine.connect() as conn:
@@ -1489,7 +1543,13 @@ def _parse_star_terms_input(raw) -> list:
 
 @router.get("/api/v1/star-terms")
 def star_terms_list():
-    """词库清单（含停用条目，便于面板管理）。"""
+    """
+    词库清单（含停用条目，便于面板管理）。
+
+    v1.10.0：`active` 改为返回**进程内当前生效的启用条数**（不再每次请求都
+    重新编译词库正则）。刚写完词库时增删改接口会立即 reload，因此 `active`
+    在一次写请求之后就是新值；多副本部署时其他实例最迟在下次重启/定时任务后一致。
+    """
     from ..models import star_terms
 
     with database.engine.connect() as conn:
@@ -1498,11 +1558,13 @@ def star_terms_list():
         ).mappings().all()
     from .. import related
 
+    # v1.10.0 / P11：读接口不再重新加载+编译词库正则（万级词库约 10ms 且抖动内存），
+    # 直接返回进程内已生效的条数；写接口（增删改）才 reload。
     return {
         "code": 1,
         "infer_mode": config.RELATED_STAR_INFER_MODE,
         "factor": config.RELATED_STAR_SIM_FACTOR,
-        "active": related.reload_star_terms(),
+        "active": related.star_stats()["count"],
         "list": [
             {
                 "id": r["id"], "term": r["term"], "note": r["note"] or "",
@@ -1537,20 +1599,26 @@ def star_terms_add(payload: dict):
             ordered.append(t)
     if not ordered:
         raise HTTPException(status_code=400, detail="没有可添加的词条")
-    added, skipped = 0, 0
+    # v1.10.0 / B1：一次 INSERT ... ON CONFLICT DO NOTHING，而不是逐条 try/except。
+    # PG 里任何语句报错都会把整个事务置为 aborted，后续语句全部失败、提交时抛
+    # PendingRollbackError —— 用户粘一批名单里夹着几个已存在的名字，就会整批 500、
+    # 一个字都进不去（SQLite 是语句级回滚，所以 15 个测试全绿也测不出来）。
+    stmt = (
+        database.dialect_insert(star_terms)
+        .values(term=bindparam("term"), note=note, enabled=1)
+        .on_conflict_do_nothing(index_elements=["term"])
+    )
     with database.write_txn() as conn:
-        for t in ordered:
-            try:
-                conn.execute(star_terms.insert().values(term=t, note=note, enabled=1))
-                added += 1
-            except Exception:
-                skipped += 1   # 唯一键冲突 = 已存在
-    related.reload_star_terms()
+        res = conn.execute(stmt, [{"term": t} for t in ordered])
+        added = res.rowcount if (res.rowcount or 0) > 0 else 0
+    skipped = max(0, len(ordered) - added)
+    # 写操作后只重载一次（旧实现这里 reload 了两遍，等于把万级词库编译两次正则）
+    active = related.reload_star_terms()
     return {
         "code": 1,
         "added": added,
         "skipped": skipped,
-        "active": related.reload_star_terms(),
+        "active": active,
         "msg": f"已添加 {added} 个词条（跳过已存在 {skipped} 个）"
                "。需要点「重算推荐」或等每日校准后生效",
     }
@@ -1591,7 +1659,6 @@ def star_terms_update(term_id: int, payload: dict):
         )
         if not (res.rowcount or 0):
             raise HTTPException(status_code=404, detail=f"词条不存在: {term_id}")
-    related.reload_star_terms()
     return {"code": 1, "updated": sorted(changes), "active": related.reload_star_terms()}
 
 
@@ -1606,7 +1673,6 @@ def star_terms_delete(term_id: int):
         res = conn.execute(star_terms.delete().where(star_terms.c.id == term_id))
         if not (res.rowcount or 0):
             raise HTTPException(status_code=404, detail=f"词条不存在: {term_id}")
-    related.reload_star_terms()
     return {"code": 1, "deleted": term_id, "active": related.reload_star_terms()}
 
 
@@ -1648,6 +1714,11 @@ def star_related_api(
     """
     返回与目标视频共享明星（词库 tag 交集）的其他视频。
     目标视频的明星 = star_map 里的映射（真实演员 ∩ 词库 + 标题命中推断）。
+
+    v1.10.0：`truncated` 改成精确判定 —— 老实现用 `count(distinct vod_id)` 判
+    「是否还有更多」，代价是多扫一遍；现在多取 1 条来判断，`truncated` 因此
+    可以是 false（旧版在命中不足限制条数时也恒为 true，客户端「加载更多」按钮
+    会一直亮着却点不出新内容）。
     """
     from .. import star_tags
 

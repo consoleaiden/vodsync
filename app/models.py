@@ -18,6 +18,7 @@ vod_{slug} 关键字段映射（苹果 CMS -> 本库）：
 """
 import hashlib
 import re
+import threading
 
 from sqlalchemy import (
     Column,
@@ -28,7 +29,6 @@ from sqlalchemy import (
     String,
     Table,
     Text,
-    UniqueConstraint,
     func,
 )
 
@@ -174,6 +174,10 @@ Index("idx_star_map_term", star_map.c.slug, star_map.c.term)
 # vod_{slug} 动态表缓存：避免重复构建 Table 对象
 # ---------------------------------------------------------------------------
 _vod_table_cache: dict = {}
+# v1.10.0 / C5：同步线程与 API 线程可能同时首次访问同一个新表，两个线程都走
+# cache miss 时会对同一个名字构造两次 Table —— SQLAlchemy 的 META 里同名注册
+# 直接抛 InvalidRequestError（偶发 500）。用一把进程内锁包住 cache miss 分支。
+_vod_table_lock = threading.Lock()
 
 
 def slugify(name: str) -> str:
@@ -194,38 +198,44 @@ def build_vod_table(slug: str) -> Table:
     构建并缓存某个源站的数据表定义（vod_{slug}）。
     建表语句由 syncer.ensure_table() 通过 CREATE TABLE IF NOT EXISTS 执行。
     """
-    if slug in _vod_table_cache:
-        return _vod_table_cache[slug]
-    table = Table(
-        f"vod_{slug}",
-        META,
-        Column("vod_id", Integer, primary_key=True, autoincrement=False),
-        Column("type_id", Integer, default=0),
-        Column("type_name", String(64), default=""),
-        Column("name", String(255), nullable=False),
-        Column("pic", String(1024), default=""),
-        Column("remarks", String(128), default=""),
-        Column("content", Text, default=""),
-        Column("play_url", Text, default=""),
-        # ---- 相关推荐信号字段（v1.9.0）----
-        # 抓取阶段已做占位词清洗（"内详"/"未知"/"暂无" 等存为空串）。
-        # 演职员以逗号分隔存储；老库通过 database._migrate() 自动补列。
-        Column("vod_actor", String(512), default=""),
-        Column("vod_director", String(255), default=""),
-        Column("vod_writer", String(255), default=""),
-        Column("vod_area", String(64), default=""),
-        Column("vod_year", String(16), default=""),
-        Column("vod_tag", String(255), default=""),
-        Column("vod_time", String(32), default=""),
-        Column("synced_at", DateTime, server_default=func.now()),
-        UniqueConstraint("vod_id", name=f"uk_vod_{slug}"),
-    )
-    # 常用查询索引：按分类、按名称模糊搜索、按更新时间排序
-    Index(f"idx_{slug}_type", table.c.type_id)
-    Index(f"idx_{slug}_time", table.c.vod_time.desc())
-    Index(f"idx_{slug}_name", table.c.name)
-    _vod_table_cache[slug] = table
-    return table
+    cached = _vod_table_cache.get(slug)
+    if cached is not None:
+        return cached
+    with _vod_table_lock:
+        cached = _vod_table_cache.get(slug)
+        if cached is not None:
+            return cached
+        table = Table(
+            f"vod_{slug}",
+            META,
+            Column("vod_id", Integer, primary_key=True, autoincrement=False),
+            Column("type_id", Integer, default=0),
+            Column("type_name", String(64), default=""),
+            Column("name", String(255), nullable=False),
+            Column("pic", String(1024), default=""),
+            Column("remarks", String(128), default=""),
+            Column("content", Text, default=""),
+            Column("play_url", Text, default=""),
+            # ---- 相关推荐信号字段（v1.9.0）----
+            # 抓取阶段已做占位词清洗（"内详"/"未知"/"暂无" 等存为空串）。
+            # 演职员以逗号分隔存储；老库通过 database._migrate() 自动补列。
+            Column("vod_actor", String(512), default=""),
+            Column("vod_director", String(255), default=""),
+            Column("vod_writer", String(255), default=""),
+            Column("vod_area", String(64), default=""),
+            Column("vod_year", String(16), default=""),
+            Column("vod_tag", String(255), default=""),
+            Column("vod_time", String(32), default=""),
+            Column("synced_at", DateTime, server_default=func.now()),
+            # v1.10.0 / C14：这里原来还有一个 UniqueConstraint("vod_id")，
+            # 与主键完全重复（多一个唯一索引 = 每次写入多一次索引维护），已删除。
+        )
+        # 常用查询索引：按分类、按名称模糊搜索、按更新时间排序
+        Index(f"idx_{slug}_type", table.c.type_id)
+        Index(f"idx_{slug}_time", table.c.vod_time.desc())
+        Index(f"idx_{slug}_name", table.c.name)
+        _vod_table_cache[slug] = table
+        return table
 
 
 def forget_vod_table(slug: str):

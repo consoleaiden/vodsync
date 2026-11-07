@@ -193,8 +193,9 @@ def _bootstrap():
                 # 后台并行全量同步，不阻塞服务启动
                 threading.Thread(target=syncer.sync_all, daemon=True).start()
         else:
-            # 已同步过的库：启动时校准本地条数（同步中断时 total_videos 可能滞后）
-            syncer.refresh_counts()
+            # 已同步过的库：启动时只校准「条数为 0」的源站（v1.10.0 / P9）。
+            # 全量 count(*) 52 张表要几十秒，会拖住调度器启动；精确值交给夜间校准。
+            syncer.refresh_counts(only_zero=True)
         # 无论首次与否，启动定时调度
         from .scheduler import start_scheduler
 
@@ -227,8 +228,23 @@ def _bootstrap():
             syncer.auto_resume_incomplete()
         except Exception:
             log.exception("自动续跑检查失败（不影响服务）")
+
+        # 搜索索引（v1.10.0 / P8）：pg_trgm GIN，让 name LIKE '%kw%' 能走索引。
+        # 后台线程 + CREATE INDEX CONCURRENTLY（不锁表），首次建完后续自动跳过。
+        if config.PG_TRGM_ENABLED:
+            threading.Thread(
+                target=_ensure_search_indexes_bg, daemon=True, name="pg-trgm"
+            ).start()
     except Exception:
         log.exception("启动引导失败（服务仍可用，可稍后通过 API 手动触发）")
+
+
+def _ensure_search_indexes_bg():
+    """后台建 pg_trgm 搜索索引（失败只记日志，不影响任何功能）。"""
+    try:
+        database.ensure_search_indexes()
+    except Exception:
+        log.exception("创建搜索索引失败（搜索退化为顺序扫描，功能不受影响）")
 
 
 @app.on_event("shutdown")

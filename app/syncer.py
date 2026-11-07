@@ -776,21 +776,29 @@ def _save_checkpoint(slug: str, page: int):
         conn.execute(sources.update().where(sources.c.slug == slug).values(**values))
 
 
-def refresh_counts(slug: str = None) -> int:
+def refresh_counts(slug: str = None, only_zero: bool = False) -> int:
     """
     重算本地条数（用于同步中断/异常后的数据校准，避免面板显示与实际不符）。
     slug 为空则重算全部源站。返回更新的源站数量。
+
+    only_zero=True（v1.10.0 / P9，启动时用）：只重算「本地条数为 0」的源站 ——
+    那些才是面板会显示错的。52 张表全量 count(*) 在 220 万行库上要几十秒，
+    启动阶段做这件事会把调度器一起拖住；精确值交给每天凌晨的校准任务。
     """
     with database.engine.connect() as conn:
         if slug:
             slugs = [slug]
         else:
-            slugs = [r[0] for r in conn.execute(select(sources.c.slug)).all()]
+            q = select(sources.c.slug)
+            if only_zero:
+                q = q.where((sources.c.total_videos.is_(None)) | (sources.c.total_videos <= 0))
+            slugs = [r[0] for r in conn.execute(q).all()]
     done = 0
+    existing = database.list_tables("vod_")   # 一次取全，别逐站往返
     for s in slugs:
         try:
             table = build_vod_table(s)
-            if not database.table_exists(table.name):
+            if table.name not in existing:
                 continue
             count = _table_count(table)
             if count is None:
@@ -983,7 +991,13 @@ def incremental_sync(slug: str, client: MacCmsClient) -> dict:
 
     # 2) 筛选候选：vod_time > 水位线（新更新），可选检测缺失 ID
     table = build_vod_table(slug)
-    candidates = {vid for vid, (t, _tid, _n) in index.items() if t and t > watermark}
+    # v1.10.0 / C8：`t and t > watermark` 会把「源站没给 vod_time」的条目永久排除
+    # （这类条目的字段会停在第一次抓取的状态）。水位线为空（首次增量）时一并收进来；
+    # 之后由 INCR_CHECK_MISSING 的缺失检测兜底。
+    candidates = {
+        vid for vid, (t, _tid, _n) in index.items()
+        if (t and t > watermark) or (not t and not watermark)
+    }
 
     if config.INCR_CHECK_MISSING and len(index) < 200000:
         # 检测本库缺失的 ID（源站数据被重置/换库时可兜底；大表较慢，默认关闭）
@@ -1188,7 +1202,10 @@ def _apply_health(slug: str, status: str, stats: dict):
                 values = {"fail_streak": 0, "skip_until": None}
                 if cur_status == "down":
                     values["status"] = "ok"   # 已恢复在线；下次 refresh 仍会按远端刷新
-                if streak or values.get("status") or "skip_until" in values:
+                # v1.10.0 / C9：原来的条件里 "skip_until" in values 恒为真（它就在
+                # values 里），于是每次成功同步都白跑一次 UPDATE sources。
+                # 只在真的需要改（清零退避 / 恢复在线）时才写。
+                if streak or "status" in values:
                     conn.execute(
                         sources.update().where(sources.c.slug == slug).values(**values)
                     )
@@ -1355,15 +1372,18 @@ def _kick_related(slug: str, mode: str, stats: dict):
     """
     if not config.RELATED_ENABLED:
         return
+    from . import related
     if mode == "full":
         threading.Thread(target=_related_full_worker, args=(slug,), daemon=True).start()
         return
     touched = stats.get("touched") or []
     if touched:
-        threading.Thread(
-            target=_related_ids_worker, args=(slug, list(dict.fromkeys(touched))),
-            daemon=True,
-        ).start()
+        # v1.10.0 / P5：不再每批 touched 起一个线程去全量加载特征，而是入队，
+        # 在 RELATED_INCREMENT_DEBOUNCE_SECONDS 窗口内合并成一次重算。
+        try:
+            related.queue_recompute_ids(slug, list(dict.fromkeys(touched)), reason="after_incremental")
+        except Exception:
+            log.exception("[%s] 增量推荐重算入队失败（忽略）", slug)
 
     # 明星 Tag 回填（v1.9.1）：与推荐重算同节奏 —— 全量整站重建，增量只重算 touched
     if config.STAR_TAG_AUTO_AFTER_SYNC:
@@ -1401,6 +1421,7 @@ def _related_full_worker(slug: str):
 
 
 def _related_ids_worker(slug: str, ids: list):
+    """立即重算指定 id（v1.10.0 起正走 _kick_related 的合并队列；保留供手动调用）。"""
     from . import related
 
     try:
