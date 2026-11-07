@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.9.1"
+    "version": "1.9.2"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -1424,7 +1424,7 @@
     "/api/v1/star-terms/{term_id}": {
       "patch": {
         "summary": "Star Terms Update",
-        "description": "修改词条（名字/备注/启停）。",
+        "description": "修改词条（名字/备注/别名/启停）。别名变更后需重算才生效。",
         "operationId": "star_terms_update_api_v1_star_terms__term_id__patch",
         "parameters": [
           {
@@ -1578,6 +1578,151 @@
               "default": 20,
               "title": "Limit"
             }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/star/works": {
+      "get": {
+        "summary": "Star Works Api",
+        "description": "按明星查作品（v1.9.2，明星为中心）：直接取该明星的全部映射再按时间排序，\n不受「重叠明星数」影响 —— 客户端按明星切 Tab 时不会漏作品。\n\nterm 无映射 / 视频已下架 → 200 + total:0 + list:[]（不是 404）。",
+        "operationId": "star_works_api_api_v1_star_works_get",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "源站 slug",
+              "title": "Slug"
+            },
+            "description": "源站 slug"
+          },
+          {
+            "name": "term",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "description": "明星名（主名或别名）",
+              "title": "Term"
+            },
+            "description": "明星名（主名或别名）"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 30,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "exclude_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "排除的视频 ID（通常是当前详情页视频）",
+              "default": 0,
+              "title": "Exclude Id"
+            },
+            "description": "排除的视频 ID（通常是当前详情页视频）"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/star/tags/untracked": {
+      "get": {
+        "summary": "Star Tags Untracked",
+        "description": "未入词库的高频标题词 Top N（扩词库用，启发式候选）。\n抽样缺演员视频标题 → 屏蔽已命中词库片段 → 剩余文本 2~4 元 n-gram 频次统计。",
+        "operationId": "star_tags_untracked_api_v1_star_tags_untracked_get",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "源站 slug；留空=全部启用源站抽样",
+              "default": "",
+              "title": "Slug"
+            },
+            "description": "源站 slug；留空=全部启用源站抽样"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "sample",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200000,
+              "minimum": 0,
+              "description": "抽样标题数（0=用配置默认）",
+              "default": 0,
+              "title": "Sample"
+            },
+            "description": "抽样标题数（0=用配置默认）"
           }
         ],
         "responses": {

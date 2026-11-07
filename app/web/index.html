@@ -1039,8 +1039,10 @@ function openSettings() {
         <div style="display:flex;align-items:center;gap:6px;padding:5px 8px;border-bottom:1px solid var(--line);font-size:12px">
           <span class="badge ${t.enabled ? "ok" : "mute"}">${t.enabled ? "启用" : "停用"}</span>
           <span style="font-weight:600">${esc(t.term)}</span>
+          ${t.aliases ? `<span style="color:var(--muted)" title="别名（命中归一到主名）">＝ ${esc(t.aliases)}</span>` : ""}
           <span style="color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.note || "")}</span>
           <button class="sm" data-star-toggle="${t.id}" data-en="${t.enabled ? 1 : 0}">${t.enabled ? "停用" : "启用"}</button>
+          <button class="sm" data-star-alias="${t.id}" data-term="${esc(t.term)}" data-aliases="${esc(t.aliases || "")}">别名</button>
           <button class="sm" data-star-edit="${t.id}" data-term="${esc(t.term)}" data-note="${esc(t.note || "")}">改名</button>
           <button class="sm warn" data-star-del="${t.id}">删除</button>
         </div>`).join("");
@@ -1061,6 +1063,14 @@ function openSettings() {
           body: JSON.stringify({ enabled: b.dataset.en !== "1" }),
         });
         toast("已更新（点「重算推荐」生效）");
+      } else if (b.dataset.starAlias) {
+        const aliases = prompt("别名（逗号分隔，命中后归一到主名「" + b.dataset.term + "」）：", b.dataset.aliases);
+        if (aliases === null) return;
+        await api(`/api/v1/star-terms/${b.dataset.starAlias}`, {
+          method: "PATCH", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ aliases }),
+        });
+        toast("别名已保存（点「重算推荐」生效）");
       } else if (b.dataset.starEdit) {
         const name = prompt("修改演员名：", b.dataset.term);
         if (name === null) return;

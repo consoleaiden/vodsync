@@ -314,3 +314,14 @@ STAR_TAG_BATCH_SIZE = int(os.environ.get("STAR_TAG_BATCH_SIZE", "2000"))
 # 明星相关视频 API 默认/上限条数
 STAR_RELATED_LIMIT_DEFAULT = int(os.environ.get("STAR_RELATED_LIMIT_DEFAULT", "20"))
 STAR_RELATED_LIMIT_MAX = int(os.environ.get("STAR_RELATED_LIMIT_MAX", "50"))
+# 按明星查作品 API（v1.9.2）默认/上限条数
+STAR_WORKS_LIMIT_DEFAULT = int(os.environ.get("STAR_WORKS_LIMIT_DEFAULT", "30"))
+STAR_WORKS_LIMIT_MAX = int(os.environ.get("STAR_WORKS_LIMIT_MAX", "100"))
+# 未入词库高频词统计（v1.9.2，扩词库用）：抽样标题数 / 最低频次 / 停用词
+STAR_UNTRACKED_SAMPLE = int(os.environ.get("STAR_UNTRACKED_SAMPLE", "20000"))
+STAR_UNTRACKED_MIN_COUNT = int(os.environ.get("STAR_UNTRACKED_MIN_COUNT", "3"))
+STAR_UNTRACKED_STOPWORDS = os.environ.get(
+    "STAR_UNTRACKED_STOPWORDS",
+    "电影,电视剧,全集,完整版,高清,超清,国语,粤语,英语,中字,字幕,更新,在线,免费,"
+    "第,季,集,部,期,版,篇,之,的,和,与,合集,解说,预告,花絮,正片,加长",
+)

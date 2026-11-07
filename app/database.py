@@ -148,6 +148,8 @@ def _migrate():
         # 健康度退避（v1.8.1）
         ("sources", "fail_streak", "INTEGER DEFAULT 0"),
         ("sources", "skip_until", "TIMESTAMP"),
+        # 明星词库别名（v1.9.2）：逗号分隔，命中后归一到主名
+        ("star_terms", "aliases", "VARCHAR(512) DEFAULT ''"),
     ]
     insp = inspect(engine)
     existing_tables = set(insp.get_table_names())

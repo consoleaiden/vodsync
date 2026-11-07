@@ -25,6 +25,7 @@
 #      会被重新评估 —— 这是有意设计，不是浪费。
 # ---------------------------------------------------------------------------
 import logging
+import re
 import time
 from datetime import datetime
 
@@ -33,13 +34,13 @@ from sqlalchemy import and_, or_
 
 from . import config, database
 from .models import build_vod_table, star_map, star_terms
-from .related import _star_norm, star_pattern
+from .related import _star_norm, canon_hits, canon_star, star_alias_map, star_pattern
 
 log = logging.getLogger("vodsync.star_tags")
 
 
 def _library_set() -> frozenset:
-    """启用词库的归一化名字集合（真实演员行做交集用）。"""
+    """启用词库的主名集合（归一化）。真实演员行做交集用。"""
     with database.engine.connect() as conn:
         rows = conn.execute(
             select(star_terms.c.term).where(star_terms.c.enabled == 1)
@@ -59,17 +60,31 @@ def _actors_of(actor_raw: str) -> set:
     return out
 
 
+def _actor_hits(actor_raw: str, library: frozenset) -> set:
+    """
+    真实演员名 → 词库主名集合。别名也认（v1.9.2）：
+    如「京哥」在别名表里 → 归一为「吴京」。不在词库的演员直接丢弃。
+    """
+    amap = star_alias_map()
+    hits = set()
+    for name in _actors_of(actor_raw):
+        main = amap.get(name)
+        if main and main in library:
+            hits.add(main)
+    return hits
+
+
 def _hits_for_row(name_raw: str, actor_raw: str, pattern, library: frozenset):
     """
-    返回 (明星名集合, 来源)：
-      真实演员行 → 演员 ∩ 词库（不跑正则，快）
-      缺演员行   → 标题单正则扫描
+    返回 (主名集合, 来源)：
+      真实演员行 → 演员 ∩ 词库（别名归一，不跑正则，快）
+      缺演员行   → 标题单正则扫描（命中变体归一为主名）
     """
     if (actor_raw or "").strip():
-        return _actors_of(actor_raw) & library, "actor"
+        return _actor_hits(actor_raw, library), "actor"
     if pattern is None:
         return set(), "title"
-    return set(pattern.findall(_star_norm(name_raw or ""))), "title"
+    return canon_hits(pattern.findall(_star_norm(name_raw or ""))) & library, "title"
 
 
 def _flush_tag_updates(table, upd_rows: list):
@@ -220,8 +235,23 @@ def update_ids(slug: str, ids: list) -> dict:
 # ---------------------------------------------------------------------------
 # 明星作品推荐查询（API 用）
 # ---------------------------------------------------------------------------
+def _esc_like(kw: str) -> str:
+    """转义 LIKE 通配符（\\ % _），避免用户输入变成全表匹配。"""
+    return kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def resolve_target(table, vod_id: int, name: str):
-    """按 id 或名称定位目标视频；名称先精确后模糊（取最近更新的一条）。"""
+    """
+    按 id 或名称定位目标视频（v1.9.2 健壮性加强）：
+      ① 精确匹配
+      ② 名称 LIKE 模糊（通配符已转义，取最近更新一条）
+      ③ 空白差异兜底（「流浪地球 2」↔「流浪地球2」）
+      ④ 全半角差异兜底（NFKC 归一：ＨＤ → HD）
+    仍找不到返回 None —— 调用方保持 404 语义（客户端主走 vod_id 路径）。
+    """
+    import re as _re
+    import unicodedata
+
     with database.engine.connect() as conn:
         if vod_id:
             return conn.execute(
@@ -234,20 +264,45 @@ def resolve_target(table, vod_id: int, name: str):
         row = conn.execute(
             select(table.c.vod_id, table.c.name).where(table.c.name == nm)
         ).first()
-        if not row:
-            row = conn.execute(
+        if row:
+            return row
+
+        def _like(expr, value):
+            return conn.execute(
                 select(table.c.vod_id, table.c.name)
-                .where(table.c.name.like(f"%{nm}%"))
+                .where(expr.like(f"%{_esc_like(value)}%", escape="\\"))
                 .order_by(table.c.vod_time.desc(), table.c.vod_id.desc())
                 .limit(1)
             ).first()
-        return row
+
+        # 依次尝试：原串 → 去空白 → 全半角归一
+        variants = [nm]
+        no_space = _re.sub(r"\s+", "", nm)
+        if no_space and no_space != nm:
+            variants.append(no_space)
+        nfkc = unicodedata.normalize("NFKC", nm).strip()
+        if nfkc and nfkc not in variants:
+            variants.append(nfkc)
+        for v in variants:
+            row = _like(table.c.name, v)
+            if row:
+                return row
+        # 最后兜底：库里名字去空格后再比（标题中间有空格但客户端没带）
+        if no_space:
+            row = _like(func.replace(table.c.name, " ", ""), no_space)
+            if row:
+                return row
+        return None
 
 
 def star_related(slug: str, vod_id: int = 0, name: str = "", limit: int = 20):
     """
     明星作品推荐：与目标视频共享明星（star_map 交集）的其他视频。
-    返回 None = 目标视频不存在；否则 dict(target/stars/list)。
+    返回 None = 目标视频不存在；否则 dict(target/stars/star_counts/truncated/list)。
+
+    v1.9.2 新增（纯新增字段，向后兼容）：
+      star_counts  该视频每位明星在本源站的作品数（降序），客户端渲染 Tab 角标
+      truncated    候选总数超过 limit 被截断 → true（提示「查看更多」）
     """
     table = build_vod_table(slug)
     target = resolve_target(table, vod_id, name)
@@ -271,26 +326,47 @@ def star_related(slug: str, vod_id: int = 0, name: str = "", limit: int = 20):
                 if row[1]:
                     terms = [t for t in row[1].split(",") if t]
                 if not terms and pat is not None:
-                    terms = sorted(_actors_of(row[0]) & _library_set())
+                    terms = sorted(_actor_hits(row[0], _library_set()))
         if not terms:
             return {"target": {"vod_id": target_id, "vod_name": target[1]},
-                    "stars": [], "list": []}
+                    "stars": [], "star_counts": {}, "truncated": False, "list": []}
+
+        # 每位明星在本源站的作品数（Tab 角标用），降序
+        star_counts = {
+            term: int(n) for term, n in sorted(
+                conn.execute(
+                    select(star_map.c.term, func.count())
+                    .where(star_map.c.slug == slug, star_map.c.term.in_(terms))
+                    .group_by(star_map.c.term)
+                ).all(),
+                key=lambda r: -r[1],
+            )
+        }
+        # stars 跟随 star_counts 的顺序（作品多的在前）—— 客户端 Tab 顺序稳定
+        terms = list(star_counts)
+
+        cond = [
+            star_map.c.slug == slug,
+            star_map.c.term.in_(terms),
+            star_map.c.vod_id != target_id,
+        ]
+        # 候选总量（截断判断）：distinct 视频数，不受 limit 影响
+        total_cand = conn.execute(
+            select(func.count(func.distinct(star_map.c.vod_id))).where(*cond)
+        ).scalar() or 0
 
         # 候选：共享任一明星的其他视频，按重叠明星数降序（走 idx_star_map_term）
         cand = conn.execute(
             select(star_map.c.vod_id, func.count().label("ov"))
-            .where(
-                star_map.c.slug == slug,
-                star_map.c.term.in_(terms),
-                star_map.c.vod_id != target_id,
-            )
+            .where(*cond)
             .group_by(star_map.c.vod_id)
             .order_by(func.count().desc())
             .limit(limit)
         ).all()
         if not cand:
             return {"target": {"vod_id": target_id, "vod_name": target[1]},
-                    "stars": terms, "list": []}
+                    "stars": terms, "star_counts": star_counts,
+                    "truncated": False, "list": []}
 
         cand_ids = [r[0] for r in cand]
         ov_map = {r[0]: r[1] for r in cand}
@@ -337,8 +413,63 @@ def star_related(slug: str, vod_id: int = 0, name: str = "", limit: int = 20):
     out.sort(key=lambda x: -x["overlap"])
     for o in out:
         o.pop("_t", None)
+    out = out[:limit]
     return {"target": {"vod_id": target_id, "vod_name": target[1]},
-            "stars": terms, "list": out[:limit]}
+            "stars": terms, "star_counts": star_counts,
+            "truncated": total_cand > len(out), "list": out}
+
+
+def star_works(slug: str, term: str, limit: int = 30, exclude_id: int = 0) -> dict:
+    """
+    按明星查作品（v1.9.2，明星为中心）。
+
+    与 star/related 的本质区别：不按「重叠明星数」全局排序后截断，而是直接取
+    该明星的全部映射再排序 —— 目标视频命中多位明星时，作品少的明星也不会被
+    挤出列表（客户端按明星切 Tab 的数据来源）。查询命中 idx_star_map_term。
+
+    term 做与词库一致的归一化（trim/全半角/繁简），别名归一到主名。
+    """
+    table = build_vod_table(slug)
+    canon = canon_star(term) or _star_norm(term or "").strip()
+    cond = [star_map.c.slug == slug, star_map.c.term == canon]
+    if exclude_id:
+        cond.append(star_map.c.vod_id != exclude_id)
+    # join 而不是「先取 id 再回表」：排序需要 vod_time；同时天然过滤已下架/已清理的行
+    joined = table.join(
+        star_map, and_(star_map.c.vod_id == table.c.vod_id, star_map.c.slug == slug)
+    )
+    with database.engine.connect() as conn:
+        total = conn.execute(
+            select(func.count()).select_from(joined).where(*cond)
+        ).scalar() or 0
+        rows = conn.execute(
+            select(
+                table.c.vod_id, table.c.name, table.c.pic, table.c.remarks,
+                table.c.type_name,
+            )
+            .select_from(joined)
+            .where(*cond)
+            .order_by(table.c.vod_time.desc(), table.c.vod_id.desc())
+            .limit(limit)
+        ).mappings().all()
+    return {
+        "slug": slug,
+        "term": canon,
+        "total": int(total),
+        "list": [
+            {
+                "vod_id": r["vod_id"],
+                "vod_name": r["name"],
+                "vod_pic": r["pic"],
+                "vod_remarks": r["remarks"],
+                "type_name": r["type_name"],
+                "source": slug,
+                "match_stars": [canon],
+                "overlap": 1,
+            }
+            for r in rows
+        ],
+    }
 
 
 def status_all() -> list:
@@ -383,3 +514,97 @@ def rebuild_source_safe(slug: str, reason: str = "manual") -> dict:
     except Exception:
         log.exception("[明星Tag] %s 重建失败（忽略）", slug)
         return {"slug": slug, "error": True}
+
+
+# ---------------------------------------------------------------------------
+# 未入词库高频词统计（v1.9.2，扩词库用）
+#
+# 为什么需要：词库是标题推断的唯一信号来源，词库覆盖不到的名字推不出来。
+# 做法（启发式，结果是候选不是结论）：
+#   1. 抽样「缺演员」视频标题 —— 词库推断的主力人群
+#   2. 用词库正则把已命中片段替换成占位符，只分析剩余文本
+#   3. 剩余中文串切 2~4 元 n-gram，统计**文档频次**（同一标题只计一次）
+#   4. 去掉停用词/低频词；长词优先（短词被同频长词包含则丢弃）
+# 结果给人工在面板确认后加入词库 —— 自动入库会把「第二季」这种噪声写进词库。
+# ---------------------------------------------------------------------------
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
+_untracked_cache: dict = {"key": None, "at": 0.0, "data": None}
+_UNTRACKED_TTL_SECONDS = 600
+
+
+def untracked_terms(slug: str = "", limit: int = 100, sample: int = 0) -> dict:
+    """返回 {"sample_titles": n, "candidates": [{"term", "count"}...]}（10 分钟缓存）。"""
+    from .models import sources
+
+    limit = max(1, min(500, limit))
+    sample = sample or config.STAR_UNTRACKED_SAMPLE
+    cache_key = (slug, limit, sample)
+    now = time.time()
+    if (_untracked_cache["key"] == cache_key
+            and now - _untracked_cache["at"] < _UNTRACKED_TTL_SECONDS):
+        return _untracked_cache["data"]
+
+    with database.engine.connect() as conn:
+        if slug:
+            slugs = [slug]
+        else:
+            slugs = [r[0] for r in conn.execute(
+                select(sources.c.slug).where(
+                    sources.c.enabled == 1, sources.c.total_videos > 0
+                ).order_by(sources.c.total_videos.desc())
+            ).all()]
+    slugs = [s for s in slugs if database.table_exists(build_vod_table(s).name)]
+    if not slugs:
+        return {"sample_titles": 0, "candidates": []}
+
+    per = max(200, sample // len(slugs))
+    titles: list = []
+    for s in slugs:
+        table = build_vod_table(s)
+        with database.engine.connect() as conn:
+            rows = conn.execute(
+                select(table.c.name)
+                .where(or_(table.c.vod_actor == "", table.c.vod_actor.is_(None)))
+                .order_by(table.c.vod_time.desc())
+                .limit(per)
+            ).all()
+        titles.extend(r[0] for r in rows if r[0])
+
+    pattern = star_pattern()
+    df: dict = {}
+    for raw in titles:
+        norm = _star_norm(raw)
+        # 已命中词库的片段替换成占位符 —— 只在「剩余文本」里找候选
+        residual = pattern.sub("\u0001", norm) if pattern is not None else norm
+        grams = set()
+        for seg in _CJK_RE.findall(residual):
+            L = len(seg)
+            for n in (2, 3, 4):
+                if L < n:
+                    break
+                for i in range(L - n + 1):
+                    grams.add(seg[i:i + n])
+        for g in grams:
+            df[g] = df.get(g, 0) + 1
+
+    stops = [x.strip() for x in config.STAR_UNTRACKED_STOPWORDS.split(",") if x.strip()]
+    min_count = config.STAR_UNTRACKED_MIN_COUNT
+    cands = [
+        (g, c) for g, c in df.items()
+        if c >= min_count and not any(s in g for s in stops)
+    ]
+    # 长词优先：按频次降序、长度降序处理；短词若被已保留的长词包含则丢弃
+    cands.sort(key=lambda x: (-x[1], -len(x[0])))
+    kept: list = []
+    for g, c in cands:
+        if any(g in kg for kg, _kc in kept[:400]):
+            continue
+        kept.append((g, c))
+        if len(kept) >= limit * 3:     # 多留一些再截断，避免被长词挤空
+            break
+    data = {
+        "sample_titles": len(titles),
+        "candidates": [{"term": g, "count": c} for g, c in kept[:limit]],
+    }
+    _untracked_cache.update({"key": cache_key, "at": now, "data": data})
+    return data

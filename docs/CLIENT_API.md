@@ -82,6 +82,9 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 | GET | `/api/v1/videos` | 视频列表 / 批量详情 / 分类浏览（REST 风格，多源合并） |
 | GET | `/api/v1/videos/{slug}/{vod_id}` | 单条视频详情（含播放地址） |
 | GET | `/api/v1/search` | 跨源站聚合搜索 |
+| GET | `/api/v1/related` | 相关推荐（服务端预计算，详情页「相关」栏） |
+| GET | `/api/v1/star/related` | 明星维度推荐（详情页「全部/按明星」Tab） |
+| GET | `/api/v1/star/works` | 按明星查作品（**v1.9.2** 明星 Tab 完整作品列表） |
 | GET | `/api/v1/{slug}?ac=list\|detail` | 苹果 CMS(MacCMS) 兼容接口，现有播放器可直接对接 |
 
 ### B. 管理接口（管理端 App / 面板功能）
@@ -280,7 +283,90 @@ GET /api/v1/jkun?ac=list&wd=三体     # 搜索
 
 响应结构：`{code, msg, page, pagecount, limit, total, class:[{type_id,type_name}], list:[...]}`，`ac=detail` 时 list 元素含 `vod_content / vod_play_url / vod_play_from / vod_play_list`。
 
-### 3.7 管理接口详情
+### 3.7 推荐与明星接口（v1.9.0 / v1.9.2）
+
+> 详情页推荐栏的三层数据来源：`related`（内容相似）→ `star/related`（全部 Tab）→ `star/works`（单个明星 Tab）。
+
+#### GET `/api/v1/related` — 相关推荐（内容相似，预计算）
+
+```bash
+GET /api/v1/related?slug=jkun&id=134369&limit=12
+```
+返回 `{code, slug, vod_id, limit, fallback, list:[{vod_id, vod_name, vod_pic, vod_remarks, type_name, source, source_name, score, mode}]}`。
+列表**永远非空**（零命中走兜底链）；`fallback=true` 表示整条来自兜底（同分类→同地区/年代→最新），客户端可弱化展示。未知 `slug`/`id` → 404。
+
+#### GET `/api/v1/star/related` — 明星维度（详情页「全部」Tab，v1.9.2 增强）
+
+```bash
+GET /api/v1/star/related?slug=jkun&vod_id=134369&limit=50
+GET /api/v1/star/related?slug=jkun&name=流浪地球      # 名称兜底（先精确后模糊）
+```
+
+```json
+{
+  "code": 1,
+  "target": {"vod_id": 134369, "vod_name": "流浪地球"},
+  "stars": ["吴京", "郭帆"],
+  "star_counts": {"吴京": 42, "郭帆": 7},
+  "truncated": true,
+  "list": [{
+    "vod_id": 135001, "vod_name": "战狼2", "vod_pic": "https://...",
+    "vod_remarks": "HD国语", "type_name": "动作片", "source": "jkun",
+    "match_stars": ["吴京"], "overlap": 1
+  }]
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `stars` | **string[]**，本视频命中的明星（结构未变，向后兼容） |
+| `star_counts` | **v1.9.2 新增**：`{明星名: 作品数}`，按作品数降序 —— Tab 角标用 |
+| `truncated` | **v1.9.2 新增**：候选总数超过 `limit` 被截断时为 `true`（提示「查看更多」） |
+| `list[].match_stars` | 该条与目标重叠的明星名 |
+| `list[].overlap` | 重叠明星数，列表按它降序、同分按更新时间降序 |
+
+`name` 兜底已做健壮性处理：前后/中间空格差异、全半角差异、`%`/`_` 通配符转义；确实找不到 → 404（主路径请用 `vod_id`）。
+
+#### GET `/api/v1/star/works` — 按明星查作品（v1.9.2，明星 Tab）
+
+```bash
+GET /api/v1/star/works?slug=jkun&term=吴京&limit=30&exclude_id=134369
+```
+
+```json
+{
+  "code": 1, "slug": "jkun", "term": "吴京", "total": 42,
+  "list": [{
+    "vod_id": 135001, "vod_name": "战狼2", "vod_pic": "https://...",
+    "vod_remarks": "HD国语", "type_name": "动作片", "source": "jkun",
+    "match_stars": ["吴京"], "overlap": 1
+  }]
+}
+```
+
+| 参数 | 说明 |
+|---|---|
+| `slug` | 必填，源站 |
+| `term` | 必填，明星名（主名或别名均可，服务端归一化；响应里 `term` 返回归一后的主名） |
+| `limit` | 默认 30，上限 100 |
+| `exclude_id` | 可选，排除当前视频（详情页展示「其他作品」时传） |
+
+- **排序**：`vod_time desc, vod_id desc`（最新作品靠前）
+- **total**：该明星现存作品总数（**不受 limit 影响**，也不含 `exclude_id` 排除的条目）——客户端据此展示「共 N 部」并判断是否需要翻页
+- `term` 无映射或作品已下架 → **200 + `total:0` + `list:[]`**（不是 404，避免客户端 Tab 报错）
+- 走 `star_map` 的 `(slug, term)` 索引，P95 < 50ms
+- 与 `star/related` 的区别：它**不按重叠明星数全局截断**，所以命中多位明星的目标视频，作品少的明星也不会被挤出
+
+#### 客户端推荐栏建议流程
+
+```text
+进入详情页
+  ├─ 调 /api/v1/star/related?limit=50        → 渲染「全部」Tab（用 star_counts 画明星 Tab 角标）
+  └─ 用户点某个明星 Tab
+        └─ 调 /api/v1/star/works?term=该明星&exclude_id=当前id → 渲染该明星完整作品（total 显示「共 N 部」）
+```
+
+### 3.8 管理接口详情
 
 #### GET `/healthz`
 `{"status":"ok","time":"..."}`；**免鉴权**（容器健康检查用），不反映业务状态。

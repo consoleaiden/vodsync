@@ -1492,6 +1492,7 @@ def star_terms_list():
         "list": [
             {
                 "id": r["id"], "term": r["term"], "note": r["note"] or "",
+                "aliases": r.get("aliases") or "",
                 "enabled": bool(r["enabled"]),
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,
             }
@@ -1543,7 +1544,7 @@ def star_terms_add(payload: dict):
 
 @router.patch("/api/v1/star-terms/{term_id}")
 def star_terms_update(term_id: int, payload: dict):
-    """修改词条（名字/备注/启停）。"""
+    """修改词条（名字/备注/别名/启停）。别名变更后需重算才生效。"""
     from ..models import star_terms
 
     from .. import related
@@ -1557,6 +1558,15 @@ def star_terms_update(term_id: int, payload: dict):
         changes["term"] = t
     if fields.get("note") is not None:
         changes["note"] = str(fields["note"])[:255]
+    if fields.get("aliases") is not None:
+        # 别名（v1.9.2）：逗号分隔存库，去重去空、单条上限 64 字、总长 400 字
+        seen, parts = set(), []
+        for a in re.split(r"[,，、|;/]", str(fields["aliases"])):
+            v = a.strip()[:64]
+            if v and v not in seen:
+                seen.add(v)
+                parts.append(v)
+        changes["aliases"] = ",".join(parts)[:400]
     if fields.get("enabled") is not None:
         changes["enabled"] = 1 if fields["enabled"] else 0
     if not changes:
@@ -1633,6 +1643,46 @@ def star_related_api(
     if result is None:
         raise HTTPException(status_code=404, detail="视频不存在")
     return {"code": 1, **result}
+
+
+@router.get("/api/v1/star/works")
+def star_works_api(
+    slug: str = Query(..., description="源站 slug"),
+    term: str = Query(..., min_length=1, max_length=64, description="明星名（主名或别名）"),
+    limit: int = Query(config.STAR_WORKS_LIMIT_DEFAULT,
+                       ge=1, le=config.STAR_WORKS_LIMIT_MAX),
+    exclude_id: int = Query(0, ge=0, description="排除的视频 ID（通常是当前详情页视频）"),
+):
+    """
+    按明星查作品（v1.9.2，明星为中心）：直接取该明星的全部映射再按时间排序，
+    不受「重叠明星数」影响 —— 客户端按明星切 Tab 时不会漏作品。
+
+    term 无映射 / 视频已下架 → 200 + total:0 + list:[]（不是 404）。
+    """
+    from .. import star_tags
+
+    slug = validate_slug(slug)
+    _src, _table = _require_table(slug)
+    result = star_tags.star_works(slug, term, limit=limit, exclude_id=exclude_id)
+    return {"code": 1, **result}
+
+
+@router.get("/api/v1/star/tags/untracked")
+def star_tags_untracked(
+    slug: str = Query("", description="源站 slug；留空=全部启用源站抽样"),
+    limit: int = Query(100, ge=1, le=500),
+    sample: int = Query(0, ge=0, le=200000, description="抽样标题数（0=用配置默认）"),
+):
+    """
+    未入词库的高频标题词 Top N（扩词库用，启发式候选）。
+    抽样缺演员视频标题 → 屏蔽已命中词库片段 → 剩余文本 2~4 元 n-gram 频次统计。
+    """
+    from .. import star_tags
+
+    if slug:
+        slug = validate_slug(slug)
+        _require_table(slug)
+    return {"code": 1, **star_tags.untracked_terms(slug=slug, limit=limit, sample=sample)}
 
 
 @router.post("/api/v1/maintenance/star-tags")

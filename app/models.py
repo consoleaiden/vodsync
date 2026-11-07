@@ -121,6 +121,10 @@ star_terms = Table(
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("term", String(64), nullable=False, unique=True),   # 演员名（去重）
     Column("note", String(255), default=""),                   # 备注（可空）
+    # 别名（v1.9.2）：同一明星的多译名/写法，逗号分隔。别名参与匹配（标题扫描、
+    # 演员交集），但命中后统一归一到主名 —— star_map.term / vod_tag 只存主名，
+    # 避免「同演员多写法」把作品拆到多个明星名下。
+    Column("aliases", String(512), default=""),
     Column("enabled", Integer, default=1, server_default="1"), # 停用后不参与推断
     Column("created_at", DateTime, server_default=func.now()),
 )

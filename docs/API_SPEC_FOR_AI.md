@@ -3,7 +3,7 @@
 > **本文档的用途**：把 VodSync 服务作为后端，交由 AI（或 AI 编程助手）开发客户端 App。
 > 文档自包含：只读本文即可完成全部对接，**不需要**阅读服务端源码。
 >
-> 对应服务版本：**v1.9.1** ｜ 文档版本：`2026-11-06` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.9.2** ｜ 文档版本：`2026-11-07` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 **目录**
 
@@ -279,6 +279,8 @@ type PlayLine = {
 | 36 | GET | `/api/v1/star/related` | 业务 | 明星作品推荐：与目标视频共享明星的其他视频 v1.9.1 |
 | 37 | POST | `/api/v1/maintenance/star-tags` | 管理 | 手动重建明星 Tag + star_map 映射 v1.9.1 |
 | 38 | GET | `/api/v1/star/tags/status` | 管理 | 明星 Tag 覆盖统计（视频数/缺演员数/已映射数） v1.9.1 |
+| 39 | GET | `/api/v1/star/works` | 业务 | 按明星查作品（明星为中心，total 不受 limit 影响） v1.9.2 |
+| 40 | GET | `/api/v1/star/tags/untracked` | 管理 | 未入词库高频标题词 Top N（扩词库用） v1.9.2 |
 
 > 第 23–29 项是**管理面板自己用的**，客户端 App 只需要 Token（见 2.1），不必实现这些接口。
 > `/api/v1/auth/login` 与 `/api/v1/auth/state` 免鉴权，其余四项需要登录会话 cookie。
@@ -993,6 +995,8 @@ GET /api/v1/related?slug=jkun&id=134369&limit=8
   "code": 1,
   "target": { "vod_id": 102, "vod_name": "战狼2" },
   "stars": ["吴京"],
+  "star_counts": { "吴京": 42 },
+  "truncated": false,
   "list": [
     { "vod_id": 101, "vod_name": "流浪地球", "vod_pic": "https://...",
       "vod_remarks": "HD国语", "type_name": "科幻片", "source": "jkun",
@@ -1007,11 +1011,56 @@ GET /api/v1/related?slug=jkun&id=134369&limit=8
   标题命中推断 `src=title`）；映射缺失时自动从 `vod_tag`/`vod_actor` 现算兜底
 - 排序：`overlap` 重叠明星数降序，同分按更新时间降序；已下架视频自动跳过
 - 查询走 `star_map` 的 `(slug, term)` 索引，毫秒级
+- **v1.9.2 新增字段（纯新增，向后兼容）**：`star_counts` = `{明星名: 本源站作品数}`
+  （降序，Tab 角标用）；`truncated` = 候选总数超 `limit` 时为 true。`stars` 仍是 `string[]`
+- `name` 路径健壮性（v1.9.2）：前后/中间空格、全半角差异、LIKE 通配符转义；
+  确实找不到保持 404（客户端主走 `vod_id`）
 - 无明星 → `stars` 与 `list` 为空数组；目标视频不存在 → `404` 标准错误
 - Tag 自动维护：全量同步后整站重建、增量同步重算 touched、每晚小站优先重建；
   词库增删改后点面板「重算」（或 `POST /api/v1/star-terms/recompute`）生效
 - 管理：`POST /api/v1/maintenance/star-tags?slug=all` 手动重建；
   `GET /api/v1/star/tags/status` 查看覆盖（videos / no_actor_videos / star_mapped）
+
+---
+
+### 4.23 按明星查作品（v1.9.2）
+
+**GET `/api/v1/star/works?slug=<源站>&term=<明星名>&limit=30&exclude_id=0`**
+
+| 参数 | 说明 |
+|---|---|
+| `slug` | 必填，源站 slug |
+| `term` | 必填，明星名（主名或别名，服务端归一化；响应 `term` 返回主名） |
+| `limit` | 默认 30，上限 100 |
+| `exclude_id` | 可选，排除当前视频 |
+
+```json
+{ "code": 1, "slug": "jkun", "term": "吴京", "total": 42,
+  "list": [{ "vod_id": 135001, "vod_name": "战狼2", "vod_pic": "https://...",
+             "vod_remarks": "HD国语", "type_name": "动作片", "source": "jkun",
+             "match_stars": ["吴京"], "overlap": 1 }] }
+```
+
+要点：
+
+- **明星为中心**：不做「重叠明星数」全局排序截断，命中多位明星的目标视频里，
+  作品少的明星也不会被挤出（客户端按明星切 Tab 的数据来源）
+- 排序 `vod_time desc, vod_id desc`；`total` 为该明星现存作品总数
+  （不受 `limit` 影响、不含 `exclude_id`），客户端据此展示「共 N 部」与翻页
+- `term` 无映射 / 作品已下架 → **200 + `total:0` + `list:[]`**（不 404）
+- 走 `idx_star_map_term` 索引 + join 回表（排序需 `vod_time`），P95 < 50ms
+
+**GET `/api/v1/star/tags/untracked?slug=&limit=100&sample=20000`**（扩词库用）
+
+抽样「缺演员」视频标题 → 用词库正则把已命中片段替换为占位符 → 剩余中文串做
+2~4 元 n-gram 频次统计 → 过滤停用词/低频词、长词优先，返回
+`{sample_titles, candidates:[{term, count}]}`。结果 10 分钟缓存；
+**是候选不是结论**，请人工确认后加入词库（自动入库会把噪声写进词库）。
+
+**词库别名（v1.9.2）**：`star_terms.aliases` 逗号分隔，`PATCH /api/v1/star-terms/{id}`
+的 `{"aliases": "京哥,Wu Jing"}` 可维护。别名参与匹配（标题扫描 + 演员交集），
+命中后统一归一到主名 —— `star_map.term` / `vod_tag` 只存主名，避免同一演员
+多译名把作品拆散。别名变更后同样需 `POST /api/v1/star-terms/recompute` 生效。
 
 ---
 
@@ -1331,7 +1380,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.9.1（当前） | **明星作品推荐**：词库明星名回填缺失演员视频的 `vod_tag`（单正则一次扫描，O(标题长) 与词库大小解耦）；新表 `star_map` 明星-视频倒排映射（`src=actor/title` 可信度标记）；`GET /api/v1/star/related` 共享明星视频（走索引毫秒级）；`maintenance/star-tags` 手动重建、`star/tags/status` 覆盖统计；UPSERT 空 `vod_tag` 不覆盖本地推断值；同步后自动维护 + 每晚小站优先重建 |
+| v1.9.2（当前） | **按明星查作品**：`GET /api/v1/star/works`（明星为中心，`total` 不受 limit 影响，无映射返回 200+空列表）；`star/related` 新增 `star_counts`（明星→作品数，Tab 角标）与 `truncated`（截断标志），`stars` 结构不变；`name` 匹配健壮性（空格/全半角/LIKE 转义）；词库 `aliases` 别名归一主名；`star/tags/untracked` 未入词库高频词统计 |
+| v1.9.1 | **明星作品推荐**：词库明星名回填缺失演员视频的 `vod_tag`（单正则一次扫描，O(标题长) 与词库大小解耦）；新表 `star_map` 明星-视频倒排映射（`src=actor/title` 可信度标记）；`GET /api/v1/star/related` 共享明星视频（走索引毫秒级）；`maintenance/star-tags` 手动重建、`star/tags/status` 覆盖统计；UPSERT 空 `vod_tag` 不覆盖本地推断值；同步后自动维护 + 每晚小站优先重建 |
 | v1.9.0 | **相关推荐（服务端预计算）**：`GET /api/v1/related`（预计算直读 P95<50ms，fallback 兜底列表非空）；REST 详情与 `ac=detail` 附带 `related` 数组（`RELATED_IN_DETAIL` 可关）；`vod_{slug}` 新增 `vod_actor/vod_director/vod_writer/vod_area/vod_year/vod_tag` 列（存量库自动补列）；详情卡片字段不变、只增；新增明星词库管理接口与 `related/status`、`maintenance/related-recompute` |
 | v1.8.1 | 源站健康度退避：`/api/v1/sources` 新增 `fail_streak` / `skip_until`；大面积失败（页失败率≥50% 或整轮异常）按 60min→2h→4h→…（封顶 24h）指数退避，调度器跳过未到期的站（手动触发不受限），成功即清零；增量索引失败页在本次运行内重试（`PAGE_MAX_ATTEMPTS` 轮）；连续 2 批整批失败早停；日志行带失败原因分布（如 `timeout×1900, http_403×778`） |
 | v1.8.0 | 新增自定义源站：`POST /api/v1/sources/custom`、`PATCH/DELETE /api/v1/sources/{slug}/custom`、`POST /api/v1/sources/probe`；`/api/v1/sources` 增加 `origin` 字段（`latest` / `custom`） |

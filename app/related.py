@@ -358,20 +358,40 @@ def _star_norm(s: str) -> str:
 
 
 def reload_star_terms() -> int:
-    """读取启用的词库条目并编译匹配正则（面板增删改后调用）。返回词条数。"""
+    """
+    读取启用的词库条目（主名 + v1.9.2 别名）并编译匹配正则。返回**主名**条数。
+
+    别名与主名进同一个 pattern（按长度降序，长名优先），但命中后统一归一到主名：
+    star_map.term / vod_tag 只存主名，避免「同演员多译名/写法」把作品拆散。
+    """
     with database.engine.connect() as conn:
         rows = conn.execute(
-            select(star_terms.c.term).where(star_terms.c.enabled == 1)
+            select(star_terms.c.term, star_terms.c.aliases).where(star_terms.c.enabled == 1)
         ).all()
-    terms = sorted({_star_norm(r[0]).strip() for r in rows}, key=lambda t: (-len(t), t))
-    terms = [t for t in terms if len(t) >= 2]   # 单字名误报率过高，不参与推断
-    pattern = re.compile("|".join(re.escape(t) for t in terms)) if terms else None
+    alias_map: dict = {}
+    mains: set = set()
+    for main_raw, aliases_raw in rows:
+        main = _star_norm(main_raw or "").strip()
+        if len(main) < 2:      # 单字名误报率过高，不参与推断
+            continue
+        mains.add(main)
+        alias_map[main] = main
+        for a in re.split(r"[,，、|;/]", aliases_raw or ""):
+            v = _star_norm(a).strip()
+            if len(v) >= 2 and v not in alias_map:
+                alias_map[v] = main
+    variants = sorted(alias_map, key=lambda t: (-len(t), t))
+    pattern = re.compile("|".join(re.escape(t) for t in variants)) if variants else None
     with _locks_guard:
         _star_cache["pattern"] = pattern
-        _star_cache["count"] = len(terms)
-    if terms:
-        log.info("明星词库已加载 %d 个词条", len(terms))
-    return len(terms)
+        _star_cache["count"] = len(mains)
+        _star_cache["variants"] = len(variants)
+        _star_cache["alias"] = alias_map
+        _star_cache["mains"] = frozenset(mains)
+    if mains:
+        log.info("明星词库已加载 %d 个主名 / %d 个匹配变体（含别名）",
+                 len(mains), len(variants))
+    return len(mains)
 
 
 def star_pattern():
@@ -387,6 +407,35 @@ def star_pattern():
         return _star_cache["pattern"]
 
 
+def star_alias_map() -> dict:
+    """归一化名字 -> 主名（含主名自身）。首次调用触发词库加载。"""
+    star_pattern()
+    with _locks_guard:
+        return _star_cache.get("alias") or {}
+
+
+def star_mains() -> frozenset:
+    """词库主名集合（归一化后）。"""
+    star_pattern()
+    with _locks_guard:
+        return _star_cache.get("mains") or frozenset()
+
+
+def canon_star(name: str):
+    """
+    把任意写法（主名/别名/繁简/全半角）归一到主名。
+    不在词库返回 None —— 调用方据此判断「是不是我们认识的明星」。
+    """
+    v = _star_norm(name or "").strip()
+    return star_alias_map().get(v) if v else None
+
+
+def canon_hits(raw_hits) -> set:
+    """正则 findall 出来的变体集合 → 主名集合。"""
+    m = star_alias_map()
+    return {m.get(h, h) for h in raw_hits}
+
+
 def _infer_strength(name_raw: str, content: str, area: str, year: str, type_name: str, pattern):
     """
     明星词库推断，返回 (演员集合, asrc)。
@@ -399,15 +448,15 @@ def _infer_strength(name_raw: str, content: str, area: str, year: str, type_name
     """
     if pattern is None:
         return frozenset(), "none"
-    title_hits = frozenset(pattern.findall(_star_norm(name_raw or "")))
+    title_hits = frozenset(canon_hits(pattern.findall(_star_norm(name_raw or ""))))
     if not title_hits:
-        c_hits = frozenset(pattern.findall(_star_norm((content or "")[:2000])))
+        c_hits = frozenset(canon_hits(pattern.findall(_star_norm((content or "")[:2000]))))
         return c_hits, ("inf" if c_hits else "none")
     sparse = sum(1 for v in (area, year, type_name) if v) <= config.RELATED_STAR_STRONG_MAX_FIELDS
     if sparse:
         return title_hits, "strong"
     # 标题命中但字段齐全 → 弱信号；顺带合并简介里的命中
-    c_hits = frozenset(pattern.findall(_star_norm((content or "")[:2000])))
+    c_hits = frozenset(canon_hits(pattern.findall(_star_norm((content or "")[:2000]))))
     return title_hits | c_hits, "inf"
 
 
