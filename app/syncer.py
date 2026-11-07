@@ -388,6 +388,7 @@ def update_custom_source(slug: str, **fields) -> dict:
             with database.write_txn() as conn:
                 conn.execute(table.delete())
         delete_related_rows(slug)
+        delete_star_map_rows(slug)
         log.info("源站 %s 的 API 地址已变更，历史数据已清空", slug)
 
     return {"slug": slug, "updated": sorted(changes), "data_reset": reset_data}
@@ -416,6 +417,7 @@ def delete_custom_source(slug: str, drop_table: bool = True) -> dict:
         table.drop(database.engine, checkfirst=True)
         forget_vod_table(slug)
     delete_related_rows(slug)
+    delete_star_map_rows(slug)
     log.info("自定义源站已删除: %s（数据表%s）", slug, "已删除" if drop_table else "保留")
     return {"slug": slug, "dropped": bool(drop_table)}
 
@@ -533,7 +535,12 @@ def upsert_batch(slug: str, rows: list) -> tuple:
             )
         )
         # ON CONFLICT 子句：SQLite 与 PostgreSQL 语法一致
-        update_cols = {c: stmt.excluded[c] for c in _UPSERT_COLS if c != "vod_id"}
+        update_cols = {c: stmt.excluded[c] for c in _UPSERT_COLS if c not in ("vod_id", "vod_tag")}
+        # vod_tag 特殊处理（v1.9.1）：源站给的 tag 基本缺失，空值不覆盖本地推断的
+        # 明星 tag（star_tags 回填结果），源站真给了非空 tag 才更新
+        update_cols["vod_tag"] = func.coalesce(
+            func.nullif(stmt.excluded["vod_tag"], ""), table.c.vod_tag
+        )
         stmt = stmt.on_conflict_do_update(index_elements=["vod_id"], set_=update_cols)
         conn.execute(stmt, rows)
     inserted = sum(1 for i in ids if i not in existing)
@@ -562,6 +569,17 @@ def delete_related_rows(slug: str):
             conn.execute(vod_related.delete().where(vod_related.c.slug == slug))
     except Exception as e:
         log.warning("[%s] 清理推荐结果失败（忽略）: %s", slug, e)
+
+
+def delete_star_map_rows(slug: str):
+    """删除某源站的明星-视频映射（删源站/清数据时调用，与推荐结果同步清理）。"""
+    from .models import star_map
+
+    try:
+        with database.write_txn() as conn:
+            conn.execute(star_map.delete().where(star_map.c.slug == slug))
+    except Exception as e:
+        log.warning("[%s] 清理明星映射失败（忽略）: %s", slug, e)
 
 
 def fetch_class_map(payload: dict, class_map: dict) -> dict:
@@ -1334,6 +1352,31 @@ def _kick_related(slug: str, mode: str, stats: dict):
             target=_related_ids_worker, args=(slug, list(dict.fromkeys(touched))),
             daemon=True,
         ).start()
+
+    # 明星 Tag 回填（v1.9.1）：与推荐重算同节奏 —— 全量整站重建，增量只重算 touched
+    if config.STAR_TAG_AUTO_AFTER_SYNC:
+        if mode == "full":
+            threading.Thread(target=_star_tags_full_worker, args=(slug,), daemon=True).start()
+        elif touched:
+            threading.Thread(
+                target=_star_tags_ids_worker, args=(slug, list(dict.fromkeys(touched))),
+                daemon=True,
+            ).start()
+
+
+def _star_tags_full_worker(slug: str):
+    from . import star_tags
+
+    star_tags.rebuild_source_safe(slug, reason="after_full_sync")
+
+
+def _star_tags_ids_worker(slug: str, ids: list):
+    from . import star_tags
+
+    try:
+        star_tags.update_ids(slug, ids)
+    except Exception:
+        log.exception("[%s] 明星 Tag 增量回填失败（忽略）", slug)
 
 
 def _related_full_worker(slug: str):

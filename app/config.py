@@ -292,3 +292,25 @@ RELATED_STAR_SIM_FACTOR = float(os.environ.get("RELATED_STAR_SIM_FACTOR", "0.7")
 FIELD_BACKFILL_ENABLED = os.environ.get("FIELD_BACKFILL_ENABLED", "true").lower() == "true"
 FIELD_BACKFILL_SOURCES_PER_NIGHT = int(os.environ.get("FIELD_BACKFILL_SOURCES_PER_NIGHT", "2"))
 FIELD_BACKFILL_START_HOUR = int(os.environ.get("FIELD_BACKFILL_START_HOUR", "2"))
+
+# ---------------------------------------------------------------------------
+# 明星 Tag 回填 + 明星作品推荐（v1.9.1）
+#
+# 数据流：词库编译成单个正则 → 缺演员的行用标题扫描命中词库 →
+#   命中名写入 vod_tag（逗号分隔，可多个）+ star_map 倒排映射表；
+#   真实演员行把演员名与词库做交集也进 star_map（高可信）。
+# API 查询走 star_map 的 (slug, term) 索引，不打大表。
+# ---------------------------------------------------------------------------
+# 同步完成后自动回填：全量同步 → 整站重建；增量同步 → 只重算本轮 touched 的 id
+STAR_TAG_AUTO_AFTER_SYNC = os.environ.get("STAR_TAG_AUTO_AFTER_SYNC", "true").lower() == "true"
+# 每晚定时重建的源站预算（重建是全量幂等的，词库增删后历史行会被重新评估）
+STAR_TAG_NIGHTLY_BUDGET = int(os.environ.get("STAR_TAG_NIGHTLY_BUDGET", "2"))
+STAR_TAG_NIGHTLY_HOUR = int(os.environ.get("STAR_TAG_NIGHTLY_HOUR", "3"))
+STAR_TAG_NIGHTLY_MINUTE = int(os.environ.get("STAR_TAG_NIGHTLY_MINUTE", "40"))
+# 单视频最多写入的明星数（防超长溢出 vod_tag VARCHAR(255)）
+STAR_TAG_MAX_PER_VIDEO = int(os.environ.get("STAR_TAG_MAX_PER_VIDEO", "5"))
+# 扫描批大小（keyset 分页步长，内存恒定）
+STAR_TAG_BATCH_SIZE = int(os.environ.get("STAR_TAG_BATCH_SIZE", "2000"))
+# 明星相关视频 API 默认/上限条数
+STAR_RELATED_LIMIT_DEFAULT = int(os.environ.get("STAR_RELATED_LIMIT_DEFAULT", "20"))
+STAR_RELATED_LIMIT_MAX = int(os.environ.get("STAR_RELATED_LIMIT_MAX", "50"))

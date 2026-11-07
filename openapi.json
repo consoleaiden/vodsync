@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.9.0"
+    "version": "1.9.1"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -1510,8 +1510,144 @@
     "/api/v1/star-terms/recompute": {
       "post": {
         "summary": "Star Terms Recompute",
-        "description": "词库变更后重算全部源站的相关推荐（后台执行，串行避免抢 IO）。",
+        "description": "词库变更后重算全部源站：① 明星 Tag 回填 + star_map 重建（v1.9.1）；\n② 相关推荐重算（推断演员信号变化影响打分）。后台串行执行。",
         "operationId": "star_terms_recompute_api_v1_star_terms_recompute_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/star/related": {
+      "get": {
+        "summary": "Star Related Api",
+        "description": "返回与目标视频共享明星（词库 tag 交集）的其他视频。\n目标视频的明星 = star_map 里的映射（真实演员 ∩ 词库 + 标题命中推断）。",
+        "operationId": "star_related_api_api_v1_star_related_get",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "源站 slug",
+              "title": "Slug"
+            },
+            "description": "源站 slug"
+          },
+          {
+            "name": "vod_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "视频 ID（与 name 二选一，id 优先）",
+              "default": 0,
+              "title": "Vod Id"
+            },
+            "description": "视频 ID（与 name 二选一，id 优先）"
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 255,
+              "description": "视频名称（先精确后模糊）",
+              "default": "",
+              "title": "Name"
+            },
+            "description": "视频名称（先精确后模糊）"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 50,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/maintenance/star-tags": {
+      "post": {
+        "summary": "Star Tags Rebuild",
+        "description": "手动触发明星 Tag 回填 + star_map 重建（后台串行执行，全量幂等）。",
+        "operationId": "star_tags_rebuild_api_v1_maintenance_star_tags_post",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "源站 slug；all=全部启用源站",
+              "default": "all",
+              "title": "Slug"
+            },
+            "description": "源站 slug；all=全部启用源站"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/star/tags/status": {
+      "get": {
+        "summary": "Star Tags Status",
+        "description": "各源站明星 Tag 覆盖情况：总视频数 / 缺演员视频数 / 已映射明星条数。",
+        "operationId": "star_tags_status_api_v1_star_tags_status_get",
         "responses": {
           "200": {
             "description": "Successful Response",

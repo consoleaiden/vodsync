@@ -107,6 +107,43 @@ def _job_field_backfill():
         log.info("[字段回填] 今晚完成: %s", ",".join(slugs_done))
 
 
+def _job_star_tags_nightly():
+    """
+    明星 Tag 每晚重建（v1.9.1）：小站优先重建 STAR_TAG_NIGHTLY_BUDGET 个源站。
+    全量幂等 —— 字段回填补上的真实演员会进入映射；词库新增的名字也会
+    重新评估历史未命中标题。全部源站都映射过则跳过（白天同步已增量维护）。
+    """
+    from sqlalchemy import func, select
+
+    from . import star_tags
+    from .models import sources, star_map
+
+    if not config.RELATED_ENABLED:
+        return
+    try:
+        with database.engine.connect() as conn:
+            rows = conn.execute(
+                select(sources.c.slug, sources.c.total_videos)
+                .where(sources.c.enabled == 1, sources.c.total_videos > 0)
+                .order_by(sources.c.total_videos)
+            ).all()
+            mapped = dict(conn.execute(
+                select(star_map.c.slug, func.count()).group_by(star_map.c.slug)
+            ).all())
+        done = []
+        for slug, tv in rows:
+            if len(done) >= config.STAR_TAG_NIGHTLY_BUDGET:
+                break
+            if mapped.get(slug, 0) >= tv:      # 已覆盖（映射条数 >= 视频数），跳过
+                continue
+            star_tags.rebuild_source_safe(slug, reason="nightly")
+            done.append(slug)
+        if done:
+            log.info("[明星Tag] 每晚重建完成: %s", ",".join(done))
+    except Exception:
+        log.exception("[明星Tag] 每晚重建失败")
+
+
 def start_scheduler():
     global _scheduler
     if _scheduler is not None:
@@ -154,6 +191,16 @@ def start_scheduler():
             hour=max(0, min(23, config.FIELD_BACKFILL_START_HOUR)),
             minute=0,
             id="field_backfill",
+            max_instances=1,
+            coalesce=True,
+        )
+    if config.RELATED_ENABLED:
+        _scheduler.add_job(
+            _job_star_tags_nightly,
+            "cron",
+            hour=max(0, min(23, config.STAR_TAG_NIGHTLY_HOUR)),
+            minute=max(0, min(59, config.STAR_TAG_NIGHTLY_MINUTE)),
+            id="star_tags_nightly",
             max_instances=1,
             coalesce=True,
         )

@@ -1588,8 +1588,11 @@ def star_terms_delete(term_id: int):
 
 @router.post("/api/v1/star-terms/recompute")
 def star_terms_recompute():
-    """词库变更后重算全部源站的相关推荐（后台执行，串行避免抢 IO）。"""
-    from .. import related
+    """
+    词库变更后重算全部源站：① 明星 Tag 回填 + star_map 重建（v1.9.1）；
+    ② 相关推荐重算（推断演员信号变化影响打分）。后台串行执行。
+    """
+    from .. import related, star_tags
 
     with database.engine.connect() as conn:
         targets = [r[0] for r in conn.execute(
@@ -1598,10 +1601,73 @@ def star_terms_recompute():
 
     def _worker():
         for s in targets:
+            star_tags.rebuild_source_safe(s, reason="star_terms_changed")
+        for s in targets:
             related.recompute_source_safe(s, reason="star_terms_changed")
 
     threading.Thread(target=_worker, daemon=True).start()
-    return {"code": 1, "targets": targets, "msg": f"重算已受理: {len(targets)} 个源站"}
+    return {"code": 1, "targets": targets,
+            "msg": f"词库变更重算已受理: {len(targets)} 个源站（明星 Tag + 相关推荐）"}
+
+
+# ---------------------------------------------------------------------------
+# 明星作品推荐（v1.9.1）：tag 回填 + 共享明星视频查询
+# ---------------------------------------------------------------------------
+@router.get("/api/v1/star/related")
+def star_related_api(
+    slug: str = Query(..., description="源站 slug"),
+    vod_id: int = Query(0, ge=0, description="视频 ID（与 name 二选一，id 优先）"),
+    name: str = Query("", max_length=255, description="视频名称（先精确后模糊）"),
+    limit: int = Query(config.STAR_RELATED_LIMIT_DEFAULT,
+                       ge=1, le=config.STAR_RELATED_LIMIT_MAX),
+):
+    """
+    返回与目标视频共享明星（词库 tag 交集）的其他视频。
+    目标视频的明星 = star_map 里的映射（真实演员 ∩ 词库 + 标题命中推断）。
+    """
+    from .. import star_tags
+
+    slug = validate_slug(slug)
+    _src, _table = _require_table(slug)
+    result = star_tags.star_related(slug, vod_id=vod_id, name=name, limit=limit)
+    if result is None:
+        raise HTTPException(status_code=404, detail="视频不存在")
+    return {"code": 1, **result}
+
+
+@router.post("/api/v1/maintenance/star-tags")
+def star_tags_rebuild(
+    slug: str = Query("all", description="源站 slug；all=全部启用源站"),
+):
+    """手动触发明星 Tag 回填 + star_map 重建（后台串行执行，全量幂等）。"""
+    from .. import star_tags
+
+    if slug and slug != "all":
+        slug = validate_slug(slug)
+        _require_table(slug)
+        targets = [slug]
+    else:
+        with database.engine.connect() as conn:
+            targets = [r[0] for r in conn.execute(
+                select(sources.c.slug).where(
+                    sources.c.enabled == 1, sources.c.total_videos > 0
+                )
+            ).all()]
+
+    def _worker():
+        for s in targets:
+            star_tags.rebuild_source_safe(s, reason="manual_rebuild")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return {"code": 1, "targets": targets, "msg": f"明星 Tag 重建已受理: {len(targets)} 个源站"}
+
+
+@router.get("/api/v1/star/tags/status")
+def star_tags_status():
+    """各源站明星 Tag 覆盖情况：总视频数 / 缺演员视频数 / 已映射明星条数。"""
+    from .. import star_tags
+
+    return {"code": 1, "list": star_tags.status_all()}
 
 
 @router.get("/api/v1/related/status")

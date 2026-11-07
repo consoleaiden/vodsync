@@ -146,6 +146,27 @@ vod_related = Table(
 )
 
 # ---------------------------------------------------------------------------
+# 明星-视频倒排映射表（v1.9.1 明星作品推荐）
+#
+# 词库明星 → 视频的反向索引：明星相关视频 API 直接查这张表的 (slug, term)
+# 索引拿候选，再回 vod_{slug} 表补卡片字段 —— 绝不对大表做 LIKE '%吴京%' 全表扫。
+# src 标记信号来源（客户端可展示可信度）：
+#   actor  视频自带真实演员且演员名在词库中（高可信）
+#   title  缺演员视频，标题命中词库推断（「提及≠主演」，中等可信）
+# ---------------------------------------------------------------------------
+star_map = Table(
+    "star_map",
+    META,
+    Column("slug", String(64), primary_key=True),
+    Column("vod_id", Integer, primary_key=True),
+    Column("term", String(64), primary_key=True),
+    Column("src", String(8), default="title"),
+    Column("computed_at", DateTime, server_default=func.now()),
+)
+# 主键前缀只覆盖 (slug, vod_id) 查「某视频的明星」；按明星找视频需要这把索引
+Index("idx_star_map_term", star_map.c.slug, star_map.c.term)
+
+# ---------------------------------------------------------------------------
 # vod_{slug} 动态表缓存：避免重复构建 Table 对象
 # ---------------------------------------------------------------------------
 _vod_table_cache: dict = {}

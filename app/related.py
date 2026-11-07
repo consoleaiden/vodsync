@@ -363,7 +363,7 @@ def reload_star_terms() -> int:
         rows = conn.execute(
             select(star_terms.c.term).where(star_terms.c.enabled == 1)
         ).all()
-    terms = sorted({_star_norm(r[0]).strip() for r in rows})
+    terms = sorted({_star_norm(r[0]).strip() for r in rows}, key=lambda t: (-len(t), t))
     terms = [t for t in terms if len(t) >= 2]   # 单字名误报率过高，不参与推断
     pattern = re.compile("|".join(re.escape(t) for t in terms)) if terms else None
     with _locks_guard:
