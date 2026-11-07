@@ -8,6 +8,21 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# 构建信息（v1.9.3 起由 CI 传入，本地 build 用默认值）
+#   APP_VERSION   —— 与 app/__init__.py 的 __version__ 一致，CI 用它生成镜像 tag
+#   APP_REVISION  —— 构建所用提交的完整 SHA，写进镜像标签 + 环境变量，
+#                    部署后 `docker inspect` 与 `GET /healthz` 都能看到
+ARG APP_VERSION=dev
+ARG APP_REVISION=unknown
+
+LABEL org.opencontainers.image.title="VodSync" \
+      org.opencontainers.image.description="影视数据同步服务：MacCMS 源站采集 + 统一视频 API" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.revision="${APP_REVISION}"
+
+# 运行时暴露给 /healthz，方便升级/回滚后核对容器里跑的是哪个构建
+ENV VODSYNC_BUILD_SHA=${APP_REVISION}
+
 # 先装依赖（利用 Docker 层缓存）
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

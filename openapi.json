@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.9.2"
+    "version": "1.9.3"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -227,7 +227,7 @@
     "/healthz": {
       "get": {
         "summary": "Healthz",
-        "description": "健康检查 / 存活探针。\n\n关键点：数据库繁忙时**不返回 5xx**。容器健康检查只看 HTTP 状态码，\n若这里因为连接池排队而报 500/超时，Docker 会把一个其实还在正常干活的容器判定为不健康\n并反复重启（v1.4.0 在 NAS 上就表现为\"容器崩溃\"）。因此这里始终 200，\n用 db 字段表达数据库是否可用。",
+        "description": "健康检查 / 存活探针。\n\n关键点：数据库繁忙时**不返回 5xx**。容器健康检查只看 HTTP 状态码，\n若这里因为连接池排队而报 500/超时，Docker 会把一个其实还在正常干活的容器判定为不健康\n并反复重启（v1.4.0 在 NAS 上就表现为\"容器崩溃\"）。因此这里始终 200，\n用 db 字段表达数据库是否可用。\n\nv1.9.3 起额外返回 version / build：升级或回滚后 `curl /healthz` 就能确认\n容器里跑的到底是哪个版本（build 是镜像构建时写入的提交短 SHA，源码直跑时为空）。\nversion 取自 app/__init__.py，与镜像 tag 同源。",
         "operationId": "healthz_healthz_get",
         "responses": {
           "200": {

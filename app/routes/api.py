@@ -8,6 +8,7 @@
 """
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -20,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from sqlalchemy import func, select, text
 
-from .. import auth, config, database
+from .. import __version__, auth, config, database
 from ..models import build_vod_table, sources, sync_logs
 from ..syncer import (
     delete_custom_source,
@@ -372,17 +373,30 @@ def healthz():
     若这里因为连接池排队而报 500/超时，Docker 会把一个其实还在正常干活的容器判定为不健康
     并反复重启（v1.4.0 在 NAS 上就表现为"容器崩溃"）。因此这里始终 200，
     用 db 字段表达数据库是否可用。
+
+    v1.9.3 起额外返回 version / build：升级或回滚后 `curl /healthz` 就能确认
+    容器里跑的到底是哪个版本（build 是镜像构建时写入的提交短 SHA，源码直跑时为空）。
+    version 取自 app/__init__.py，与镜像 tag 同源。
     """
     now = datetime.now().isoformat()
+    build = os.environ.get("VODSYNC_BUILD_SHA", "") or "dev"
     try:
         with database.engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        return {"status": "ok", "db": True, "time": now}
+        return {
+            "status": "ok",
+            "db": True,
+            "version": __version__,
+            "build": build,
+            "time": now,
+        }
     except Exception as e:
         log.warning("/healthz 数据库暂不可用: %s", e)
         return {
             "status": "degraded",
             "db": False,
+            "version": __version__,
+            "build": build,
             "detail": str(e)[:200],
             "time": now,
         }

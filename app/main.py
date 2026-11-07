@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from sqlalchemy.exc import OperationalError, TimeoutError as SADBTimeoutError
 
-from . import config, database
+from . import __version__, config, database
 from .routes.api import router
 
 logging.basicConfig(
@@ -31,7 +31,7 @@ app = FastAPI(
         "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，"
         "并对外提供统一的视频列表/详情 API（source 参数区分源站）。"
     ),
-    version="1.9.2",
+    version=__version__,
 )
 
 app.include_router(router)

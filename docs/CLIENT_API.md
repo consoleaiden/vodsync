@@ -369,7 +369,8 @@ GET /api/v1/star/works?slug=jkun&term=吴京&limit=30&exclude_id=134369
 ### 3.8 管理接口详情
 
 #### GET `/healthz`
-`{"status":"ok","time":"..."}`；**免鉴权**（容器健康检查用），不反映业务状态。
+`{"status":"ok","db":true,"version":"1.9.3","build":"7b44587...","time":"..."}`；**免鉴权**（容器健康检查用），不反映业务状态。
+`version`/`build` 是服务端版本与构建提交，可在「关于」页展示，便于用户报障时定位版本。
 
 #### GET `/api/v1/stats`
 ```json

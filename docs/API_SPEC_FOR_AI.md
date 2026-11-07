@@ -3,7 +3,7 @@
 > **本文档的用途**：把 VodSync 服务作为后端，交由 AI（或 AI 编程助手）开发客户端 App。
 > 文档自包含：只读本文即可完成全部对接，**不需要**阅读服务端源码。
 >
-> 对应服务版本：**v1.9.2** ｜ 文档版本：`2026-11-07` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.9.3** ｜ 文档版本：`2026-11-07` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 **目录**
 
@@ -290,10 +290,14 @@ type PlayLine = {
 ### 4.1 GET `/healthz`
 
 ```json
-{ "status": "ok", "db": true, "time": "2026-10-30T16:09:53.527655" }
+{ "status": "ok", "db": true, "version": "1.9.3", "build": "7b4458781508a9055d84a0f744d5ce1327db984d", "time": "2026-10-30T16:09:53.527655" }
 ```
 
 用途：服务可用性探测 + 判断是否启用 API Key（见 2.1）。
+
+`version` / `build`（v1.9.3 起，纯新增）：服务版本号与构建所用提交的完整 SHA
+（本地源码直跑时 `build` 为 `dev`）。客户端可在「关于/诊断」页展示，便于反馈问题时定位版本；
+运维升级或回滚后用它确认容器里跑的到底是哪一版。
 
 **重要（v1.4.1 起）**：即使数据库繁忙，本接口**仍返回 200**，此时 `status` 为 `"degraded"`、`db` 为 `false`。
 Docker/K8s 健康检查只看状态码，若这里因数据库排队返回 5xx，编排系统会把一个还在正常干活的容器判定为不健康并重启（v1.4.0 的真实故障）。
@@ -1380,7 +1384,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.9.2（当前） | **按明星查作品**：`GET /api/v1/star/works`（明星为中心，`total` 不受 limit 影响，无映射返回 200+空列表）；`star/related` 新增 `star_counts`（明星→作品数，Tab 角标）与 `truncated`（截断标志），`stars` 结构不变；`name` 匹配健壮性（空格/全半角/LIKE 转义）；词库 `aliases` 别名归一主名；`star/tags/untracked` 未入词库高频词统计 |
+| v1.9.3（当前） | `GET /healthz` 新增 `version` / `build`（镜像构建提交 SHA），便于升级/回滚核对与报障定位；无新增/变更业务接口，**客户端无需改动** |
+| v1.9.2 | **按明星查作品**：`GET /api/v1/star/works`（明星为中心，`total` 不受 limit 影响，无映射返回 200+空列表）；`star/related` 新增 `star_counts`（明星→作品数，Tab 角标）与 `truncated`（截断标志），`stars` 结构不变；`name` 匹配健壮性（空格/全半角/LIKE 转义）；词库 `aliases` 别名归一主名；`star/tags/untracked` 未入词库高频词统计 |
 | v1.9.1 | **明星作品推荐**：词库明星名回填缺失演员视频的 `vod_tag`（单正则一次扫描，O(标题长) 与词库大小解耦）；新表 `star_map` 明星-视频倒排映射（`src=actor/title` 可信度标记）；`GET /api/v1/star/related` 共享明星视频（走索引毫秒级）；`maintenance/star-tags` 手动重建、`star/tags/status` 覆盖统计；UPSERT 空 `vod_tag` 不覆盖本地推断值；同步后自动维护 + 每晚小站优先重建 |
 | v1.9.0 | **相关推荐（服务端预计算）**：`GET /api/v1/related`（预计算直读 P95<50ms，fallback 兜底列表非空）；REST 详情与 `ac=detail` 附带 `related` 数组（`RELATED_IN_DETAIL` 可关）；`vod_{slug}` 新增 `vod_actor/vod_director/vod_writer/vod_area/vod_year/vod_tag` 列（存量库自动补列）；详情卡片字段不变、只增；新增明星词库管理接口与 `related/status`、`maintenance/related-recompute` |
 | v1.8.1 | 源站健康度退避：`/api/v1/sources` 新增 `fail_streak` / `skip_until`；大面积失败（页失败率≥50% 或整轮异常）按 60min→2h→4h→…（封顶 24h）指数退避，调度器跳过未到期的站（手动触发不受限），成功即清零；增量索引失败页在本次运行内重试（`PAGE_MAX_ATTEMPTS` 轮）；连续 2 批整批失败早停；日志行带失败原因分布（如 `timeout×1900, http_403×778`） |

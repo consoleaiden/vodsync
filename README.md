@@ -406,6 +406,59 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
 | `API_KEY` | 空 | 兼容项：设置后作为一枚额外有效的 Token |
 | `ONLY_OK_SOURCES` | true | 只同步在线源站 |
 
+## 镜像版本与回滚（v1.9.3）
+
+**每次构建的镜像都带版本号**，不再是「只有一个 latest」—— 回滚就是把 compose 里的 tag 改回旧版本。
+
+### tag 语义
+
+| tag | 示例 | 是否可变 | 用途 |
+|---|---|---|---|
+| `latest` | `…/vodsync:latest` | 可变 | 生产默认跟随最新（只在 main 分支构建时更新） |
+| 版本号 | `…/vodsync:1.9.3` | 可变 | 同一版本多次构建时指向最新一次 |
+| 次版本号 | `…/vodsync:1.9` | 可变 | 小版本内快速定位 |
+| 版本 + 提交 | `…/vodsync:1.9.3-7b44587` | **不可变** | **回滚用这个** —— 一个提交一个镜像，永不被覆盖 |
+| 提交短 SHA | `…/vodsync:sha-7b44587` | **不可变** | 按提交回滚 / 溯源 |
+
+版本号唯一来源是 `app/__init__.py` 里的 `__version__`：CI 从这里读出来生成 tag，
+`/docs` 与 `/healthz` 也读同一个值。推 `vX.Y.Z` git tag 时 CI 会校验 tag 与代码里的版本号一致，
+不一致直接构建失败（防止「镜像说 1.9.3、代码其实是 1.9.2」这种回滚事故）。
+每次构建的日志开头会打印「构建版本：…」，Actions 页面即可查到某一版打了哪些 tag。
+
+### 升级（跟随最新）
+
+```bash
+cd /volume2/docker/vodsync
+sudo docker compose pull vodsync && sudo docker compose up -d
+```
+
+### 回滚到指定版本
+
+```bash
+# 1) 看有哪些版本：GitHub → 仓库右侧 Packages → vodsync（或 Actions 里某次构建的 tag 列表）
+#    也可以直接试拉，404 就是没有这个版本
+sudo docker pull ghcr.io/consoleaiden/vodsync:1.9.3-7b44587
+
+# 2) 改 compose 里的镜像 tag（推荐用不可变的「版本 + 提交」tag）
+#    image: ghcr.io/consoleaiden/vodsync:1.9.3-7b44587
+sudo docker compose up -d
+
+# 3) 核对真的回滚成功了（version/build 对不上说明 tag 或缓存不对）
+curl -s http://127.0.0.1:8181/healthz
+# {"status":"ok","db":true,"version":"1.9.3","build":"7b4458781508a9055d84a0f744d5ce1327db984d",...}
+```
+
+要点：
+
+- **回滚只回滚代码，数据库不会跟着回退**。新版本做过的迁移（补列、加表）在旧版本上依然存在，
+  旧版本忽略它们即可 —— 本项目迁移均为「加列/加表」，不删不改，因此前后兼容。
+  唯一的例外是算法类升级（如相关推荐算法版本）：旧镜像启动后会把 `algo_version` 视为不匹配并重算，
+  属预期行为。
+- **生产环境建议把 `latest` 钉成具体版本**（`1.9.3-7b44587`），否则下次 `docker compose pull`
+  又会回到最新；想「只升指定版本」就永远别用 `latest`。
+- `docker compose pull` 发现有同名 tag 被覆盖时才会更新，所以**用不可变 tag 时拉取是幂等的**。
+- `build` 字段取自镜像构建时的提交 SHA（本地 `build: .` 时为 `unknown`），是区分「同名版本不同构建」的唯一凭据。
+
 ## 群晖部署
 
 详见 [docs/deploy-synology.md](docs/deploy-synology.md)。
@@ -464,6 +517,26 @@ vodsync/
 ```
 
 ## 变更记录
+
+### v1.9.3
+镜像版本化 + 版本探针：每次构建都打版本号 tag，回滚有据可依。
+
+- **CI 改为「每构建必带版本号」**：`app/__init__.py` 的 `__version__` 是唯一来源，
+  每次构建同时推 `1.9.3`、`1.9`、`1.9.3-<sha7>`（不可变）、`sha-<sha7>`（不可变），
+  main 分支额外更新 `latest`；推 `vX.Y.Z` tag 时校验与代码版本号一致，不一致直接失败
+- **镜像内写入构建信息**：`org.opencontainers.image.version / revision` label +
+  `VODSYNC_BUILD_SHA` 环境变量（`docker inspect` 可见）
+- **`GET /healthz` 新增 `version` / `build`**：升级或回滚后一条 curl 就能确认容器里跑的是哪个版本、
+  哪个提交构建的（`build` 为完整提交 SHA，源码直跑时为 `dev`）
+- **版本号集中**：`app/main.py` 的 FastAPI `version` 改为引用 `app/__init__.py`，不再两处写死
+- 文档：README 新增「镜像版本与回滚」章节（tag 语义表 / 回滚命令 / 数据库不回退的说明）；
+  `docker-compose.yml` 补 tag 说明与回滚示例
+- 测试：v1.9.2(39)、v1.9.1(31)、v1.9.0(56) 回归零失败
+- 版本号 1.9.2 → 1.9.3
+
+**升级步骤（v1.9.2 → v1.9.3）**：`docker compose pull vodsync && docker compose up -d`。
+无数据库变更、无新增配置项。升级后 `curl http://<IP>:8181/healthz` 应看到
+`"version":"1.9.3"`；从这版起每次构建都有不可变 tag，回滚按上文「镜像版本与回滚」操作。
 
 ### v1.9.2
 明星作品接口补强：新增「按明星查作品」、`star/related` 增加 Tab 角标数据、

@@ -494,6 +494,14 @@ _UPSERT_COLS = [
     "vod_time",
 ]
 
+# 可为空的文本列：手工构造的行（老脚本 / 测试 / 外部导入）只给必填字段时补空串。
+# 不补的话 executemany 会报 "A value is required for bind parameter 'vod_actor'"（v1.9.0 扩列后
+# 老脚本就是这样挂的）。抓取路径（extract_row）本来就带全 15 列，不受影响。
+_OPTIONAL_TEXT_COLS = (
+    "type_name", "pic", "remarks", "content", "play_url",
+    "vod_actor", "vod_director", "vod_writer", "vod_area", "vod_year", "vod_tag",
+)
+
 
 def upsert_batch(slug: str, rows: list) -> tuple:
     """
@@ -502,6 +510,10 @@ def upsert_batch(slug: str, rows: list) -> tuple:
     """
     if not rows:
         return 0, 0
+    rows = [dict(r) for r in rows]
+    for r in rows:
+        for c in _OPTIONAL_TEXT_COLS:
+            r.setdefault(c, "")
     table = build_vod_table(slug)
     # 先查询本批中已存在的 id，用于统计 inserted/updated
     ids = [r["vod_id"] for r in rows]
