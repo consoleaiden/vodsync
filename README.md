@@ -524,6 +524,26 @@ vodsync/
 
 ## 变更记录
 
+### v1.10.1
+详情接口透出演职员与明星标签：NAS 模式下「演员/标签」不再无数据。
+
+- **`_detail_item` 新增 5 个字段**（纯新增，旧客户端无影响）：`vod_actor`、`vod_director`、
+  `vod_area`、`vod_year`、`vod_tag`。这些列 v1.9.0 起就在库里，只是一直没返回 ——
+  NAS 模式下客户端只能拿 `star/related` 的 `stars` 兜底填演员，标签则完全没有数据源、整行隐藏
+- **取值走 `_pick`（容错）**：`_detail_item` 有 3 个调用点，其中「多源归并列表」的行是
+  multiquery 组装的 dict，没有这些列 —— 直接 `row["vod_actor"]` 会 KeyError 打挂列表接口。
+  现在缺列/为 NULL 统一返回 `""`，字段永远存在且恒为字符串
+- **三条路径对齐**：`/videos/{slug}/{id}`、`?ids=` 批量详情、`?ac=detail` 列表都带这 5 个字段
+  （`ac=detail` 与 `content/play_url` 同一条 SQL 取回，不增加往返；深翻页的 UNION 路径同样带上）；
+  普通列表模式**不带**（体积敏感）
+- 测试：新增 `scripts/test_v1101_detail.py`（26 项：3 条路径 / 缺列容错 / NULL / 回归）；
+  其余 14 个套件全绿（13/19/17/54/14/42/42/66/36/58/31/39/15/62）
+- 版本号 1.10.0 → 1.10.1
+
+**升级步骤（v1.10.0 → v1.10.1）**：`docker compose pull vodsync && docker compose up -d`。
+无数据库变更、无新增配置项、不触发重算。升级后 `curl http://<IP>:8181/healthz` 应看到
+`"version":"1.10.1"`。
+
 ### v1.10.0
 按 `docs/REVIEW_2026-11-07.md` 第 8 节把 W1~W4 四个批次一次落地：4 个数据级 Bug、
 6 项算法修正、13 项性能优化、7 项次要 Bug。**接口只加字段、不改结构**，

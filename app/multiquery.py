@@ -42,6 +42,14 @@ log = logging.getLogger("vodsync.multiquery")
 
 # 列表页需要的「瘦列」。content / play_url 是 TEXT 大字段，只在 detail 模式补当前页。
 THIN_COLS = ("vod_id", "type_id", "type_name", "name", "pic", "remarks", "vod_time")
+# 详情模式额外带出的列（v1.10.1）：演职员/地区/年代/明星标签。
+# 列表模式下不带（体积敏感）；detail=True 时和 content/play_url 同一条 SQL 取回，
+# 不增加往返 —— 否则 /videos?ac=detail 的响应里 vod_actor/vod_tag 会是空串，
+# 与 /videos/{slug}/{id} 的字段含义不一致。
+DETAIL_COLS = (
+    "content", "play_url",
+    "vod_actor", "vod_director", "vod_area", "vod_year", "vod_tag",
+)
 
 # total 缓存：key 是 slugs 元组（筛选条件下的 total 不缓存，参数太分散）
 _total_cache: dict = {}
@@ -190,7 +198,12 @@ def _page_one(slug: str, k: int, wd: str, type_name: str, type_id: int, existing
 
 
 def _attach_detail(items: list) -> None:
-    """给当前页补齐 content / play_url（按源站分组 IN 查询，只查这几十行）。"""
+    """
+    给当前页补齐详情列（按源站分组 IN 查询，只查这几十行）。
+
+    v1.10.1 起 DETAIL_COLS 里多了演职员/地区/年代/标签 —— 与 content/play_url
+    同一条 SQL 取回（列变多、往返不变），保证 `ac=detail` 与单条详情字段一致。
+    """
     by_slug: dict = {}
     for r in items:
         by_slug.setdefault(r["source_slug"], []).append(r["vod_id"])
@@ -201,7 +214,7 @@ def _attach_detail(items: list) -> None:
                 found = {
                     x["vod_id"]: x
                     for x in conn.execute(
-                        select(table.c.vod_id, table.c.content, table.c.play_url)
+                        select(table.c.vod_id, *(table.c[c] for c in DETAIL_COLS))
                         .where(table.c.vod_id.in_(ids))
                     ).mappings().all()
                 }
@@ -209,10 +222,11 @@ def _attach_detail(items: list) -> None:
             log.warning("[%s] 补详情失败（列表仍可用）: %s", slug, e)
             found = {}
         for r in items:
-            if r["source_slug"] == slug:
-                d = found.get(r["vod_id"])
-                r["content"] = (d["content"] if d else "") or ""
-                r["play_url"] = (d["play_url"] if d else "") or ""
+            if r["source_slug"] != slug:
+                continue
+            d = found.get(r["vod_id"])
+            for c in DETAIL_COLS:
+                r[c] = (d[c] if d else "") or ""
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +339,8 @@ def union_page(
             literal(slug).label("source_slug"),
         ]
         if detail:
-            cols += [table.c.content, table.c.play_url]
+            # v1.10.1：与单条详情字段对齐（同一 UNION，不增加往返）
+            cols += [table.c[c] for c in DETAIL_COLS]
         union_parts.append(select(*cols).where(*where))
 
     if not union_parts:

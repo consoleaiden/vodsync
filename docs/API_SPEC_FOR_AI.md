@@ -3,7 +3,7 @@
 > **本文档的用途**：把 VodSync 服务作为后端，交由 AI（或 AI 编程助手）开发客户端 App。
 > 文档自包含：只读本文即可完成全部对接，**不需要**阅读服务端源码。
 >
-> 对应服务版本：**v1.10.0** ｜ 文档版本：`2026-11-07` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.10.1** ｜ 文档版本：`2026-11-07` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 **目录**
 
@@ -290,7 +290,7 @@ type PlayLine = {
 ### 4.1 GET `/healthz`
 
 ```json
-{ "status": "ok", "db": true, "version": "1.10.0", "build": "7b4458781508a9055d84a0f744d5ce1327db984d", "time": "2026-10-30T16:09:53.527655" }
+{ "status": "ok", "db": true, "version": "1.10.1", "build": "7b4458781508a9055d84a0f744d5ce1327db984d", "time": "2026-10-30T16:09:53.527655" }
 ```
 
 用途：服务可用性探测 + 判断是否启用 API Key（见 2.1）。
@@ -439,6 +439,11 @@ GET /api/v1/videos?source=jkun&type_name=电影
 
 ```json
 {
+  "vod_actor": "吴京,屈楚萧,李光洁",
+  "vod_director": "郭帆",
+  "vod_area": "中国大陆",
+  "vod_year": "2019",
+  "vod_tag": "吴京",
   "vod_content": "简介文本…",
   "vod_play_url": "高清$https://example.com/playlist.m3u8",
   "vod_play_from": "vodsync",
@@ -449,6 +454,20 @@ GET /api/v1/videos?source=jkun&type_name=电影
   ]
 }
 ```
+
+> **v1.10.1 新增 5 个字段**（纯新增，仅详情模式 `ids=` / `ac=detail` 下出现，普通列表模式**不带**以控制体积）：
+>
+> | 字段 | 类型 | 说明 |
+> |---|---|---|
+> | `vod_actor` | string | 演员，逗号分隔（源站原文，未归一化）；缺失为 `""` |
+> | `vod_director` | string | 导演，逗号分隔；缺失为 `""` |
+> | `vod_area` | string | 地区（如 `中国大陆`）；缺失为 `""` |
+> | `vod_year` | string | 年代（4 位字符串，如 `2019`）；缺失为 `""` |
+> | `vod_tag` | string | **明星标签**，逗号分隔（词库命中的主名，由服务端回填）；缺失为 `""` |
+>
+> 这 5 个键**永远存在**且一定是字符串（库里为 NULL 也返回 `""`），客户端不需要判 null / 判 key 存在。
+> `vod_tag` 与 `/api/v1/star/related` 的 `stars` 同源，但它是**落库的静态值**（每晚轮转重建），
+> `stars` 是**实时计算**结果 —— 两者不一致时以 `stars` 为准。
 
 **错误**：
 - `ids` 无任何合法数字 → 400 `detail: "ids 参数格式错误，应为逗号分隔的数字，例如 ids=134369 或 ids=1,2,3"`
@@ -469,8 +488,30 @@ GET /api/v1/videos/jkun/134369
 ```
 
 ```json
-{ "code": 1, "detail": { "source": "jkun", "vod_id": 134369, "...": "同 3.3 全部字段" } }
+{
+  "code": 1,
+  "detail": {
+    "source": "jkun", "vod_id": 134369,
+    "type_id": 36, "type_name": "科幻片",
+    "vod_name": "流浪地球", "vod_pic": "https://.../cover.jpg",
+    "vod_remarks": "HD国语", "vod_time": "2026-10-30 10:59:06",
+    "vod_actor": "吴京,屈楚萧,李光洁",
+    "vod_director": "郭帆",
+    "vod_area": "中国大陆",
+    "vod_year": "2019",
+    "vod_tag": "吴京",
+    "vod_content": "简介文本…",
+    "vod_play_url": "高清$https://example.com/playlist.m3u8",
+    "vod_play_from": "vodsync",
+    "vod_play_list": [ { "name": "线路1", "episodes": [ ... ] } ],
+    "related": [ ... ], "related_fallback": false
+  }
+}
 ```
+
+> **v1.10.1**：`vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag` 五个字段开始透出
+> （列 v1.9.0 起就在库里，之前只是没返回）。语义与「②③」一致：恒为字符串，缺失为 `""`。
+> NAS 模式下客户端不再需要拿 `star/related` 的 `stars` 去拼演员，标签也有了数据源。
 
 **错误**：源站不存在 → 404；源站无数据 → 404；视频不存在 → 404 `{"detail":"视频不存在"}`。
 
@@ -1402,7 +1443,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.10.0（当前） | **算法与性能升级（无破坏性字段变更）**：`/api/v1/related` 新增 `algo_version` 与卡片级 `reason`（命中原因）；仅同分类/同地区/同年代的配对不再进推荐位、兜底条数降为 6 条且不与真命中混排；`/api/v1/videos` 无筛选时 `total` 改为估值并带 `total_approximate`；`/api/v1/categories` 新增 `cached`；`/api/v1/star/related` 的 `truncated` 改精确判定；`/api/v1/star-terms` 的 `active` 改为进程内生效数。详见 `UPGRADE_2026-11-07_v1.10.0.md` |
+| v1.10.1（当前） | **详情字段透出**：`/api/v1/videos/{slug}/{id}`、`?ids=` 批量详情、`?ac=detail` 列表新增 `vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag` 五个字段（恒为字符串，缺失为 `""`；普通列表模式不带）。纯新增，旧客户端无影响 |
+| v1.10.0 | **算法与性能升级（无破坏性字段变更）**：`/api/v1/related` 新增 `algo_version` 与卡片级 `reason`（命中原因）；仅同分类/同地区/同年代的配对不再进推荐位、兜底条数降为 6 条且不与真命中混排；`/api/v1/videos` 无筛选时 `total` 改为估值并带 `total_approximate`；`/api/v1/categories` 新增 `cached`；`/api/v1/star/related` 的 `truncated` 改精确判定；`/api/v1/star-terms` 的 `active` 改为进程内生效数。详见 `UPGRADE_2026-11-07_v1.10.0.md` |
 | v1.9.3 | `GET /healthz` 新增 `version` / `build`（镜像构建提交 SHA），便于升级/回滚核对与报障定位；无新增/变更业务接口，**客户端无需改动** |
 | v1.9.2 | **按明星查作品**：`GET /api/v1/star/works`（明星为中心，`total` 不受 limit 影响，无映射返回 200+空列表）；`star/related` 新增 `star_counts`（明星→作品数，Tab 角标）与 `truncated`（截断标志），`stars` 结构不变；`name` 匹配健壮性（空格/全半角/LIKE 转义）；词库 `aliases` 别名归一主名；`star/tags/untracked` 未入词库高频词统计 |
 | v1.9.1 | **明星作品推荐**：词库明星名回填缺失演员视频的 `vod_tag`（单正则一次扫描，O(标题长) 与词库大小解耦）；新表 `star_map` 明星-视频倒排映射（`src=actor/title` 可信度标记）；`GET /api/v1/star/related` 共享明星视频（走索引毫秒级）；`maintenance/star-tags` 手动重建、`star/tags/status` 覆盖统计；UPSERT 空 `vod_tag` 不覆盖本地推断值；同步后自动维护 + 每晚小站优先重建 |

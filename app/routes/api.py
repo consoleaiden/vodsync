@@ -288,6 +288,25 @@ def _qp(request: Request, name: str, default: str = "") -> str:
     return default
 
 
+def _pick(row, key):
+    """
+    容错取列值（v1.10.1）。
+
+    `_detail_item` 有 3 个调用点，其中「/videos 多源归并列表」的行是 multiquery
+    自己组装的 dict（THIN_COLS + DETAIL_COLS），不是完整表行 —— 如果以后有人往
+    这里加字段却忘了同步 multiquery，直接 `row["xxx"]` 就是 KeyError，
+    会把整个列表接口打挂（500）。
+
+    这里同时兼容 SQLAlchemy 的 Row / RowMapping（走 `_mapping.get`）与普通 dict，
+    取不到或为 None 时统一返回空串，客户端不必再判 null。
+    """
+    m = getattr(row, "_mapping", row)
+    try:
+        return m.get(key) or ""
+    except Exception:
+        return ""
+
+
 def _detail_item(source: str, row) -> dict:
     """详情条目：原始播放地址 + 结构化播放列表（列表接口与详情接口共用）。"""
     return {
@@ -299,6 +318,15 @@ def _detail_item(source: str, row) -> dict:
         "vod_pic": row["pic"],
         "vod_remarks": row["remarks"],
         "vod_time": row["vod_time"],
+        # v1.10.1：演职员 / 地区 / 年代 / 明星标签（纯新增字段）。
+        # 这些列 v1.9.0 起就在库里有，只是一直没透出 —— NAS 模式下客户端拿不到，
+        # 演员只能靠 star/related 的 stars 兜底，标签则没有任何数据源、整行隐藏。
+        # 取值必须走 _pick（见其 docstring）：3 个调用点里有一路的行没有这些列。
+        "vod_actor": _pick(row, "vod_actor"),
+        "vod_director": _pick(row, "vod_director"),
+        "vod_area": _pick(row, "vod_area"),
+        "vod_year": _pick(row, "vod_year"),
+        "vod_tag": _pick(row, "vod_tag"),
         "vod_content": row["content"],
         "vod_play_url": row["play_url"],
         "vod_play_from": "vodsync",
@@ -1132,6 +1160,10 @@ def video_list(
       3. 完整列表：  /api/v1/videos?source=jkun&ac=detail         （列表带播放地址）
       4. 分类浏览：  /api/v1/videos?source=jkun&type_id=6         （配合 /api/v1/categories）
 
+    v1.10.1（纯新增）：详情模式（`ids=` 批量 / `ac=detail` 列表）额外返回
+    `vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag` 五个字段，
+    恒为字符串（库里 NULL 也返回 ""），普通列表模式不带（控制体积）。
+
     v1.10.0（纯新增）：不带筛选条件的全站列表（无 wd / type_id / type_name / ids）
     的 `total` 改为估值，并在响应里带 `total_approximate: true`。
     出处是 sources.total_videos（后台同步一直维护），省掉 52 张表各跑一次 count(*)。
@@ -1252,7 +1284,13 @@ def video_list(
 
 @router.get("/api/v1/videos/{slug}/{vod_id}")
 def video_detail(slug: str, vod_id: int):
-    """视频详情（含结构化播放地址列表）。RELATED_IN_DETAIL=true 时附带 related 推荐数组。"""
+    """
+    视频详情（含结构化播放地址列表）。RELATED_IN_DETAIL=true 时附带 related 推荐数组。
+
+    v1.10.1（纯新增）：返回 `vod_actor` / `vod_director` / `vod_area` / `vod_year` /
+    `vod_tag` 五个字段 —— 列 v1.9.0 起就在库里，之前没透出，NAS 模式的客户端拿不到
+    演员与明星标签。字段恒为字符串（缺失/NULL 为 ""），客户端不必判 null。
+    """
     src, table = _require_table(slug)
     with database.engine.connect() as conn:
         row = conn.execute(

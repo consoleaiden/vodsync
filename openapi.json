@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.10.0"
+    "version": "1.10.1"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -1023,7 +1023,7 @@
     "/api/v1/videos": {
       "get": {
         "summary": "Video List",
-        "description": "视频列表 / 批量详情。\n\n四种用法：\n  1. 列表：      /api/v1/videos?source=jkun&page=1&page_size=20\n  2. 批量详情：  /api/v1/videos?source=jkun&ids=134369       （含 vod_play_url）\n  3. 完整列表：  /api/v1/videos?source=jkun&ac=detail         （列表带播放地址）\n  4. 分类浏览：  /api/v1/videos?source=jkun&type_id=6         （配合 /api/v1/categories）\n\nv1.10.0（纯新增）：不带筛选条件的全站列表（无 wd / type_id / type_name / ids）\n的 `total` 改为估值，并在响应里带 `total_approximate: true`。\n出处是 sources.total_videos（后台同步一直维护），省掉 52 张表各跑一次 count(*)。\n`pagecount` 随之由估值算出，翻到末页可能有 1~2 页偏差；带筛选时仍是精确值。\n客户端若做「共 N 条 / 最后一页」的强展示，请判断该字段后自行降级为「约 N 条」。",
+        "description": "视频列表 / 批量详情。\n\n四种用法：\n  1. 列表：      /api/v1/videos?source=jkun&page=1&page_size=20\n  2. 批量详情：  /api/v1/videos?source=jkun&ids=134369       （含 vod_play_url）\n  3. 完整列表：  /api/v1/videos?source=jkun&ac=detail         （列表带播放地址）\n  4. 分类浏览：  /api/v1/videos?source=jkun&type_id=6         （配合 /api/v1/categories）\n\nv1.10.1（纯新增）：详情模式（`ids=` 批量 / `ac=detail` 列表）额外返回\n`vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag` 五个字段，\n恒为字符串（库里 NULL 也返回 \"\"），普通列表模式不带（控制体积）。\n\nv1.10.0（纯新增）：不带筛选条件的全站列表（无 wd / type_id / type_name / ids）\n的 `total` 改为估值，并在响应里带 `total_approximate: true`。\n出处是 sources.total_videos（后台同步一直维护），省掉 52 张表各跑一次 count(*)。\n`pagecount` 随之由估值算出，翻到末页可能有 1~2 页偏差；带筛选时仍是精确值。\n客户端若做「共 N 条 / 最后一页」的强展示，请判断该字段后自行降级为「约 N 条」。",
         "operationId": "video_list_api_v1_videos_get",
         "parameters": [
           {
@@ -1152,7 +1152,7 @@
     "/api/v1/videos/{slug}/{vod_id}": {
       "get": {
         "summary": "Video Detail",
-        "description": "视频详情（含结构化播放地址列表）。RELATED_IN_DETAIL=true 时附带 related 推荐数组。",
+        "description": "视频详情（含结构化播放地址列表）。RELATED_IN_DETAIL=true 时附带 related 推荐数组。\n\nv1.10.1（纯新增）：返回 `vod_actor` / `vod_director` / `vod_area` / `vod_year` /\n`vod_tag` 五个字段 —— 列 v1.9.0 起就在库里，之前没透出，NAS 模式的客户端拿不到\n演员与明星标签。字段恒为字符串（缺失/NULL 为 \"\"），客户端不必判 null。",
         "operationId": "video_detail_api_v1_videos__slug___vod_id__get",
         "parameters": [
           {
