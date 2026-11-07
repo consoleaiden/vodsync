@@ -4,6 +4,8 @@
 
 > 本文档面向「调用 VodSync 服务的客户端 App」（原生 App / H5 / 小程序 / 播放器 / 采集器均可）。
 > 目标：一个 AI 客户端开发者（或 AI 编程助手）拿这份文档即可完成全部对接，无需阅读服务端代码。
+>
+> 对应服务版本：**v1.10.1** ｜ 文档版本：`2026-11-07` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 ---
 
@@ -109,6 +111,11 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 | POST | `/api/v1/maintenance/recount` | 条数校准（异步执行） |
 
 > 管理接口全部为**异步受理**模式：POST 立即返回 `{"code":1,"msg":"...已受理"}`，实际进度通过轮询 `/api/v1/sources`（看 `syncing`/`progress` 字段）与 `/api/v1/logs` 获取。
+>
+> 上表只列客户端最常用的管理接口。**完整清单（共 44 个）见
+> [`API_SPEC_FOR_AI.md` 4.0 接口总表](./API_SPEC_FOR_AI.md)** —— 其中鉴权（`/api/v1/auth/*`）、
+> 自定义源站（`/api/v1/sources/custom` 等）、明星词库维护（`/api/v1/star-terms*`）、
+> 明星 Tag 重建（`/api/v1/maintenance/star-tags`）本文未展开。
 
 ---
 
@@ -296,7 +303,7 @@ GET /api/v1/jkun?ac=list&wd=三体     # 搜索
 
 响应结构：`{code, msg, page, pagecount, limit, total, class:[{type_id,type_name}], list:[...]}`，`ac=detail` 时 list 元素含 `vod_content / vod_play_url / vod_play_from / vod_play_list`。
 
-### 3.7 推荐与明星接口（v1.9.0 / v1.9.2 / v1.10.0）
+### 3.7 推荐与明星接口（v1.9.0 ~ v1.10.1）
 
 > 详情页推荐栏的三层数据来源：`related`（内容相似）→ `star/related`（全部 Tab）→ `star/works`（单个明星 Tab）。
 

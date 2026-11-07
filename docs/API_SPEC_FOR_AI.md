@@ -13,7 +13,7 @@
 | [1](#1-服务能提供什么) | 服务能力概览 |
 | [2](#2-通用约定) | 鉴权 / 响应格式 / 错误码 / 分页 / 编码 |
 | [3](#3-数据模型字段字典) | 数据模型与字段字典 |
-| [4](#4-接口参考) | 29 个接口逐一说明 |
+| [4](#4-接口参考) | 44 个接口逐一说明 |
 | [5](#5-状态语义与推荐-ui最容易做错的部分) | 状态语义与推荐 UI（running / syncing / paused / auto_sync） |
 | [6](#6-端到端流程可直接交给-ai-实现) | 端到端流程（观影 App / 管理 App） |
 | [7](#7-客户端代码骨架) | 客户端代码骨架（TS / Kotlin / Flutter / Swift） |
@@ -27,7 +27,7 @@
 
 生成代码前请把这些规则当作不可协商的约束：
 
-1. **Base URL 由部署方提供**，形如 `http://192.168.1.10:8000`（Docker 默认映射端口 `8000`；群晖示例可能用 `8181`）。文档中所有路径都相对于该地址，**不要**自行拼接域名或加 `/api` 前缀。
+1. **Base URL 由部署方提供**，形如 `http://192.168.1.10:8181`。`docker-compose.yml` 默认把宿主机 `8181` 映射到容器内 `8000`（`"8181:8000"`），所以**对外一律用宿主机端口**；本地直接 `uvicorn` 起服务时才是 `8000`。文档中所有路径都相对于该地址，**不要**自行拼接域名或加 `/api` 前缀。
 2. 所有响应为 JSON，编码 UTF-8；业务成功标记为 `code: 1`。
 3. 失败是 **HTTP 状态码 + `detail`**，不是 `code: 0`。客户端必须按状态码分支，不要只判断 `code`。
 4. `source` 参数是**源站标识 slug**（如 `jkun`、`s361c088099`），**不是**站点名。slug 只能匹配 `^[a-z0-9_]{1,64}$`；中文站名在服务端被哈希成 `s` + 10 位十六进制。
@@ -157,7 +157,7 @@ curl -s http://<host>:8181/api/v1/auth/state
 
 ---
 
-## 3. 数据模型（字段字典）
+## 3. 数据模型与字段字典
 
 ### 3.1 Source（源站）
 
@@ -239,9 +239,9 @@ type PlayLine = {
 |---|---|---|---|---|
 | 1 | GET | `/healthz` | 基础 | 健康检查（免鉴权，恒 200） |
 | 2 | GET | `/source` | 数据 | 源站清单（App 初始化） |
-| 3 | GET | `/api/v1/categories` | 数据 | 分类清单 |
-| 4 | GET | `/api/v1/videos` | 数据 | 列表 / 分类浏览 / 批量详情 |
-| 5 | GET | `/api/v1/videos/{slug}/{vod_id}` | 数据 | 单条详情 |
+| 3 | GET | `/api/v1/categories` | 数据 | 分类清单（v1.10.0 起带 `cached`） |
+| 4 | GET | `/api/v1/videos` | 数据 | 列表 / 分类浏览 / 批量详情（详情模式带演职员与标签） |
+| 5 | GET | `/api/v1/videos/{slug}/{vod_id}` | 数据 | 单条详情（v1.10.1 起带演职员与标签） |
 | 6 | GET | `/api/v1/search` | 数据 | 跨源聚合搜索 |
 | 7 | GET | `/api/v1/{slug}` | 数据 | MacCMS 兼容（`?ac=list\|detail`） |
 | 8 | GET | `/api/v1/stats` | 管理 | 概览统计 |
@@ -259,38 +259,38 @@ type PlayLine = {
 | 20 | POST | `/api/v1/sources/auto-sync` | 管理 | 批量自动同步开关 |
 | 21 | GET | `/api/v1/logs` | 管理 | 最近同步日志 |
 | 22 | POST | `/api/v1/maintenance/recount` | 管理 | 条数校准 |
-| 23 | POST | `/api/v1/auth/login` | 鉴权 | 面板登录（换会话 cookie） |
-| 24 | POST | `/api/v1/auth/logout` | 鉴权 | 退出登录 |
-| 25 | GET | `/api/v1/auth/state` | 鉴权 | 鉴权状态（免鉴权，未登录只回 `enabled`/`logged_in`） |
-| 26 | POST | `/api/v1/sources/probe` | 管理 | 测试 API 地址连通性（不落库、不建表） |
-| 27 | POST | `/api/v1/sources/custom` | 管理 | **添加自定义源站**（latest.json 之外） |
-| 28 | PATCH | `/api/v1/sources/{slug}/custom` | 管理 | 修改自定义源站（改 `api_url` 会清空该站数据） |
-| 29 | DELETE | `/api/v1/sources/{slug}/custom` | 管理 | 删除自定义源站（需 `confirm=<slug>`） |
-| 26 | POST | `/api/v1/auth/password` | 鉴权 | 修改面板密码 |
-| 27 | POST | `/api/v1/auth/settings` | 鉴权 | 开关访问控制（开启时自动换 Token） |
-| 28 | GET | `/api/v1/auth/token` | 鉴权 | 读取当前 Token（需登录） |
-| 29 | POST | `/api/v1/auth/token` | 鉴权 | 重置 Token（旧 Token 立即失效） |
-| 30 | GET | `/api/v1/related` | 数据 | **相关推荐**（预计算直读，P95<50ms）v1.9.0 |
-| 31 | GET | `/api/v1/related/status` | 管理 | 各源站推荐覆盖率 v1.9.0 |
-| 32 | GET/POST | `/api/v1/star-terms` | 管理 | 明星词库查询/批量添加（面板用）v1.9.0 |
-| 33 | PATCH/DELETE | `/api/v1/star-terms/{id}` | 管理 | 词条改名/启停/删除（面板用）v1.9.0 |
-| 34 | POST | `/api/v1/star-terms/recompute` | 管理 | 词库变更后全量重算推荐（面板用）v1.9.0 |
-| 35 | POST | `/api/v1/maintenance/related-recompute` | 管理 | 手动重算指定/全部源站推荐 v1.9.0 |
-| 36 | GET | `/api/v1/star/related` | 业务 | 明星作品推荐：与目标视频共享明星的其他视频 v1.9.1 |
-| 37 | POST | `/api/v1/maintenance/star-tags` | 管理 | 手动重建明星 Tag + star_map 映射 v1.9.1 |
-| 38 | GET | `/api/v1/star/tags/status` | 管理 | 明星 Tag 覆盖统计（视频数/缺演员数/已映射数） v1.9.1 |
-| 39 | GET | `/api/v1/star/works` | 业务 | 按明星查作品（明星为中心，total 不受 limit 影响） v1.9.2 |
-| 40 | GET | `/api/v1/star/tags/untracked` | 管理 | 未入词库高频标题词 Top N（扩词库用） v1.9.2 |
+| 23 | POST | `/api/v1/sources/probe` | 管理 | 测试 API 地址连通性（不落库、不建表） |
+| 24 | POST | `/api/v1/sources/custom` | 管理 | **添加自定义源站**（latest.json 之外） |
+| 25 | PATCH | `/api/v1/sources/{slug}/custom` | 管理 | 修改自定义源站（改 `api_url` 会清空该站数据） |
+| 26 | DELETE | `/api/v1/sources/{slug}/custom` | 管理 | 删除自定义源站（需 `confirm=<slug>`） |
+| 27 | POST | `/api/v1/auth/login` | 鉴权 | 面板登录（换会话 cookie，免鉴权） |
+| 28 | POST | `/api/v1/auth/logout` | 鉴权 | 退出登录 |
+| 29 | GET | `/api/v1/auth/state` | 鉴权 | 鉴权状态（免鉴权，未登录只回 `enabled`/`logged_in`） |
+| 30 | POST | `/api/v1/auth/password` | 鉴权 | 修改面板密码 |
+| 31 | POST | `/api/v1/auth/settings` | 鉴权 | 开关访问控制（开启时自动换 Token） |
+| 32 | GET | `/api/v1/auth/token` | 鉴权 | 读取当前 Token（需登录） |
+| 33 | POST | `/api/v1/auth/token` | 鉴权 | 重置 Token（旧 Token 立即失效） |
+| 34 | GET | `/api/v1/related` | 数据 | **相关推荐**（预计算直读，P95<50ms） |
+| 35 | GET | `/api/v1/related/status` | 管理 | 各源站推荐覆盖率 |
+| 36 | GET/POST | `/api/v1/star-terms` | 管理 | 明星词库查询/批量添加（面板用） |
+| 37 | PATCH/DELETE | `/api/v1/star-terms/{id}` | 管理 | 词条改名/启停/删除（面板用） |
+| 38 | POST | `/api/v1/star-terms/recompute` | 管理 | 词库变更后全量重算推荐（面板用） |
+| 39 | POST | `/api/v1/maintenance/related-recompute` | 管理 | 手动重算指定/全部源站推荐 |
+| 40 | GET | `/api/v1/star/related` | 业务 | 明星作品推荐：与目标视频共享明星的其他视频 |
+| 41 | POST | `/api/v1/maintenance/star-tags` | 管理 | 手动重建明星 Tag + star_map 映射 |
+| 42 | GET | `/api/v1/star/tags/status` | 管理 | 明星 Tag 覆盖统计（视频数/缺演员数/已映射数） |
+| 43 | GET | `/api/v1/star/works` | 业务 | 按明星查作品（明星为中心，total 不受 limit 影响） |
+| 44 | GET | `/api/v1/star/tags/untracked` | 管理 | 未入词库高频标题词 Top N（扩词库用） |
 
-> 第 23–29 项是**管理面板自己用的**，客户端 App 只需要 Token（见 2.1），不必实现这些接口。
-> `/api/v1/auth/login` 与 `/api/v1/auth/state` 免鉴权，其余四项需要登录会话 cookie。
+> 共 **44 个接口**。标「管理」的主要供管理面板使用，客户端 App 只需一枚 Token（见 2.1）即可调用「数据」「业务」类接口。
+> 鉴权类中 `/api/v1/auth/login` 与 `/api/v1/auth/state` **免鉴权**，其余需登录会话 cookie（`POST /api/v1/auth/password` 等也可用 Token 访问）。
 
 ---
 
 ### 4.1 GET `/healthz`
 
 ```json
-{ "status": "ok", "db": true, "version": "1.10.1", "build": "7b4458781508a9055d84a0f744d5ce1327db984d", "time": "2026-10-30T16:09:53.527655" }
+{ "status": "ok", "db": true, "version": "1.10.1", "build": "4f249a7299d30827c1e785173d7d5a63a22191ca", "time": "2026-11-07T10:20:31.882914" }
 ```
 
 用途：服务可用性探测 + 判断是否启用 API Key（见 2.1）。
@@ -1444,7 +1444,7 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 | 版本 | 主要变化 |
 |---|---|
 | v1.10.1（当前） | **详情字段透出**：`/api/v1/videos/{slug}/{id}`、`?ids=` 批量详情、`?ac=detail` 列表新增 `vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag` 五个字段（恒为字符串，缺失为 `""`；普通列表模式不带）。纯新增，旧客户端无影响 |
-| v1.10.0 | **算法与性能升级（无破坏性字段变更）**：`/api/v1/related` 新增 `algo_version` 与卡片级 `reason`（命中原因）；仅同分类/同地区/同年代的配对不再进推荐位、兜底条数降为 6 条且不与真命中混排；`/api/v1/videos` 无筛选时 `total` 改为估值并带 `total_approximate`；`/api/v1/categories` 新增 `cached`；`/api/v1/star/related` 的 `truncated` 改精确判定；`/api/v1/star-terms` 的 `active` 改为进程内生效数。详见 `UPGRADE_2026-11-07_v1.10.0.md` |
+| v1.10.0 | **算法与性能升级（无破坏性字段变更）**：`/api/v1/related` 新增 `algo_version` 与卡片级 `reason`（命中原因）；仅同分类/同地区/同年代的配对不再进推荐位、兜底条数降为 6 条且不与真命中混排；`/api/v1/videos` 无筛选时 `total` 改为估值并带 `total_approximate`；`/api/v1/categories` 新增 `cached`；`/api/v1/star/related` 的 `truncated` 改精确判定；`/api/v1/star-terms` 的 `active` 改为进程内生效数。详见 `UPGRADE_2026-11-07_v1.10.x.md` |
 | v1.9.3 | `GET /healthz` 新增 `version` / `build`（镜像构建提交 SHA），便于升级/回滚核对与报障定位；无新增/变更业务接口，**客户端无需改动** |
 | v1.9.2 | **按明星查作品**：`GET /api/v1/star/works`（明星为中心，`total` 不受 limit 影响，无映射返回 200+空列表）；`star/related` 新增 `star_counts`（明星→作品数，Tab 角标）与 `truncated`（截断标志），`stars` 结构不变；`name` 匹配健壮性（空格/全半角/LIKE 转义）；词库 `aliases` 别名归一主名；`star/tags/untracked` 未入词库高频词统计 |
 | v1.9.1 | **明星作品推荐**：词库明星名回填缺失演员视频的 `vod_tag`（单正则一次扫描，O(标题长) 与词库大小解耦）；新表 `star_map` 明星-视频倒排映射（`src=actor/title` 可信度标记）；`GET /api/v1/star/related` 共享明星视频（走索引毫秒级）；`maintenance/star-tags` 手动重建、`star/tags/status` 覆盖统计；UPSERT 空 `vod_tag` 不覆盖本地推断值；同步后自动维护 + 每晚小站优先重建 |

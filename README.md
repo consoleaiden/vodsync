@@ -18,9 +18,12 @@
 - **自带维护任务**：定时清理同步日志、回收 WAL，长时间跑不会把库/磁盘撑爆
 - **自定义源站**（v1.8.0）：latest.json 之外的接口可在面板手动登记，带连通性测试；持久化保存，刷新源站列表不会覆盖或删除
 - **相关推荐预计算**（v1.9.0）：同步时离线算好每个视频的 Top-12 相关推荐，客户端详情页直接拉取零计算成本；权重重分配 + 标题相似度核心 + 三级兜底，数据稀疏也能命中；面板可维护「明星词库」增强信号
-
 - **明星作品推荐**（v1.9.1）：词库明星名自动回填进缺失演员视频的 `vod_tag`（单正则一次扫描全部命中，性能与词库大小解耦）；`star_map` 倒排映射让「同明星的其他作品」API 走索引毫秒返回
 - **按明星查作品**（v1.9.2）：`/api/v1/star/works` 以明星为中心返回完整作品（`total` 不受 limit 影响），配合 `/star/related` 的 `star_counts` 角标与 `truncated` 标志，客户端可直接做「全部 / 按明星」Tab；词库支持别名（多译名归一主名）
+- **推荐算法 v2**（v1.10.0）：证据先验 + 内容信号门控，修掉「仅同分类的不相关影片拿高分」；演员改余弦相似度抑制客串；整站重算 **3.9×**；无筛选列表 `total` 走估值
+- **详情字段透出**（v1.10.1）：详情与批量详情返回 `vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag`，NAS 模式下演员与标签不再无数据
+
+> 文档入口：[`docs/README.md`](docs/README.md)（按用途索引全部文档）
 
 ## 技术选型说明
 
@@ -396,6 +399,8 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
 | `CATEGORIES_CACHE_SECONDS` | 300 | 分类清单缓存秒数（0 = 不缓存） |
 | `PG_TRGM_ENABLED` | true | 启动后台建 `pg_trgm` GIN 搜索索引（不锁表；无权限只记日志） |
 | `RELATED_ALGO_VERSION` | 2 | 算法版本，改动即清空旧结果并重算（回滚到 1.9.x 请设回 `1`） |
+| `RELATED_REQUIRE_CONTENT_SIGNAL` | true | 只有标题/演职员命中才算相似；关掉则退回纯权重打分（不推荐） |
+| `RELATED_CANDIDATE_CAP` | 140 | 倒排候选上限（越大越慢；1 万行实测 140 是性价比拐点） |
 | `RELATED_RECOMPUTE_CONCURRENCY` | 2 | 全局同时整站重算的源站数（内存紧设 1） |
 | `RELATED_FALLBACK_LIMIT` | 6 | 零命中时的兜底条数 |
 | `HOUSEKEEPING_ENABLED` | true | 是否定时清理同步日志 / 回收 WAL |
@@ -412,7 +417,7 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
 | `API_KEY` | 空 | 兼容项：设置后作为一枚额外有效的 Token |
 | `ONLY_OK_SOURCES` | true | 只同步在线源站 |
 
-## 镜像版本与回滚（v1.9.3）
+## 镜像版本与回滚
 
 **每次构建的镜像都带版本号**，不再是「只有一个 latest」—— 回滚就是把 compose 里的 tag 改回旧版本。
 
@@ -421,14 +426,14 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
 | tag | 示例 | 是否可变 | 用途 |
 |---|---|---|---|
 | `latest` | `…/vodsync:latest` | 可变 | 生产默认跟随最新（只在 main 分支构建时更新） |
-| 版本号 | `…/vodsync:1.9.3` | 可变 | 同一版本多次构建时指向最新一次 |
-| 次版本号 | `…/vodsync:1.9` | 可变 | 小版本内快速定位 |
-| 版本 + 提交 | `…/vodsync:1.9.3-7b44587` | **不可变** | **回滚用这个** —— 一个提交一个镜像，永不被覆盖 |
-| 提交短 SHA | `…/vodsync:sha-7b44587` | **不可变** | 按提交回滚 / 溯源 |
+| 版本号 | `…/vodsync:1.10.1` | 可变 | 同一版本多次构建时指向最新一次 |
+| 次版本号 | `…/vodsync:1.10` | 可变 | 小版本内快速定位 |
+| 版本 + 提交 | `…/vodsync:1.10.1-4f249a7` | **不可变** | **回滚用这个** —— 一个提交一个镜像，永不被覆盖 |
+| 提交短 SHA | `…/vodsync:sha-4f249a7` | **不可变** | 按提交回滚 / 溯源 |
 
 版本号唯一来源是 `app/__init__.py` 里的 `__version__`：CI 从这里读出来生成 tag，
 `/docs` 与 `/healthz` 也读同一个值。推 `vX.Y.Z` git tag 时 CI 会校验 tag 与代码里的版本号一致，
-不一致直接构建失败（防止「镜像说 1.9.3、代码其实是 1.9.2」这种回滚事故）。
+不一致直接构建失败（防止「镜像说 1.10.1、代码其实是 1.10.0」这种回滚事故）。
 每次构建的日志开头会打印「构建版本：…」，Actions 页面即可查到某一版打了哪些 tag。
 
 ### 升级（跟随最新）
@@ -443,15 +448,15 @@ sudo docker compose pull vodsync && sudo docker compose up -d
 ```bash
 # 1) 看有哪些版本：GitHub → 仓库右侧 Packages → vodsync（或 Actions 里某次构建的 tag 列表）
 #    也可以直接试拉，404 就是没有这个版本
-sudo docker pull ghcr.io/consoleaiden/vodsync:1.9.3-7b44587
+sudo docker pull ghcr.io/consoleaiden/vodsync:1.10.1-4f249a7
 
 # 2) 改 compose 里的镜像 tag（推荐用不可变的「版本 + 提交」tag）
-#    image: ghcr.io/consoleaiden/vodsync:1.9.3-7b44587
+#    image: ghcr.io/consoleaiden/vodsync:1.10.1-4f249a7
 sudo docker compose up -d
 
 # 3) 核对真的回滚成功了（version/build 对不上说明 tag 或缓存不对）
 curl -s http://127.0.0.1:8181/healthz
-# {"status":"ok","db":true,"version":"1.9.3","build":"7b4458781508a9055d84a0f744d5ce1327db984d",...}
+# {"status":"ok","db":true,"version":"1.10.1","build":"4f249a7299d30827c1e785173d7d5a63a22191ca",...}
 ```
 
 要点：
@@ -460,7 +465,7 @@ curl -s http://127.0.0.1:8181/healthz
   旧版本忽略它们即可 —— 本项目迁移均为「加列/加表」，不删不改，因此前后兼容。
   唯一的例外是算法类升级（如相关推荐算法版本）：旧镜像启动后会把 `algo_version` 视为不匹配并重算，
   属预期行为。
-- **生产环境建议把 `latest` 钉成具体版本**（`1.9.3-7b44587`），否则下次 `docker compose pull`
+- **生产环境建议把 `latest` 钉成具体版本**（`1.10.1-4f249a7`），否则下次 `docker compose pull`
   又会回到最新；想「只升指定版本」就永远别用 `latest`。
 - `docker compose pull` 发现有同名 tag 被覆盖时才会更新，所以**用不可变 tag 时拉取是幂等的**。
 - `build` 字段取自镜像构建时的提交 SHA（本地 `build: .` 时为 `unknown`），是区分「同名版本不同构建」的唯一凭据。
@@ -469,7 +474,7 @@ curl -s http://127.0.0.1:8181/healthz
 
 详见 [docs/deploy-synology.md](docs/deploy-synology.md)。
 
-**客户端 App 对接**：完整的接口文档（含参数表、响应示例、App 实现流程、常见坑）见 **[docs/CLIENT_API.md](docs/CLIENT_API.md)**；给已有 App **加 API Token** 的施工单见 **[docs/APP_TOKEN_UPGRADE.md](docs/APP_TOKEN_UPGRADE.md)**（整篇丢给 AI 即可）；机器可读规范直接导入 `http://<host>:8000/openapi.json`。
+**客户端 App 对接**：完整的接口文档（含参数表、响应示例、App 实现流程、常见坑）见 **[docs/CLIENT_API.md](docs/CLIENT_API.md)**；给已有 App **加 API Token** 的施工单见 **[docs/APP_TOKEN_UPGRADE.md](docs/APP_TOKEN_UPGRADE.md)**（整篇丢给 AI 即可）；机器可读规范直接导入 `http://<host>:8181/openapi.json`（宿主机端口按 `docker-compose.yml` 映射，默认 8181→容器 8000）。
 
 ## 常见坑
 
@@ -515,14 +520,21 @@ vodsync/
 ├── .env.example
 ├── scripts/                             # 测试脚本（用 SQLite 临时库，不需要 PG）
 └── docs/
-    ├── API_SPEC_FOR_AI.md   # ★ 交付给 AI 的完整 API 文档（字段字典/状态语义/代码骨架/排查表）
-    ├── CLIENT_API.md        # 简明对接说明（人类速查）
-    ├── APP_TOKEN_UPGRADE.md # ★ 给 App 加 API Token 的升级施工单（交给 AI 执行）
-    ├── openapi.json         # OpenAPI 3.1 快照（可导入代码生成器）
-    └── deploy-synology.md   # 群晖部署
+    ├── README.md                     # 文档索引（每份文档的用途 / 时效 / 读者）
+    ├── API_SPEC_FOR_AI.md            # ★ 交付给 AI 的完整 API 文档（字段字典/状态语义/代码骨架/排查表）
+    ├── CLIENT_API.md                 # 简明对接说明（人类速查）
+    ├── openapi.json                  # OpenAPI 3.1 快照（可导入代码生成器）
+    ├── deploy-synology.md            # 群晖部署
+    ├── APP_TOKEN_UPGRADE.md          # 给已有 App 加 API Token 的施工单（交给 AI 执行）
+    ├── UPGRADE_2026-11-07_v1.10.x.md # v1.9.3 → v1.10.x 升级报告（前端对接清单）
+    ├── REVIEW_2026-11-07.md          # 代码审查报告（v1.9.3 基线，问题已全部落地）
+    ├── REVIEW_2026-11-03.md          # 复盘报告（v1.5.2 基线，已在 v1.6.0 修复）
+    └── RESPONSE_ENCRYPTION_PLAN.md   # 响应加密/请求签名方案（规划稿，未实施）
 ```
 
 ## 变更记录
+
+> 按版本号**从新到旧**排列，最新版本在最前。历史版本只做归档记录，细节以对应版本的代码与文档为准。
 
 ### v1.10.1
 详情接口透出演职员与明星标签：NAS 模式下「演员/标签」不再无数据。
@@ -547,7 +559,7 @@ vodsync/
 ### v1.10.0
 按 `docs/REVIEW_2026-11-07.md` 第 8 节把 W1~W4 四个批次一次落地：4 个数据级 Bug、
 6 项算法修正、13 项性能优化、7 项次要 Bug。**接口只加字段、不改结构**，
-完整对接说明见 [`docs/UPGRADE_2026-11-07_v1.10.0.md`](docs/UPGRADE_2026-11-07_v1.10.0.md)。
+完整对接说明见 [`docs/UPGRADE_2026-11-07_v1.10.x.md`](docs/UPGRADE_2026-11-07_v1.10.x.md)。
 
 - **数据级修复**
   - B1 批量加词条改 `ON CONFLICT DO NOTHING`：PG 上"含重复名字 → 整批 500、一个字没进"修掉
@@ -731,195 +743,32 @@ vodsync/
 
 **新增配置**：见 `.env.example` 的「相关推荐（v1.9.0）」与「存量字段回填」两段，全部有默认值，不配也能正常跑。
 
-### v1.1.0
-- 新增 **Web 管理面板**（`/`）：概览统计、全量同步进度条、单站/全站手动触发、条数校准、源站日志、跨源搜索
-- 新增 **聚合搜索接口** `GET /api/v1/search`：线程池并行查询各源站表 + 内存归并分页，单源失败隔离，LIKE 通配符转义
-- 新增 `GET /api/v1/stats`（面板概览）、`POST /api/v1/maintenance/recount`（条数校准）
-- `sources` 表新增 `total_pages` 列，启动时自动迁移旧库（无需手动改表）
-- 修复：全量同步中断时 `total_videos` 长期为 0（现在每次断点保存同时刷新条数；启动时也会校准）
-- 版本号 1.0.0 → 1.1.0
+### v1.8.1
+源站健康度退避：源站持续限流/宕机时不再「每 6 小时从第 1 页捶到最后一页」。
 
-### v1.0.0
-- 首个版本：源站发现、全量断点续传、增量水位线同步、每源站一表、REST + MacCMS 兼容 API、CI 多架构镜像、群晖部署文档
+背景：某 9.3 万条的源站出现单轮 2,678 个索引页失败的日志。旧逻辑水位线冻结是对的
+（不丢数据），但下一轮照样全量重扫——源站还在宕机时就是每轮 2,700 次空转请求，
+既烧流量又持续触发对方风控，面板上也看不出哪个站在装死。
 
-### v1.1.1
-- 新增 `GET /source`：资源站 API 清单（上游 `api` 地址 + 本地 `local_api`/`local_list_api` + 已入库条数），支持 `?status=ok|down`、`?only_ready=true` 过滤
-- 管理面板新增「资源站 API」按钮，一键查看清单
-- 断点保存时同步更新 `last_sync_at`，面板与 `/source` 的"最后同步时间"不再为空
-
-### v1.1.2
-- `/api/v1/videos` 增强：新增 `ids=1,2,3`（批量取详情，按请求顺序返回，含播放地址）与 `ac=detail`（列表带播放地址）
-- 查询参数归一化：兼容 `&?ac=detail` 这类多打问号的写法（原会被静默忽略）
-- 详情字段统一：列表/详情/兼容接口共用 `_detail_item()`，补齐 `vod_play_from`
-- `ids` 查不到时返回 404 并提示如何搜索确认 `vod_id`（原来只返回空列表）
-
-### v1.1.3
-- 面向客户端 App 对接的整理：
-  - 新增 `GET /api/v1/categories`：分类清单（type_id/type_name/count，支持多源合并），分类浏览入口
-  - `/api/v1/videos` 新增 `type_id` 参数（可与 `ac=detail`、`wd` 组合）
-  - 新增 CORS 支持（H5/Web App 可跨域直调，`CORS_ORIGINS` 环境变量可限制来源）
-  - 新增 **docs/CLIENT_API.md**：面向 AI 客户端开发的完整 API 文档（约定/鉴权/全部接口/响应示例/App 实现流程/常见坑）
-
-### v1.2.0
-- 新增**同步暂停/继续**，三层级独立控制：全局（全量+增量+定时任务一起停）、仅全量、仅增量
-- 暂停语义为**检查点式优雅停止**：当前抓取批次完成后保存断点再停，不丢数据；继续时自动从断点续传（增量则水位线不动、重跑增量）
-- 暂停状态持久化到 `data/pause_state.json`，服务重启后仍生效；启动时自动恢复
-- 新增 API：`GET /api/v1/pause`、`POST /api/v1/pause?scope=`、`POST /api/v1/resume?scope=`（resume 会自动续跑受影响的源站）；`/api/v1/stats` 新增 `pause` 字段；同步日志新增 `paused` 状态
-- 管理面板新增「同步暂停控制」区：三个开关 + 页面顶部暂停横幅 + 源站行"已暂停"徽标
-- 定时调度在暂停期间自动跳过对应任务（恢复后下一周期自动执行）
-- 新增测试 `scripts/test_v12_pause.py`（15 项，含真实网络中途暂停→断点 8 页→继续→16 页的端到端验证）
-
-### v1.2.1
-- 新增**单源站级暂停/继续**：源站列表每行增加「暂停 / 继续」按钮，暂停中的站显示橙色「本站暂停」徽标
-- 新增 API `POST /api/v1/sources/{slug}/pause` 与 `POST /api/v1/sources/{slug}/resume`；`/api/v1/sources`、`/api/v1/sources/{slug}` 返回 `paused` / `paused_at`
-- 判定顺序：全局/分层暂停 → 单源站暂停，任一命中即停；单源站暂停不影响其他源站，`sync-all` 与定时任务自动跳过被暂停的站
-- `sources` 表新增 `paused` / `paused_at` 列，启动自动迁移旧库
-- 测试 `scripts/test_v12_pause.py` 扩至 23 项（含单源站暂停隔离、运行中单源站暂停断点保存、全局暂停下的阻断提示）
-
-### v1.2.2
-- 修复：源站列表的「暂停」按钮在**未同步的源站**上也显示（误把"有断点未跑完"当成"正在跑"）
-- 新增运行时状态 `syncer._running`：`sync_source` 进入即登记、结束即注销，`/api/v1/sources` 与详情返回 `running` / `running_mode` / `running_seconds`
-- 面板交互改为按运行态渲染：**只有 `running=true` 才显示「暂停」**；已暂停显示「继续」；空闲站不显示这两个按钮
-- 进度列区分三态：正在跑（流动进度条 + 已运行时长）/ 有断点但未跑（"断点 N/M 页 · 未在同步"）/ 已完成
-- 修正：全新全量同步在取到首页总页数前 `progress` 误算为 100，现为 0；`stats.sources_syncing` 改为"真正在跑的任务数"，另加 `sources_unfinished` 表示有断点的站数
-- 单源站暂停接口返回 `was_running`，并区分提示"将在当前批次结束后停止"与"当前未在同步，暂停标记已记录"
-- 新增 `scripts/test_panel_render.js`：Node 里用 DOM 桩执行面板真实 JS，逐行断言「暂停」按钮只出现在运行中的行
-
-### v1.2.3
-- 项目已发布到 GitHub：https://github.com/consoleaiden/vodsync
-- GitHub Actions 首次构建成功（amd64 + arm64 双架构），镜像公开可拉取：`ghcr.io/consoleaiden/vodsync:latest`、`ghcr.io/consoleaiden/vodsync:1.2.2`
-- `docker-compose.yml` 与群晖部署文档的镜像地址已替换为实际发布地址
-
-### v1.3.0
-- 新增**按源站的自动同步开关**（全局定时调度保留不变：每 6 小时全站增量、每 12 小时刷新源站列表）：
-  - `sources` 表新增 `auto_sync` 列（默认 1=参与），启动自动迁移旧库，状态持久化重启不丢
-  - 关闭后该源站**不参与**定时增量任务与全站同步（`sync-all` / 定时 / 增量续跑），手动单站同步不受影响
-  - 新增 API：`POST /api/v1/sources/{slug}/auto-sync?enabled=`（单站）、`POST /api/v1/sources/auto-sync?enabled=&slugs=`（批量，`slugs=all` 为全部）
-  - `/api/v1/sources`、`/api/v1/sources/{slug}` 返回 `auto_sync` 字段
-  - 面板源站列表：每行「自动」开关 + 复选框多选（全选框跨刷新保留）+ 「全部开启 / 全部暂停 / 开启所选 / 暂停所选自动同步」批量按钮
-  - 测试 `scripts/test_v130_autosync.py`（13 项：默认值/单站/批量/sync_all 过滤/续跑过滤/路由注册）
-
-### v1.4.0
-- 新增**中转代理降级通道**：源站直连不可达/被风控时，自动按顺序切到 API 中转代理拉取数据
-  - 请求格式 `{proxy}?url=<urlencode(目标地址)>`，默认内置 `https://pz.v88.qzz.io/`、`https://mconfig.viptv.work/`，可用 `PROXY_URLS` 覆盖
-  - 路由策略：直连优先 → 失败自动切代理；连接失败/超时/403/429/451 立即切换（不做无意义重试），5xx 与 JSON 解析失败在当前路由重试后再切换
-  - **代理偏好记忆**：某源站走代理成功后记住 30 分钟（`PROXY_PREF_TTL_MINUTES`），期间直接走代理避免每次先等直连超时；直连恢复后自动清除记忆
-  - 每个代理由信号量限制并发（`PROXY_CONCURRENCY`，默认 4），避免打挂中转服务
-  - `/api/v1/stats` 新增 `proxy` 段（是否启用、代理列表、当前走代理的源站、成功/失败计数）；面板操作区显示代理状态
-- 修复：**未同步过的源站进度误显示「已完成」**
-  - 根因：进度计算把"没有断点且不在跑"一律判为 100，未区分"从未同步"
-  - 修复：新增 `synced` 判定（水位线 / 已入库 / 有断点 任一成立才算同步过），从未同步时进度恒为 0
-  - `/api/v1/sources`、`/api/v1/sources/{slug}` 新增 `synced` 字段；面板对未同步站显示 `0%` +「从未同步 · 可点「增量」开始」
-- 测试：新增 `scripts/test_v140_proxy_progress.py`（19 项：URL 编码、直连不可达/403 自动切代理、记忆与 TTL、代理关闭即报错、进度口径）；`scripts/test_panel_render.js` 增加"未同步不得显示已完成"断言
-
-### v1.4.1
-- 修复：**并发同步过多导致数据库连接池耗尽，整个服务「假死」**（NAS 上表现为容器不健康 / 面板全 500）
-  - 根因链：面板连点十几个「全量」→ 每个请求各起一个线程、无任何上限 → SQLite 只允许一个写者，十几个写线程互相等写锁 → 等锁期间线程仍占着连接池连接（默认 5+10）→ 池满后连 `/healthz` 都 30s 超时 → Docker 判容器不健康
-  - **全局并发闸门**：`sync_source` 内加信号量，无论谁触发（面板 / 定时 / 续跑 / 批量），同时真正在跑的源站不超过 `SOURCE_SYNC_CONCURRENCY`（默认 2），其余排队且**不占数据库连接**；`/stats.sync_load`、`/sources[].queued` 可看排队情况，面板显示「排队中」
-  - **同源站防重入**：同一源站已在排队/运行时重复触发直接返回 `status=already_running`，不再双写同一张表
-  - **写事务串行化**：新增 `database.write_txn()`，SQLite 下进程内串行所有写事务，消除 `database is locked` 与写锁抢占；所有业务写操作统一走它
-  - **count(*) 移出写事务**：断点保存 / 水位线更新不再"持着写锁做全表扫描"，改用独立读连接先统计
-  - **修掉一处连接泄漏**：`GET /api/v1/videos` 原来是 `engine.connect().execute(...)` 直接丢弃对象（靠 GC 归还），改为 `with` 显式归还
-  - **连接池可配 + 更容易排障**：`DB_POOL_SIZE`(10) / `DB_MAX_OVERFLOW`(20) / `DB_POOL_TIMEOUT`(10)，`/api/v1/stats` 新增 `db_pool`、`sync_load`
-  - **`/healthz` 不再因数据库繁忙返回 5xx**：始终 200，用 `status=ok|degraded` + `db:true|false` 表达，避免 Docker 把还在干活的容器反复重启（健康检查只看状态码）
-  - **503 语义**：连接池排队超时 / `database is locked` 统一返回 `503` + `Retry-After: 5`，不再是 500 堆栈
-  - 聚合搜索并行度收敛为 `SEARCH_CONCURRENCY`（默认 4，原来固定 8，每线程各占一个连接）
-- 测试：新增 `scripts/test_v141_pool.py`（17 项：池参数、无泄漏、并发闸门峰值、防重入、并发写、池满时 healthz、断点保存）与 `scripts/loadtest_concurrency.py`（端到端：12 源站同时全量，实测峰值并发 2、探活 0 失败、连接池归零、720 条数据全部入库）
-
-### v1.4.2
-- 新增 `scripts/migrate_sqlite_to_pg.py`：SQLite → PostgreSQL 数据迁移，**切库不需要重新同步**
-  - 迁移 `sources` / `sync_logs` / 全部 `vod_*` 表，保留 `watermark`（增量水位线）与 `last_page`（全量断点），迁完直接续增量
-  - 幂等（重复执行按主键跳过）、每批一个事务（中断可续跑）、PG 下自动对齐 SERIAL 序列
-  - `--dry-run` 预估规模、`--only-meta` 只搬元数据、`--tables` 指定源站、`--replace` 覆盖、`--verify` 只校验
-  - 迁移后自动校验：表齐全性、行数一致、关键字段逐行比对
-- 镜像内包含迁移脚本，可直接 `docker run --entrypoint python .../migrate_sqlite_to_pg.py`
-- 测试：`scripts/test_migration.py`（42 项：跨批翻页、字段保真、幂等、替换、过滤、dry-run、错误提示）
-
-### v1.5.0
-- 新增**访问控制**：面板密码登录 + API Token，防止接口被公网滥用
-  - `settings` 表（key/value，启动自动建）：`auth_enabled` / `admin_password_hash` / `api_token` / `session_secret`
-  - 面板登录：默认密码 `666666`，PBKDF2-SHA256（20 万轮 + 随机盐），HttpOnly 签名会话 cookie（默认 7 天）
-  - 改密码后所有旧会话立即失效（签名携带密码指纹）；连续失败 5 次锁 5 分钟
-  - API Token：`Authorization: Bearer` / `X-API-Key` / `?token=` 三种带法；面板可复制、重置
-  - 开关：可随时关闭（`enabled=false` 时接口不校验），重新开启时自动更换 Token
-  - `/healthz` 与 `/api/v1/auth/*` 永远免鉴权；`/` 未登录时 303 跳 `/login`
-  - 兼容旧的 `API_KEY` 环境变量（作为额外 Token）
-- 新增接口：`POST /api/v1/auth/{login,logout,password,settings,token}`、`GET /api/v1/auth/{state,token}`
-- 新增页面：`/login`（登录页），面板右上「⚙ 设置」抽屉（改密码 / Token / 开关 / 退出登录）
-- 测试：`scripts/test_v150_auth.py`（40 项：默认密码、三种 Token 带法、登录跳转、锁定、改密失效、开关换 Token、开放重定向防护）
-- 版本号 1.4.2 → 1.5.0
-
-### v1.5.1
-- 修复：`/source`（源站清单 JSON）不带 `/api/` 前缀，此前只带 Token 的客户端会被拦成
-  `401 请先登录管理面板`，现在与其它接口一致认 Token
-- 新增 **`docs/APP_TOKEN_UPGRADE.md`** —— 交给 AI 给 App 加 Token 的施工单（含各平台拦截器代码、401 处理策略、自测清单）
-- 测试：鉴权用例补 4 项（`/source` 认 Token、双空格 Bearer、无空格 Bearer 拒绝），共 44 项
-- 版本号 1.5.0 → 1.5.1
-
-### v1.5.2
-- 分页：`API_PAGE_SIZE_DEFAULT` 默认由 20 调到 **30**（三列宫格 10 行 × 3 列，每页正好整行）
-- 修复：`/api/v1/search` 的 `page_size` 之前写死 `20 / 100`，不跟随配置；现在与列表接口一致读 `API_PAGE_SIZE_DEFAULT` / `API_PAGE_SIZE_MAX`
-- 新增 `scripts/test_v151_paging.py`（14 项：默认值、显式值、最后一页不足整页、越界 422、search 与 MacCMS 兼容接口一致性）
-- 文档：`docs/APP_TOKEN_UPGRADE.md` 新增「9. 分页约定：三列宫格每页 30 条」（含取数策略与三个常见坑）
-- 版本号 1.5.1 → 1.5.2
-
-### v1.6.0
-修复三个「静默丢数据」的同步缺陷（复盘报告 `docs/REVIEW_2026-11-03.md`），围绕断电/重启恢复补齐冗余：
-
-- **P0-1 全量同步丢页**：批内单页失败时旧代码用 `max(成功页)` 存断点 → 跳过失败页且清断点标记完成。
-  现在断点只落在「连续完成的前缀」，失败页在本次内重试（`PAGE_MAX_ATTEMPTS`），仍失败则中止并保留断点，
-  状态记 `incomplete`（新增，面板显示「部分完成」）
-- **P0-2 增量水位线越过未入库数据**：水位线改为按「实际写库的最大 `vod_time`」推进；有失败批次时
-  封顶在失败记录之前；详情缺失的 ID 追加一次补抓，仍未返回才按「源站已下架」跳过并记 `missing`
-- **P0-3 增量 list 单页失败导致整站崩溃**：`except` 分支里重复调用 `fut.result()` 会重抛异常；
-  已改为按页记录，并且索引不完整时**冻结水位线**
-- **重启恢复**：启动时把残留 `running` 日志标记为 `interrupted`；新增 `AUTO_RESUME_ON_BOOT`
-  （默认 true，延迟 30s）自动续跑有断点的源站；`pause_state.json` 改原子写（tmp + `os.replace`）
-- **安全**：`_client_ip` 不再无条件信任 `X-Forwarded-For`（默认只看对端地址，`TRUST_PROXY=true`
-  才取最后一跳），修复「伪造 IP 绕过登录失败锁定」
-- **隐患**：修复 `database.write_lock_only()` 被 `@contextmanager` 装饰两层导致调用即 `TypeError`
-- 测试：新增 `scripts/test_v160_recovery.py`（42 项，含三个缺陷的复现转回归 + 自动续跑），全仓 207 项通过
-- 版本号 1.5.2 → 1.6.0
-
-### v1.6.1
-收紧 `/api/v1/auth/state` 的信息暴露面（该接口在免鉴权白名单里，登录页需要它）：
-
-- **删除 `token_hint`**：原来会回 `vs_HYgS…u51c` 这种前 7 位 + 后 4 位片段。Token 是唯一凭据，
-  暴露片段等于把搜索空间从 43 字符砍到十几个字符，而这个接口**任何人不登录都能调**
-- **未登录只回 `enabled` / `logged_in`**：`has_token`、`token_created_at`、`password_changed_at`
-  收敛到「已登录」才返回 —— 它们能用来推断服务器是否配过 Token、什么时候改的密码
-- 响应加 `Cache-Control: no-store`，避免代理/浏览器缓存状态
-- 启动日志里的 Token 也改为只报「已生成/未生成」，不再打印片段
-- 文档同步：`docs/APP_TOKEN_UPGRADE.md` 的 state 示例与「给 AI 的提示词」第 6 条改为
-  「任何日志都不出现 Token，最多记布尔位」；`docs/API_SPEC_FOR_AI.md` 同步
-- 测试：`scripts/test_v150_auth.py` 增加 10 项断言（未登录字段白名单、响应体不含 Token 前后缀、缓存头）
-- 版本号 1.6.0 → 1.6.1
-
-### v1.7.0
-Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一 PostgreSQL**。
-
-- **多源列表查询**（`app/multiquery.py`，新）：不带 `source` 查全部源站时，旧实现把 52 张表
-  `UNION ALL` 成子查询再套 `count(*)` + `ORDER BY ... OFFSET`，等于每次请求把 220 万行物化排序
-  （首页 4~8s，第 20 页 10s+）。改为每表各取 top-K（走 `idx_*_time` 倒序）+ 进程内多路归并：
-  全局第 N 行必然在所属表的前 N 行内，**结果精确**而非近似；首页降到几十毫秒
-  - `ac=detail` 改两段式：先瘦列排序分页，再只对当前页那几十行补 `content`/`play_url`
-  - `total` 并行 count + 60s 缓存；单表失败降级为 `total_is_partial` 而不是整页 500
-  - 翻页超过 `MERGE_MAX_PER_TABLE / page_size`（默认第 100 页）自动回退 UNION，宁可慢不快错
-  - 响应新增 `query_ms` / `total_is_partial` / `sources_failed`（App 可忽略）
-- **数据维护**（`app/housekeeping.py`，新）：`sync_logs` 原来只增不减。现在每小时三级清理
-  （超期 / 每源站上限 / 全表上限，`running` 行永不删）+ SQLite WAL checkpoint（PG 下 no-op）
-- **源站 slug 碰撞**（`syncer.refresh_sources`）：只按 `slugify(name)` 判重时，两个纯 ASCII 站名
-  撞车（`"HD 资源"` 与 `"HD-资源"` 都得 `hd`），第二个站被当成已存在 → 它的 `api_url` 永远写不进去，
-  表现为**长期同步的是别人家的接口且无任何报错**。改为按 `api_url` 认源站身份，slug 冲突时追加
-  `_2`/`_3`；已登记源站的 slug 永不变（它是表名与 API 路径的一部分）
-- **生产统一 PG**：默认 `DATABASE_URL` 指向 `postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync`；
-  compose 里 `postgres` 从注释段升为必备服务（`depends_on: service_healthy` + `shm_size`）；
-  删除 `scripts/migrate_sqlite_to_pg.py` 与其 58 项测试（数据已迁完，git 历史可查）；
-  SQLite 驱动仅保留给自动化测试
-- **安全**：启动日志不再打印带密码的 `DATABASE_URL`（`init_db` 内已打脱敏版本）
-- 测试：新增 `scripts/test_v170_wave2.py`（42 项：归并与 UNION 逐条比对、分页边界、detail 两段式、
-  LIKE 转义、缓存命中、深页回退、日志三级清理、slug 碰撞），全仓 201 项通过
-- 版本号 1.6.1 → 1.7.0
+- **M1 页级重试**：增量索引阶段的失败页在本次运行内重试（复用 `PAGE_MAX_ATTEMPTS`
+  轮数 + `PAGE_RETRY_SLEEP_SECONDS` 间隔），零进展提前退出。瞬时抖动当场恢复，
+  不必等下一轮重扫全索引
+- **M2 早停**：连续 2 个批次整批失败（≥8 次请求含内部重试全部失败）判定源站当前
+  不可达，剩余页直接跳过。2,700 页的死站现在只花约 20 次请求就确认结论
+- **M3 指数退避**：`sources` 新增 `fail_streak` / `skip_until`。大面积失败
+  （页失败率 ≥50% 或整轮异常）→ streak+1，调度器跳过 `skip_until` 未到期的站，
+  退避 60min → 2h → 4h → … 封顶 24h（`BACKOFF_*` 可配）；到期自然恢复参与
+  （第一页就是探针，早停保证探针成本极低）；成功一次立即清零
+- **M4 状态联动**：连续失败达 `FAIL_STATUS_DOWN_STREAK`（默认 2）次后状态标
+  `down`（面板「离线」徽标），退避中的站显示「退避 Xh」徽标；恢复自动转回
+- **M5 错误聚合**：日志行从「索引页 2678 个失败」升级为
+  「索引页 2678 个失败（timeout×1900, http_403×778），水位线保持不变」，
+  面板上直接看到原因分布，不必钻 docker logs
+- **安全边界不变**：水位线「失败冻结 / 按实际写库推进」的语义一字未动；
+  手动点「增量/全量」不受退避限制
+- 测试：新增 `scripts/test_v181_backoff.py`（36 项：迁移、页级重试、早停请求计数、
+  streak 进退、sync_all 跳过与到期恢复、错误聚合、水位线冻结回归），全仓 303 项通过
+- 版本号 1.8.0 → 1.8.1
 
 ### v1.8.0
 自定义源站：latest.json 之外的接口可以在面板直接登记。
@@ -950,29 +799,192 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
   同 slug 重建，以及一段真实 HTTP 的端到端链路），全仓 267 项通过
 - 版本号 1.7.0 → 1.8.0
 
-### v1.8.1
-源站健康度退避：源站持续限流/宕机时不再「每 6 小时从第 1 页捶到最后一页」。
+### v1.7.0
+Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一 PostgreSQL**。
 
-背景：某 9.3 万条的源站出现单轮 2,678 个索引页失败的日志。旧逻辑水位线冻结是对的
-（不丢数据），但下一轮照样全量重扫——源站还在宕机时就是每轮 2,700 次空转请求，
-既烧流量又持续触发对方风控，面板上也看不出哪个站在装死。
+- **多源列表查询**（`app/multiquery.py`，新）：不带 `source` 查全部源站时，旧实现把 52 张表
+  `UNION ALL` 成子查询再套 `count(*)` + `ORDER BY ... OFFSET`，等于每次请求把 220 万行物化排序
+  （首页 4~8s，第 20 页 10s+）。改为每表各取 top-K（走 `idx_*_time` 倒序）+ 进程内多路归并：
+  全局第 N 行必然在所属表的前 N 行内，**结果精确**而非近似；首页降到几十毫秒
+  - `ac=detail` 改两段式：先瘦列排序分页，再只对当前页那几十行补 `content`/`play_url`
+  - `total` 并行 count + 60s 缓存；单表失败降级为 `total_is_partial` 而不是整页 500
+  - 翻页超过 `MERGE_MAX_PER_TABLE / page_size`（默认第 100 页）自动回退 UNION，宁可慢不快错
+  - 响应新增 `query_ms` / `total_is_partial` / `sources_failed`（App 可忽略）
+- **数据维护**（`app/housekeeping.py`，新）：`sync_logs` 原来只增不减。现在每小时三级清理
+  （超期 / 每源站上限 / 全表上限，`running` 行永不删）+ SQLite WAL checkpoint（PG 下 no-op）
+- **源站 slug 碰撞**（`syncer.refresh_sources`）：只按 `slugify(name)` 判重时，两个纯 ASCII 站名
+  撞车（`"HD 资源"` 与 `"HD-资源"` 都得 `hd`），第二个站被当成已存在 → 它的 `api_url` 永远写不进去，
+  表现为**长期同步的是别人家的接口且无任何报错**。改为按 `api_url` 认源站身份，slug 冲突时追加
+  `_2`/`_3`；已登记源站的 slug 永不变（它是表名与 API 路径的一部分）
+- **生产统一 PG**：默认 `DATABASE_URL` 指向 `postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync`；
+  compose 里 `postgres` 从注释段升为必备服务（`depends_on: service_healthy` + `shm_size`）；
+  删除 `scripts/migrate_sqlite_to_pg.py` 与其 58 项测试（数据已迁完，git 历史可查）；
+  SQLite 驱动仅保留给自动化测试
+- **安全**：启动日志不再打印带密码的 `DATABASE_URL`（`init_db` 内已打脱敏版本）
+- 测试：新增 `scripts/test_v170_wave2.py`（42 项：归并与 UNION 逐条比对、分页边界、detail 两段式、
+  LIKE 转义、缓存命中、深页回退、日志三级清理、slug 碰撞），全仓 201 项通过
+- 版本号 1.6.1 → 1.7.0
 
-- **M1 页级重试**：增量索引阶段的失败页在本次运行内重试（复用 `PAGE_MAX_ATTEMPTS`
-  轮数 + `PAGE_RETRY_SLEEP_SECONDS` 间隔），零进展提前退出。瞬时抖动当场恢复，
-  不必等下一轮重扫全索引
-- **M2 早停**：连续 2 个批次整批失败（≥8 次请求含内部重试全部失败）判定源站当前
-  不可达，剩余页直接跳过。2,700 页的死站现在只花约 20 次请求就确认结论
-- **M3 指数退避**：`sources` 新增 `fail_streak` / `skip_until`。大面积失败
-  （页失败率 ≥50% 或整轮异常）→ streak+1，调度器跳过 `skip_until` 未到期的站，
-  退避 60min → 2h → 4h → … 封顶 24h（`BACKOFF_*` 可配）；到期自然恢复参与
-  （第一页就是探针，早停保证探针成本极低）；成功一次立即清零
-- **M4 状态联动**：连续失败达 `FAIL_STATUS_DOWN_STREAK`（默认 2）次后状态标
-  `down`（面板「离线」徽标），退避中的站显示「退避 Xh」徽标；恢复自动转回
-- **M5 错误聚合**：日志行从「索引页 2678 个失败」升级为
-  「索引页 2678 个失败（timeout×1900, http_403×778），水位线保持不变」，
-  面板上直接看到原因分布，不必钻 docker logs
-- **安全边界不变**：水位线「失败冻结 / 按实际写库推进」的语义一字未动；
-  手动点「增量/全量」不受退避限制
-- 测试：新增 `scripts/test_v181_backoff.py`（36 项：迁移、页级重试、早停请求计数、
-  streak 进退、sync_all 跳过与到期恢复、错误聚合、水位线冻结回归），全仓 303 项通过
-- 版本号 1.8.0 → 1.8.1
+### v1.6.1
+收紧 `/api/v1/auth/state` 的信息暴露面（该接口在免鉴权白名单里，登录页需要它）：
+
+- **删除 `token_hint`**：原来会回 `vs_HYgS…u51c` 这种前 7 位 + 后 4 位片段。Token 是唯一凭据，
+  暴露片段等于把搜索空间从 43 字符砍到十几个字符，而这个接口**任何人不登录都能调**
+- **未登录只回 `enabled` / `logged_in`**：`has_token`、`token_created_at`、`password_changed_at`
+  收敛到「已登录」才返回 —— 它们能用来推断服务器是否配过 Token、什么时候改的密码
+- 响应加 `Cache-Control: no-store`，避免代理/浏览器缓存状态
+- 启动日志里的 Token 也改为只报「已生成/未生成」，不再打印片段
+- 文档同步：`docs/APP_TOKEN_UPGRADE.md` 的 state 示例与「给 AI 的提示词」第 6 条改为
+  「任何日志都不出现 Token，最多记布尔位」；`docs/API_SPEC_FOR_AI.md` 同步
+- 测试：`scripts/test_v150_auth.py` 增加 10 项断言（未登录字段白名单、响应体不含 Token 前后缀、缓存头）
+- 版本号 1.6.0 → 1.6.1
+
+### v1.6.0
+修复三个「静默丢数据」的同步缺陷（复盘报告 `docs/REVIEW_2026-11-03.md`），围绕断电/重启恢复补齐冗余：
+
+- **P0-1 全量同步丢页**：批内单页失败时旧代码用 `max(成功页)` 存断点 → 跳过失败页且清断点标记完成。
+  现在断点只落在「连续完成的前缀」，失败页在本次内重试（`PAGE_MAX_ATTEMPTS`），仍失败则中止并保留断点，
+  状态记 `incomplete`（新增，面板显示「部分完成」）
+- **P0-2 增量水位线越过未入库数据**：水位线改为按「实际写库的最大 `vod_time`」推进；有失败批次时
+  封顶在失败记录之前；详情缺失的 ID 追加一次补抓，仍未返回才按「源站已下架」跳过并记 `missing`
+- **P0-3 增量 list 单页失败导致整站崩溃**：`except` 分支里重复调用 `fut.result()` 会重抛异常；
+  已改为按页记录，并且索引不完整时**冻结水位线**
+- **重启恢复**：启动时把残留 `running` 日志标记为 `interrupted`；新增 `AUTO_RESUME_ON_BOOT`
+  （默认 true，延迟 30s）自动续跑有断点的源站；`pause_state.json` 改原子写（tmp + `os.replace`）
+- **安全**：`_client_ip` 不再无条件信任 `X-Forwarded-For`（默认只看对端地址，`TRUST_PROXY=true`
+  才取最后一跳），修复「伪造 IP 绕过登录失败锁定」
+- **隐患**：修复 `database.write_lock_only()` 被 `@contextmanager` 装饰两层导致调用即 `TypeError`
+- 测试：新增 `scripts/test_v160_recovery.py`（42 项，含三个缺陷的复现转回归 + 自动续跑），全仓 207 项通过
+- 版本号 1.5.2 → 1.6.0
+
+### v1.5.2
+- 分页：`API_PAGE_SIZE_DEFAULT` 默认由 20 调到 **30**（三列宫格 10 行 × 3 列，每页正好整行）
+- 修复：`/api/v1/search` 的 `page_size` 之前写死 `20 / 100`，不跟随配置；现在与列表接口一致读 `API_PAGE_SIZE_DEFAULT` / `API_PAGE_SIZE_MAX`
+- 新增 `scripts/test_v151_paging.py`（14 项：默认值、显式值、最后一页不足整页、越界 422、search 与 MacCMS 兼容接口一致性）
+- 文档：`docs/APP_TOKEN_UPGRADE.md` 新增「9. 分页约定：三列宫格每页 30 条」（含取数策略与三个常见坑）
+- 版本号 1.5.1 → 1.5.2
+
+### v1.5.1
+- 修复：`/source`（源站清单 JSON）不带 `/api/` 前缀，此前只带 Token 的客户端会被拦成
+  `401 请先登录管理面板`，现在与其它接口一致认 Token
+- 新增 **`docs/APP_TOKEN_UPGRADE.md`** —— 交给 AI 给 App 加 Token 的施工单（含各平台拦截器代码、401 处理策略、自测清单）
+- 测试：鉴权用例补 4 项（`/source` 认 Token、双空格 Bearer、无空格 Bearer 拒绝），共 44 项
+- 版本号 1.5.0 → 1.5.1
+
+### v1.5.0
+- 新增**访问控制**：面板密码登录 + API Token，防止接口被公网滥用
+  - `settings` 表（key/value，启动自动建）：`auth_enabled` / `admin_password_hash` / `api_token` / `session_secret`
+  - 面板登录：默认密码 `666666`，PBKDF2-SHA256（20 万轮 + 随机盐），HttpOnly 签名会话 cookie（默认 7 天）
+  - 改密码后所有旧会话立即失效（签名携带密码指纹）；连续失败 5 次锁 5 分钟
+  - API Token：`Authorization: Bearer` / `X-API-Key` / `?token=` 三种带法；面板可复制、重置
+  - 开关：可随时关闭（`enabled=false` 时接口不校验），重新开启时自动更换 Token
+  - `/healthz` 与 `/api/v1/auth/*` 永远免鉴权；`/` 未登录时 303 跳 `/login`
+  - 兼容旧的 `API_KEY` 环境变量（作为额外 Token）
+- 新增接口：`POST /api/v1/auth/{login,logout,password,settings,token}`、`GET /api/v1/auth/{state,token}`
+- 新增页面：`/login`（登录页），面板右上「⚙ 设置」抽屉（改密码 / Token / 开关 / 退出登录）
+- 测试：`scripts/test_v150_auth.py`（40 项：默认密码、三种 Token 带法、登录跳转、锁定、改密失效、开关换 Token、开放重定向防护）
+- 版本号 1.4.2 → 1.5.0
+
+### v1.4.2
+- 新增 `scripts/migrate_sqlite_to_pg.py`：SQLite → PostgreSQL 数据迁移，**切库不需要重新同步**
+  - 迁移 `sources` / `sync_logs` / 全部 `vod_*` 表，保留 `watermark`（增量水位线）与 `last_page`（全量断点），迁完直接续增量
+  - 幂等（重复执行按主键跳过）、每批一个事务（中断可续跑）、PG 下自动对齐 SERIAL 序列
+  - `--dry-run` 预估规模、`--only-meta` 只搬元数据、`--tables` 指定源站、`--replace` 覆盖、`--verify` 只校验
+  - 迁移后自动校验：表齐全性、行数一致、关键字段逐行比对
+- 镜像内包含迁移脚本，可直接 `docker run --entrypoint python .../migrate_sqlite_to_pg.py`
+- 测试：`scripts/test_migration.py`（42 项：跨批翻页、字段保真、幂等、替换、过滤、dry-run、错误提示）
+
+### v1.4.1
+- 修复：**并发同步过多导致数据库连接池耗尽，整个服务「假死」**（NAS 上表现为容器不健康 / 面板全 500）
+  - 根因链：面板连点十几个「全量」→ 每个请求各起一个线程、无任何上限 → SQLite 只允许一个写者，十几个写线程互相等写锁 → 等锁期间线程仍占着连接池连接（默认 5+10）→ 池满后连 `/healthz` 都 30s 超时 → Docker 判容器不健康
+  - **全局并发闸门**：`sync_source` 内加信号量，无论谁触发（面板 / 定时 / 续跑 / 批量），同时真正在跑的源站不超过 `SOURCE_SYNC_CONCURRENCY`（默认 2），其余排队且**不占数据库连接**；`/stats.sync_load`、`/sources[].queued` 可看排队情况，面板显示「排队中」
+  - **同源站防重入**：同一源站已在排队/运行时重复触发直接返回 `status=already_running`，不再双写同一张表
+  - **写事务串行化**：新增 `database.write_txn()`，SQLite 下进程内串行所有写事务，消除 `database is locked` 与写锁抢占；所有业务写操作统一走它
+  - **count(*) 移出写事务**：断点保存 / 水位线更新不再"持着写锁做全表扫描"，改用独立读连接先统计
+  - **修掉一处连接泄漏**：`GET /api/v1/videos` 原来是 `engine.connect().execute(...)` 直接丢弃对象（靠 GC 归还），改为 `with` 显式归还
+  - **连接池可配 + 更容易排障**：`DB_POOL_SIZE`(10) / `DB_MAX_OVERFLOW`(20) / `DB_POOL_TIMEOUT`(10)，`/api/v1/stats` 新增 `db_pool`、`sync_load`
+  - **`/healthz` 不再因数据库繁忙返回 5xx**：始终 200，用 `status=ok|degraded` + `db:true|false` 表达，避免 Docker 把还在干活的容器反复重启（健康检查只看状态码）
+  - **503 语义**：连接池排队超时 / `database is locked` 统一返回 `503` + `Retry-After: 5`，不再是 500 堆栈
+  - 聚合搜索并行度收敛为 `SEARCH_CONCURRENCY`（默认 4，原来固定 8，每线程各占一个连接）
+- 测试：新增 `scripts/test_v141_pool.py`（17 项：池参数、无泄漏、并发闸门峰值、防重入、并发写、池满时 healthz、断点保存）与 `scripts/loadtest_concurrency.py`（端到端：12 源站同时全量，实测峰值并发 2、探活 0 失败、连接池归零、720 条数据全部入库）
+
+### v1.4.0
+- 新增**中转代理降级通道**：源站直连不可达/被风控时，自动按顺序切到 API 中转代理拉取数据
+  - 请求格式 `{proxy}?url=<urlencode(目标地址)>`，默认内置 `https://pz.v88.qzz.io/`、`https://mconfig.viptv.work/`，可用 `PROXY_URLS` 覆盖
+  - 路由策略：直连优先 → 失败自动切代理；连接失败/超时/403/429/451 立即切换（不做无意义重试），5xx 与 JSON 解析失败在当前路由重试后再切换
+  - **代理偏好记忆**：某源站走代理成功后记住 30 分钟（`PROXY_PREF_TTL_MINUTES`），期间直接走代理避免每次先等直连超时；直连恢复后自动清除记忆
+  - 每个代理由信号量限制并发（`PROXY_CONCURRENCY`，默认 4），避免打挂中转服务
+  - `/api/v1/stats` 新增 `proxy` 段（是否启用、代理列表、当前走代理的源站、成功/失败计数）；面板操作区显示代理状态
+- 修复：**未同步过的源站进度误显示「已完成」**
+  - 根因：进度计算把"没有断点且不在跑"一律判为 100，未区分"从未同步"
+  - 修复：新增 `synced` 判定（水位线 / 已入库 / 有断点 任一成立才算同步过），从未同步时进度恒为 0
+  - `/api/v1/sources`、`/api/v1/sources/{slug}` 新增 `synced` 字段；面板对未同步站显示 `0%` +「从未同步 · 可点「增量」开始」
+- 测试：新增 `scripts/test_v140_proxy_progress.py`（19 项：URL 编码、直连不可达/403 自动切代理、记忆与 TTL、代理关闭即报错、进度口径）；`scripts/test_panel_render.js` 增加"未同步不得显示已完成"断言
+
+### v1.3.0
+- 新增**按源站的自动同步开关**（全局定时调度保留不变：每 6 小时全站增量、每 12 小时刷新源站列表）：
+  - `sources` 表新增 `auto_sync` 列（默认 1=参与），启动自动迁移旧库，状态持久化重启不丢
+  - 关闭后该源站**不参与**定时增量任务与全站同步（`sync-all` / 定时 / 增量续跑），手动单站同步不受影响
+  - 新增 API：`POST /api/v1/sources/{slug}/auto-sync?enabled=`（单站）、`POST /api/v1/sources/auto-sync?enabled=&slugs=`（批量，`slugs=all` 为全部）
+  - `/api/v1/sources`、`/api/v1/sources/{slug}` 返回 `auto_sync` 字段
+  - 面板源站列表：每行「自动」开关 + 复选框多选（全选框跨刷新保留）+ 「全部开启 / 全部暂停 / 开启所选 / 暂停所选自动同步」批量按钮
+  - 测试 `scripts/test_v130_autosync.py`（13 项：默认值/单站/批量/sync_all 过滤/续跑过滤/路由注册）
+
+### v1.2.3
+- 项目已发布到 GitHub：https://github.com/consoleaiden/vodsync
+- GitHub Actions 首次构建成功（amd64 + arm64 双架构），镜像公开可拉取：`ghcr.io/consoleaiden/vodsync:latest`、`ghcr.io/consoleaiden/vodsync:1.2.2`
+- `docker-compose.yml` 与群晖部署文档的镜像地址已替换为实际发布地址
+
+### v1.2.2
+- 修复：源站列表的「暂停」按钮在**未同步的源站**上也显示（误把"有断点未跑完"当成"正在跑"）
+- 新增运行时状态 `syncer._running`：`sync_source` 进入即登记、结束即注销，`/api/v1/sources` 与详情返回 `running` / `running_mode` / `running_seconds`
+- 面板交互改为按运行态渲染：**只有 `running=true` 才显示「暂停」**；已暂停显示「继续」；空闲站不显示这两个按钮
+- 进度列区分三态：正在跑（流动进度条 + 已运行时长）/ 有断点但未跑（"断点 N/M 页 · 未在同步"）/ 已完成
+- 修正：全新全量同步在取到首页总页数前 `progress` 误算为 100，现为 0；`stats.sources_syncing` 改为"真正在跑的任务数"，另加 `sources_unfinished` 表示有断点的站数
+- 单源站暂停接口返回 `was_running`，并区分提示"将在当前批次结束后停止"与"当前未在同步，暂停标记已记录"
+- 新增 `scripts/test_panel_render.js`：Node 里用 DOM 桩执行面板真实 JS，逐行断言「暂停」按钮只出现在运行中的行
+
+### v1.2.1
+- 新增**单源站级暂停/继续**：源站列表每行增加「暂停 / 继续」按钮，暂停中的站显示橙色「本站暂停」徽标
+- 新增 API `POST /api/v1/sources/{slug}/pause` 与 `POST /api/v1/sources/{slug}/resume`；`/api/v1/sources`、`/api/v1/sources/{slug}` 返回 `paused` / `paused_at`
+- 判定顺序：全局/分层暂停 → 单源站暂停，任一命中即停；单源站暂停不影响其他源站，`sync-all` 与定时任务自动跳过被暂停的站
+- `sources` 表新增 `paused` / `paused_at` 列，启动自动迁移旧库
+- 测试 `scripts/test_v12_pause.py` 扩至 23 项（含单源站暂停隔离、运行中单源站暂停断点保存、全局暂停下的阻断提示）
+
+### v1.2.0
+- 新增**同步暂停/继续**，三层级独立控制：全局（全量+增量+定时任务一起停）、仅全量、仅增量
+- 暂停语义为**检查点式优雅停止**：当前抓取批次完成后保存断点再停，不丢数据；继续时自动从断点续传（增量则水位线不动、重跑增量）
+- 暂停状态持久化到 `data/pause_state.json`，服务重启后仍生效；启动时自动恢复
+- 新增 API：`GET /api/v1/pause`、`POST /api/v1/pause?scope=`、`POST /api/v1/resume?scope=`（resume 会自动续跑受影响的源站）；`/api/v1/stats` 新增 `pause` 字段；同步日志新增 `paused` 状态
+- 管理面板新增「同步暂停控制」区：三个开关 + 页面顶部暂停横幅 + 源站行"已暂停"徽标
+- 定时调度在暂停期间自动跳过对应任务（恢复后下一周期自动执行）
+- 新增测试 `scripts/test_v12_pause.py`（15 项，含真实网络中途暂停→断点 8 页→继续→16 页的端到端验证）
+
+### v1.1.3
+- 面向客户端 App 对接的整理：
+  - 新增 `GET /api/v1/categories`：分类清单（type_id/type_name/count，支持多源合并），分类浏览入口
+  - `/api/v1/videos` 新增 `type_id` 参数（可与 `ac=detail`、`wd` 组合）
+  - 新增 CORS 支持（H5/Web App 可跨域直调，`CORS_ORIGINS` 环境变量可限制来源）
+  - 新增 **docs/CLIENT_API.md**：面向 AI 客户端开发的完整 API 文档（约定/鉴权/全部接口/响应示例/App 实现流程/常见坑）
+
+### v1.1.2
+- `/api/v1/videos` 增强：新增 `ids=1,2,3`（批量取详情，按请求顺序返回，含播放地址）与 `ac=detail`（列表带播放地址）
+- 查询参数归一化：兼容 `&?ac=detail` 这类多打问号的写法（原会被静默忽略）
+- 详情字段统一：列表/详情/兼容接口共用 `_detail_item()`，补齐 `vod_play_from`
+- `ids` 查不到时返回 404 并提示如何搜索确认 `vod_id`（原来只返回空列表）
+
+### v1.1.1
+- 新增 `GET /source`：资源站 API 清单（上游 `api` 地址 + 本地 `local_api`/`local_list_api` + 已入库条数），支持 `?status=ok|down`、`?only_ready=true` 过滤
+- 管理面板新增「资源站 API」按钮，一键查看清单
+- 断点保存时同步更新 `last_sync_at`，面板与 `/source` 的"最后同步时间"不再为空
+
+### v1.1.0
+- 新增 **Web 管理面板**（`/`）：概览统计、全量同步进度条、单站/全站手动触发、条数校准、源站日志、跨源搜索
+- 新增 **聚合搜索接口** `GET /api/v1/search`：线程池并行查询各源站表 + 内存归并分页，单源失败隔离，LIKE 通配符转义
+- 新增 `GET /api/v1/stats`（面板概览）、`POST /api/v1/maintenance/recount`（条数校准）
+- `sources` 表新增 `total_pages` 列，启动时自动迁移旧库（无需手动改表）
+- 修复：全量同步中断时 `total_videos` 长期为 0（现在每次断点保存同时刷新条数；启动时也会校准）
+- 版本号 1.0.0 → 1.1.0
+
+### v1.0.0
+- 首个版本：源站发现、全量断点续传、增量水位线同步、每源站一表、REST + MacCMS 兼容 API、CI 多架构镜像、群晖部署文档

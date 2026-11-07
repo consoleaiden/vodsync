@@ -6,7 +6,14 @@
 
 ### 1. 准备目录
 
-File Station 中创建：`/docker/vodsync/data`（存放数据库文件）。
+File Station 中创建两个目录（**建议都放在 SSD 卷上**）：
+
+- `/docker/vodsync/data` —— 只放同步断点状态（`pause_state.json`）
+- `/docker/vodsync/pgdata` —— **数据库本体**（v1.7.0 起固定 PostgreSQL，220 万行约 2~4GB）
+
+```bash
+mkdir -p /volume1/docker/vodsync/data /volume1/docker/vodsync/pgdata
+```
 
 ### 2. 获取镜像
 
@@ -38,30 +45,81 @@ services:
     ports:
       - "8181:8000"          # 浏览器访问 http://群晖IP:8181
     volumes:
-      - /volume1/docker/vodsync/data:/app/data   # 必须挂载，否则数据不持久
+      - /volume1/docker/vodsync/data:/app/data   # 只放断点状态，必须挂载
     environment:
+      # ↓ 必填：指向下面 postgres 服务；用户/密码/库名要与之保持一致
+      DATABASE_URL: "postgresql+psycopg2://vodsync:vodsync@postgres:5432/vodsync"
+      LATEST_JSON_URL: "https://mylazily.github.io/ziyuanzhan/data/latest.json"
+      ONLY_OK_SOURCES: "true"
+      FULL_SYNC_ON_DISCOVER: "true"
       SYNC_INTERVAL_MINUTES: "360"
       SOURCE_SYNC_CONCURRENCY: "2"
       PAGE_CONCURRENCY: "4"
       REQUEST_INTERVAL_SECONDS: "0.3"
-      API_KEY: ""
+      AUTO_RESUME_ON_BOOT: "true"
+      AUTH_ENABLED: "true"
+      ADMIN_PASSWORD: "666666"          # 首次启动的面板密码，登录后请在设置里改掉
       TZ: "Asia/Shanghai"
+    depends_on:
+      postgres:
+        condition: service_healthy        # 等 PG 可接受连接再启动，否则会 CrashLoop
+
+  # ---- PostgreSQL（v1.7.0 起必备，不能省）----
+  postgres:
+    image: postgres:16-alpine
+    container_name: vodsync-pg
+    restart: unless-stopped
+    shm_size: "256mb"                     # 默认 64MB 不够多源归并排序用
+    environment:
+      POSTGRES_USER: vodsync
+      POSTGRES_PASSWORD: vodsync          # 只走容器网络可不改；映射到宿主机就必须改
+      POSTGRES_DB: vodsync
+      TZ: Asia/Shanghai
+    volumes:
+      - /volume1/docker/vodsync/pgdata:/var/lib/postgresql/data   # ★ 按实际盘符改
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vodsync -d vodsync"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    # 不要映射 5432 到宿主机（容器间用服务名直连即可，映射反而容易抢端口）
 ```
+
+> 完整版（含全部可调项、tag 语义与回滚说明）以仓库根目录的 [`docker-compose.yml`](../docker-compose.yml) 为准 ——
+> 上面的片段只是最小可用子集，**省掉 `postgres` 服务会直接起不来**。
 
 点击 **下一步 → 完成**，容器自动启动。
 
 ### 4. 验证
 
-- 浏览器打开 `http://群晖IP:8181/` → **管理面板**（看同步进度、手动触发同步、跨源搜索）
-- 打开 `http://群晖IP:8181/healthz` → 返回 `{"status":"ok"}`
+- 浏览器打开 `http://群晖IP:8181/` → 跳转登录页，输入 `ADMIN_PASSWORD`（默认 `666666`）进入**管理面板**
+- `curl -s http://群晖IP:8181/healthz` → 返回 `status` / `db` / `version` / `build`，**`"version"` 必须与你要部署的版本一致**
+
+  ```json
+  {"status":"ok","db":true,"version":"1.10.1","build":"<commit sha>","time":"..."}
+  ```
 - 打开 `http://群晖IP:8181/docs` 查看交互式 API 文档
 
 > 管理面板说明：每 5 秒自动刷新；全量同步期间「全量进度」列会显示 `已抓取页数 / 总页数` 与百分比。
-> 若 `API_KEY` 非空，面板首次加载会弹窗要求输入密钥（保存在浏览器本地）。
+> 鉴权自 v1.5.0 起改为**面板密码登录 + API Token**（面板右上「⚙ 设置」里生成/重置 Token），
+> 旧的 `API_KEY` 环境变量仅作为兼容的额外 Token，不再是主要方式。
 
-### 5. 更新镜像版本
+### 5. 更新 / 回滚镜像版本
 
-Container Manager → 项目 vodsync → **操作 → 停止 → 构建/拉取 → 启动**（数据在挂载卷中，不会丢失）。
+Container Manager → 项目 vodsync → **操作 → 停止 → 构建/拉取 → 启动**（数据在 `pgdata` 卷中，不会丢失）。
+
+也可以直接改 compose 里的 tag 再 `docker compose pull vodsync && docker compose up -d`：
+
+| tag 形式 | 可变性 | 用途 |
+|---|---|---|
+| `latest` | 可变 | 跟随最新（生产默认） |
+| `1.10.1` | 可变 | 版本号，同一版本多次构建指向最新那次 |
+| `1.10.1-<sha7>` | **不可变** | **回滚用这个** |
+| `sha-<sha7>` | **不可变** | 提交级 |
+
+回滚后 `curl http://群晖IP:8181/healthz` 核对 `version` / `build` 是否已是目标版本。
+注意：**数据库不回退** —— 新版本做过的迁移不会撤销，回滚到跨迁移的旧版本前先备份 `pgdata`。
 
 ---
 
@@ -74,17 +132,18 @@ ssh admin@192.168.1.100
 # 切换 root
 sudo -i
 
-# 创建目录
-mkdir -p /volume1/docker/vodsync/data
+# 创建目录（data 放断点，pgdata 放数据库）
+mkdir -p /volume1/docker/vodsync/data /volume1/docker/vodsync/pgdata
 
 # （使用 GHCR 私有镜像时先登录）
 docker login ghcr.io -u consoleaiden -p <GitHub Personal Access Token>
 
-# 进入项目目录（已上传项目文件）启动
+# 进入项目目录（已上传项目文件，含 docker-compose.yml）启动
 cd /volume1/docker/vodsync
-docker-compose up -d
+docker compose up -d
 
-# 查看日志
+# 查看日志（vodsync 与 PG 都要正常）
+docker compose ps
 docker logs -f vodsync
 ```
 
@@ -101,10 +160,10 @@ docker logs -f vodsync
 | 项 | 值 | 说明 |
 |---|---|---|
 | 端口映射 | `8181:8000` | 左侧为宿主机端口，可自改；右侧 8000 固定 |
-| 数据卷（App） | `/volume1/docker/vodsync/data:/app/data` | 同步断点（`pause_state.json`）与日志 |
-| 数据卷（PG） | `/volume1/docker/vodsync/pgdata:/var/lib/postgresql/data` | **必须**，数据库本体；建议放 SSD |
+| 数据卷（App） | `/volume1/docker/vodsync/data:/app/data` | 仅同步断点状态（`pause_state.json`）；**数据库不在这里** |
+| 数据卷（PG） | `/volume1/docker/vodsync/pgdata:/var/lib/postgresql/data` | **必须**，数据库本体（220 万行约 2~4GB）；建议放 SSD |
 | 重启策略 | `unless-stopped` | 开机自启、异常自动重启 |
-| 内存限制 | 建议 1-2GB（含 PG） | Container Manager 项目设置中可配 |
+| 内存限制 | 建议 2~4GB（含 PG） | 相关推荐整站重算时峰值较高；内存紧可把 `RELATED_RECOMPUTE_CONCURRENCY` 设为 1 |
 
 ## 常用环境变量（追加到 compose 的 environment）
 
