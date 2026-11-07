@@ -14,13 +14,13 @@
 services:
   vodsync:
     # 官方发布镜像（GitHub Actions 自动构建，双架构 amd64/arm64，公开可拉取）
-    # tag 说明（v1.9.3 起每次构建都带版本号；当前版本 1.10.1）：
+    # tag 说明（v1.9.3 起每次构建都带版本号；当前版本 1.11.0）：
     #   latest         最新（生产默认）
-    #   1.10.1         版本号；同一版本多次构建时指向最新那次
-    #   1.10.1-4f249a7 版本 + 提交，不可变 —— **回滚就用这个**
-    #   sha-4f249a7    仅提交短 SHA，不可变
+    #   1.11.0         版本号；同一版本多次构建时指向最新那次
+    #   1.11.0-f0f40c8 版本 + 提交，不可变 —— **回滚就用这个**
+    #   sha-f0f40c8    仅提交短 SHA，不可变
     # 回滚示例：把下面这行改成旧版本 tag，然后 docker compose pull vodsync && docker compose up -d
-    #   例：image: ghcr.io/consoleaiden/vodsync:1.10.0-12d7f87
+    #   例：image: ghcr.io/consoleaiden/vodsync:1.10.1-4f249a7
     # 回滚后 curl http://127.0.0.1:8181/healthz 核对 version / build 是否已是目标版本
     image: ghcr.io/consoleaiden/vodsync:latest
     # 本地构建模式：注释掉上面 image 行，改用下面 build
