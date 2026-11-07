@@ -33,7 +33,7 @@ from ..syncer import (
     sync_source,
     update_custom_source,
 )
-from ..utils import page_params, parse_play_url, validate_slug
+from ..utils import DETAIL_EXTRA_COLS, page_params, parse_play_lines, validate_slug
 
 log = logging.getLogger("vodsync.api")
 # 鉴权统一由 main.py 的 _auth_guard 中间件处理（Token / 会话 cookie / 开关），
@@ -208,13 +208,21 @@ def _esc_like(kw: str) -> str:
 def _query_vods(
     conn,
     table,
+    slug: str,
     page: int,
     page_size: int,
     type_id: int = None,
     wd: str = None,
     detail: bool = False,
+    play_raw: bool = False,
+    play_meta: dict = None,
 ):
-    """通用分页查询：按更新时间倒序。返回 (total, pagecount, items)。"""
+    """
+    通用分页查询：按更新时间倒序。返回 (total, pagecount, items)。
+
+    详情模式下条目统一由 `_detail_item()` 构造（v1.11.0）—— 之前这里是第二份
+    手写的字段列表，加了新字段忘了同步就会出现「同一份详情结构，走这条路少几个键」。
+    """
     where = []
     if type_id:
         where.append(table.c.type_id == type_id)
@@ -240,6 +248,7 @@ def _query_vods(
     ]
     if detail:
         cols += [table.c.content, table.c.play_url]
+        cols += [table.c[c] for c in DETAIL_EXTRA_COLS]
     q = (
         select(*cols)
         .where(*where)
@@ -251,7 +260,10 @@ def _query_vods(
 
     items = []
     for r in rows:
-        item = {
+        if detail:
+            items.append(_detail_item(slug, r, play_raw=play_raw, play_meta=play_meta))
+            continue
+        items.append({
             "vod_id": r["vod_id"],
             "type_id": r["type_id"],
             "type_name": r["type_name"],
@@ -259,13 +271,7 @@ def _query_vods(
             "vod_pic": r["pic"],
             "vod_remarks": r["remarks"],
             "vod_time": r["vod_time"],
-        }
-        if detail:
-            item["vod_content"] = r["content"]
-            item["vod_play_url"] = r["play_url"]
-            item["vod_play_from"] = "vodsync"
-            item["vod_play_list"] = parse_play_url(r["play_url"])  # 额外提供的结构化播放列表
-        items.append(item)
+        })
     return total, pagecount, items
 
 
@@ -307,8 +313,36 @@ def _pick(row, key):
         return ""
 
 
-def _detail_item(source: str, row) -> dict:
-    """详情条目：原始播放地址 + 结构化播放列表（列表接口与详情接口共用）。"""
+def _play_lines(slug: str, row, play_raw: bool = False) -> tuple:
+    """
+    结构化播放线路（v1.11.0）：识别类型 + 按策略过滤/排序，返回 `(lines, meta)`。
+
+    play_raw=True 走 off 策略：不改顺序、不过滤，用于排障（`?play_raw=1`）。
+    过滤/排序只影响 vod_play_list；`vod_play_url` 原始串始终原样下发。
+    """
+    from .. import playline
+
+    policy = "off" if play_raw else playline.effective_policy(slug)
+    lines, meta = parse_play_lines(
+        _pick(row, "play_url"), _pick(row, "play_from"), policy=policy
+    )
+    if not play_raw:
+        playline.note(slug, meta)   # 读侧计数（/api/v1/stats 的 play_line 段）
+    return lines, meta
+
+
+def _detail_item(source: str, row, *, play_raw: bool = False,
+                 play_meta: dict = None) -> dict:
+    """
+    详情条目：原始播放地址 + 结构化播放列表（列表接口与详情接口共用）。
+
+    play_meta 传一个 dict 进来时，会把「本次是否真的过滤掉了线路」写进去
+    （`play_meta["filtered"] = True`），供调用方在响应顶层打 `play_line_filtered`。
+    不传则只影响本条目的 vod_play_list。
+    """
+    lines, meta = _play_lines(source, row, play_raw)
+    if play_meta is not None and meta.get("filtered"):
+        play_meta["filtered"] = True
     return {
         "source": source,
         "vod_id": row["vod_id"],
@@ -327,10 +361,16 @@ def _detail_item(source: str, row) -> dict:
         "vod_area": _pick(row, "vod_area"),
         "vod_year": _pick(row, "vod_year"),
         "vod_tag": _pick(row, "vod_tag"),
-        "vod_content": row["content"],
-        "vod_play_url": row["play_url"],
+        "vod_content": _pick(row, "content"),
+        "vod_play_url": _pick(row, "play_url"),
+        # MacCMS 语义的「播放源名称」。存量行为一直是常量 "vodsync"，这里保持不变
+        # （改成上游 provider 串会打断依赖该常量的老客户端）；真实 provider 见
+        # 下面 play_from 以及每条线路自带的 from。
         "vod_play_from": "vodsync",
-        "vod_play_list": parse_play_url(row["play_url"]),
+        # v1.11.0：上游 vod_play_from 原始串（"feifan$$$ffm3u8"），与 vod_play_url
+        # 的线路顺序一一对应。存量行为空串（未回填）。
+        "play_from": _pick(row, "play_from"),
+        "vod_play_list": lines,
     }
 
 
@@ -507,10 +547,11 @@ def list_sources():
       synced        是否同步过（无水位线、无数据、无断点 = false，进度恒为 0）
       paused        该源站是否被单独暂停（持久化）
     """
-    from .. import syncer
+    from .. import playline, syncer
 
     running = syncer.running_snapshot()
     queued = syncer.queued_slugs()
+    line_stats = playline.stats_snapshot()["by_source"]
 
     with database.engine.connect() as conn:
         rows = conn.execute(
@@ -520,6 +561,7 @@ def list_sources():
                 sources.c.last_page, sources.c.total_pages, sources.c.last_sync_at,
                 sources.c.paused, sources.c.paused_at, sources.c.auto_sync,
                 sources.c.origin, sources.c.fail_streak, sources.c.skip_until,
+                sources.c.play_line_policy,
             ).order_by(sources.c.id)
         ).mappings().all()
     return {
@@ -556,6 +598,14 @@ def list_sources():
                 # 健康度退避（v1.8.1）：连续大面积失败次数 + 退避截止时间
                 "fail_streak": r["fail_streak"] or 0,
                 "skip_until": r["skip_until"].isoformat() if r["skip_until"] else None,
+                # 播放线路策略（v1.11.0）：inherit 跟随全局；面板用这个值渲染下拉框
+                "play_line_policy": r["play_line_policy"] or "inherit",
+                "play_line_effective": (
+                    r["play_line_policy"] if (r["play_line_policy"] or "inherit") != "inherit"
+                    else playline.global_policy()
+                ),
+                # 读侧累计（本次进程启动以来）：面板显示「线路 2→1（过滤 1 条 page）」
+                "play_line": line_stats.get(r["slug"], {"lines": 0, "dropped": 0, "fallback": 0}),
             }
             for r in rows
         ],
@@ -626,7 +676,7 @@ def stats():
     """管理面板概览数据：源站数、总条数、同步中数量、今日入库量、暂停状态、最近错误。"""
     from sqlalchemy import and_
 
-    from .. import pause, syncer
+    from .. import pause, playline, syncer
     from ..maccms import proxy_snapshot
 
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -667,6 +717,11 @@ def stats():
         "pause": pause.snapshot(),   # 同步暂停状态（面板顶栏开关用）
         # 中转代理运行态：是否启用、走代理的源站、成功/失败计数（排障用）
         "proxy": proxy_snapshot(),
+        # 播放线路过滤（v1.11.0）：全局策略 + 读侧累计计数。
+        # 注意是「本次进程启动以来」的累计值（重启清零），用于确认策略真的在拦截线路。
+        "play_line": {
+            k: v for k, v in playline.stats_snapshot().items() if k != "by_source"
+        },
         # 数据库连接池 + 同步负载（判断"是不是又堆任务了"最直接的两个指标）
         "db_pool": database.pool_status(),
         "sync_load": syncer.sync_load(),
@@ -767,6 +822,39 @@ def set_one_auto_sync(
         "msg": f"源站 {src['name']} 自动同步已{'开启' if enabled else '暂停'}",
         "slug": slug,
         "auto_sync": enabled,
+    }
+
+
+@router.post("/api/v1/sources/{slug}/play-line-policy")
+def set_play_line_policy(
+    slug: str,
+    policy: str = Query(
+        ...,
+        description="inherit=跟随全局 / off=不过滤 / filter=剔除分享页线路 / whitelist=只保留媒体直链",
+    ),
+):
+    """
+    设置单个源站的播放线路策略（v1.11.0，持久化，立即生效）。
+
+    为什么按源站配：只有「第 1 条线路恒为 /share/ 分享页」这类站点需要过滤
+    （如非凡资源站，100% 记录如此），一刀切的全局策略会误伤本来正常的站。
+    默认 `inherit` 跟随 `PLAY_LINE_POLICY`，其余站点不必动。
+
+    只影响读接口的 `vod_play_list`，不重写 `vod_play_url`，也不需要重新同步。
+    """
+    from .. import playline
+
+    src, _ = _require_table(slug)
+    try:
+        value = playline.set_source_policy(slug, policy)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {
+        "code": 1,
+        "msg": f"源站 {src['name']} 播放线路策略 = {value}",
+        "slug": slug,
+        "play_line_policy": value,
+        "effective": playline.effective_policy(slug),
     }
 
 
@@ -1025,12 +1113,23 @@ def _bg_sync_new(slugs: list):
 
 
 @router.post("/api/v1/sync/{slug}")
-def trigger_sync(slug: str, mode: str = Query(default="auto", pattern="^(auto|full|incremental)$")):
+def trigger_sync(
+    slug: str,
+    mode: str = Query(
+        default="auto",
+        pattern="^(auto|full|incremental|backfill|backfill_play_from)$",
+        description="auto / full / incremental / backfill_play_from（只回填播放线路来源）",
+    ),
+):
     """
     手动触发单源站同步（后台执行，立即返回受理结果）。
 
     并发受全局闸门（SOURCE_SYNC_CONCURRENCY）限制：名额已满时任务进入排队，
     同一源站已在排队/运行时不会重复提交（返回 status=already_running）。
+
+    `mode=backfill_play_from`（v1.11.0）：只翻 ac=detail 把上游 `vod_play_from`
+    回填进库（只写这一列），不动其它字段、不推进水位线、不动断点，可中断可重跑。
+    存量库刚升级时用它补齐 provider 信息；不回填也能正常工作（只按 URL 形态判断）。
     """
     from .. import syncer
 
@@ -1149,6 +1248,8 @@ def video_list(
     wd: str = Query("", description="按名称模糊搜索"),
     ac: str = Query("", description="兼容 MacCMS：ac=detail 时列表返回含播放地址的完整字段"),
     ids: str = Query("", description="按 ID 批量取详情（逗号分隔），返回含播放地址"),
+    play_raw: int = Query(0, ge=0, le=1,
+                          description="v1.11.0：1=不做线路过滤/排序，返回原始 vod_play_list（排障用）"),
     paging: tuple = Depends(page_params),
 ):
     """
@@ -1159,6 +1260,14 @@ def video_list(
       2. 批量详情：  /api/v1/videos?source=jkun&ids=134369       （含 vod_play_url）
       3. 完整列表：  /api/v1/videos?source=jkun&ac=detail         （列表带播放地址）
       4. 分类浏览：  /api/v1/videos?source=jkun&type_id=6         （配合 /api/v1/categories）
+
+    v1.11.0（播放线路）：默认按 `PLAY_LINE_POLICY`（源站可覆盖）过滤掉
+    `/share/`、`/play/`、`.html` 这类「H5 分享页」线路 —— 它们返回 text/html，
+    真实流地址由页面 JS 生成且带会过期的 sign，客户端直接播必然失败。
+    `vod_play_url` 原始串不变；过滤只作用于结构化的 `vod_play_list`
+    （每条线路新增 `from` / `type` / `playable` / `original_index`）。
+    默认响应若真的过滤掉了线路，顶层带 `play_line_filtered: true`；
+    `play_raw=1` 可拿到未过滤的原始列表（排障用，同时关闭排序）。
 
     v1.10.1（纯新增）：详情模式（`ids=` 批量 / `ac=detail` 列表）额外返回
     `vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag` 五个字段，
@@ -1206,6 +1315,7 @@ def video_list(
                 detail="ids 参数格式错误，应为逗号分隔的数字，例如 ids=134369 或 ids=1,2,3",
             )
         items: list = []
+        play_meta: dict = {}
         existing = database.list_tables("vod_")
         with database.engine.connect() as conn:
             for slug in slugs:
@@ -1220,7 +1330,8 @@ def video_list(
                 }
                 for vid in want:  # 按请求中的 id 顺序返回
                     if vid in found:
-                        items.append(_detail_item(slug, found[vid]))
+                        items.append(_detail_item(slug, found[vid], play_raw=bool(play_raw),
+                                                  play_meta=play_meta))
         if not items:
             raise HTTPException(
                 status_code=404,
@@ -1230,7 +1341,10 @@ def video_list(
                     "/api/v1/videos?source=xxx&wd=关键词 搜索确认 vod_id"
                 ),
             )
-        return {"code": 1, "page": 1, "pagecount": 1, "total": len(items), "list": items}
+        resp = {"code": 1, "page": 1, "pagecount": 1, "total": len(items), "list": items}
+        if play_meta.get("filtered"):
+            resp["play_line_filtered"] = True
+        return resp
 
     # ---- 用法 1 / 3：列表 ----
     # 走 app/multiquery.py：每表各取 top-K 后进程内归并（精确，见该模块顶部说明）。
@@ -1247,13 +1361,15 @@ def video_list(
     if result["tables"] == 0:
         raise HTTPException(status_code=404, detail="指定源站均无数据")
 
+    play_meta: dict = {}
     resp = {
         "code": 1,
         "page": page,
         "pagecount": result["pagecount"],
         "total": result["total"],
         "list": (
-            [_detail_item(r["source_slug"], r) for r in result["rows"]]
+            [_detail_item(r["source_slug"], r, play_raw=bool(play_raw), play_meta=play_meta)
+             for r in result["rows"]]
             if detail_mode
             else [
                 {
@@ -1278,14 +1394,28 @@ def video_list(
     # 客户端据此决定分页依据：近似时请以「本页条数 == page_size 就继续翻」为准。
     if result.get("total_approximate"):
         resp["total_approximate"] = True
+    # v1.11.0：本页有任意条目真的被过滤掉线路时标记（客户端/日志据此识别，
+    # 不影响任何既有字段语义；`play_raw=1` 时永远不出现）
+    if play_meta.get("filtered"):
+        resp["play_line_filtered"] = True
     resp["query_ms"] = result["elapsed_ms"]
     return resp
 
 
 @router.get("/api/v1/videos/{slug}/{vod_id}")
-def video_detail(slug: str, vod_id: int):
+def video_detail(
+    slug: str,
+    vod_id: int,
+    play_raw: int = Query(0, ge=0, le=1,
+                          description="v1.11.0：1=不做线路过滤/排序，返回原始 vod_play_list（排障用）"),
+):
     """
     视频详情（含结构化播放地址列表）。RELATED_IN_DETAIL=true 时附带 related 推荐数组。
+
+    v1.11.0（播放线路）：`vod_play_list` 默认已过滤掉 `/share/`、`/play/`、`.html`
+    这类「H5 分享页」线路（返回 text/html，真实流地址由 JS 生成且带过期 sign）。
+    每条线路带 `from`（上游 provider）/`type`/`playable`/`original_index`；
+    `vod_play_url` 原始串不变。真的过滤掉线路时响应顶层带 `play_line_filtered: true`。
 
     v1.10.1（纯新增）：返回 `vod_actor` / `vod_director` / `vod_area` / `vod_year` /
     `vod_tag` 五个字段 —— 列 v1.9.0 起就在库里，之前没透出，NAS 模式的客户端拿不到
@@ -1298,7 +1428,8 @@ def video_detail(slug: str, vod_id: int):
         ).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="视频不存在")
-    detail = _detail_item(slug, row)
+    play_meta: dict = {}
+    detail = _detail_item(slug, row, play_raw=bool(play_raw), play_meta=play_meta)
     if config.RELATED_IN_DETAIL:
         try:
             cards, fallback = _related_cards(slug, src["name"], vod_id,
@@ -1307,7 +1438,10 @@ def video_detail(slug: str, vod_id: int):
             detail["related_fallback"] = fallback
         except Exception as e:  # 推荐挂了不能连累详情
             log.warning("[%s] 详情附带推荐失败（忽略）: %s", slug, e)
-    return {"code": 1, "detail": detail}
+    resp = {"code": 1, "detail": detail}
+    if play_meta.get("filtered"):
+        resp["play_line_filtered"] = True
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -1888,15 +2022,22 @@ def maccms_compat(
     pg: int = Query(default=1, ge=1),
     ids: str = Query(default="", description="按 ID 批量取详情，逗号分隔"),
     wd: str = Query(default=""),
+    play_raw: int = Query(0, ge=0, le=1,
+                          description="v1.11.0：1=不做线路过滤/排序（排障用）"),
     paging: tuple = Depends(page_params),
 ):
     """
     与苹果 CMS 采集接口输出结构一致：
       ?ac=list   -> {code,page,pagecount,limit,total,class,list:[轻量字段]}
       ?ac=detail -> {code,page,pagecount,limit,total,class,list:[全字段含播放地址]}
+
+    v1.11.0：`vod_play_list` 已按策略过滤（默认剔除 /share/、/play/、.html 这类
+    分享页线路），`vod_play_url` 原始串保持不变 —— 采集端若自己解析原始串，
+    行为与旧版完全一致；用 vod_play_list 的客户端自动拿到可播线路。
     """
     src, table = _require_table(slug)
     page, page_size = paging
+    play_meta: dict = {}
     with database.engine.connect() as conn:
         class_list = _maccms_class_map(conn, table)
 
@@ -1910,20 +2051,13 @@ def maccms_compat(
             if not id_list:
                 return {"code": 1, "page": 1, "pagecount": 1, "limit": page_size, "total": 0, "class": class_list, "list": []}
             rows = conn.execute(
-                select(table.c.vod_id, table.c.type_id, table.c.type_name, table.c.name,
-                       table.c.pic, table.c.remarks, table.c.vod_time,
-                       table.c.content, table.c.play_url)
-                .where(table.c.vod_id.in_(id_list))
+                select(table).where(table.c.vod_id.in_(id_list))
             ).mappings().all()
             items = []
             for r in rows:
-                item = {
-                    "vod_id": r["vod_id"], "type_id": r["type_id"], "type_name": r["type_name"],
-                    "vod_name": r["name"], "vod_pic": r["pic"], "vod_remarks": r["remarks"],
-                    "vod_time": r["vod_time"], "vod_content": r["content"],
-                    "vod_play_url": r["play_url"], "vod_play_from": "vodsync",
-                    "vod_play_list": parse_play_url(r["play_url"]),
-                }
+                # 与 /api/v1/videos/{slug}/{id} 共用同一个构造器：
+                # 以前这里手写了另一份字段列表，v1.10.1 加演职员时就漏了这条路径。
+                item = _detail_item(slug, r, play_raw=bool(play_raw), play_meta=play_meta)
                 if config.RELATED_IN_DETAIL:
                     try:
                         cards, fb = _related_cards(slug, src["name"], r["vod_id"],
@@ -1933,17 +2067,21 @@ def maccms_compat(
                     except Exception as e:  # 推荐挂了不能连累采集端详情
                         log.warning("[%s] ac=detail 附带推荐失败（忽略）: %s", slug, e)
                 items.append(item)
-            return {
+            resp = {
                 "code": 1, "page": 1, "pagecount": 1, "limit": page_size,
                 "total": len(items), "class": class_list,
                 "list": items,
             }
+            if play_meta.get("filtered"):
+                resp["play_line_filtered"] = True
+            return resp
 
         detail = ac == "detail"
         total, pagecount, items = _query_vods(
-            conn, table, page, page_size, wd=wd or None, detail=detail
+            conn, table, slug, page, page_size, wd=wd or None, detail=detail,
+            play_raw=bool(play_raw), play_meta=play_meta,
         )
-    return {
+    resp = {
         "code": 1,
         "msg": "数据列表",
         "page": page,
@@ -1953,3 +2091,6 @@ def maccms_compat(
         "class": class_list,
         "list": items,
     }
+    if play_meta.get("filtered"):
+        resp["play_line_filtered"] = True
+    return resp

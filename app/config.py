@@ -351,6 +351,48 @@ RELATED_STAR_NEGATIVE_PATTERNS = os.environ.get(
 )
 
 # ---------------------------------------------------------------------------
+# 播放线路识别 / 过滤 / 排序（v1.11.0）
+#
+# 问题：上游 `vod_play_from` 从未入库，`parse_play_url()` 只按序号命名线路，
+# 也不做任何形态判断。于是「第 1 条线路是 H5 分享页（/share/<hash>，返回 text/html，
+# 真实流地址由页面 JS 生成且带会过期的 sign）」的源站（如非凡资源站，100% 记录如此），
+# 客户端按顺序选第一条 → 必然播放失败。线路与 provider 的对应关系在入库那一刻就丢了。
+#
+# 策略：入库保留 play_from（原始串），读时按 URL 形态分类并过滤/排序。
+# `vod_play_url` 原始串**永不改写**（客户端仍可自行解析），只影响结构化的 vod_play_list。
+# ---------------------------------------------------------------------------
+# off 不过滤（等价旧行为）/ filter 剔除 page 型 / whitelist 只保留媒体直链
+PLAY_LINE_POLICY = os.environ.get("PLAY_LINE_POLICY", "filter").strip().lower()
+# filter 模式下判定「不是播放地址」的路径特征（逗号分隔，大小写不敏感子串；
+# 以 `re:` 开头的按正则处理）。只匹配 URL 的 path（不含 query）。
+# 注意：以 .m3u8/.mp4/.flv/.mkv 结尾的地址永远视为媒体直链，不会被这里误杀。
+PLAY_LINE_DROP_PATTERNS = os.environ.get(
+    "PLAY_LINE_DROP_PATTERNS", "/share/,/play/,.html,.htm"
+)
+# whitelist 模式下保留的扩展名
+PLAY_LINE_KEEP_EXT = os.environ.get("PLAY_LINE_KEEP_EXT", "m3u8,mp4,flv,mkv")
+# 直链优先排序：m3u8 > mp4 > flv > mkv > unknown > page，同类型内保持上游原顺序（稳定排序）
+PLAY_LINE_PREFER_DIRECT = (
+    os.environ.get("PLAY_LINE_PREFER_DIRECT", "true").strip().lower() == "true"
+)
+# 线路名是否追加 provider，如「线路2 (ffm3u8)」
+PLAY_LINE_NAME_WITH_FROM = (
+    os.environ.get("PLAY_LINE_NAME_WITH_FROM", "true").strip().lower() == "true"
+)
+# 安全阀：过滤后线路数低于该值则整条影片回退到未过滤结果（绝不允许把片子过滤成「无线路」）
+PLAY_LINE_MIN_KEEP = int(os.environ.get("PLAY_LINE_MIN_KEEP", "1"))
+# 是否对 unknown 型地址做一次 HEAD 探测（默认关：读路径上发网络请求会拖慢详情接口）
+PLAY_LINE_PROBE_HTML = (
+    os.environ.get("PLAY_LINE_PROBE_HTML", "false").strip().lower() == "true"
+)
+PLAY_LINE_PROBE_TIMEOUT = float(os.environ.get("PLAY_LINE_PROBE_TIMEOUT", "1.5"))
+# HEAD 结果缓存秒数（结果不落库，仅进程内）
+PLAY_LINE_PROBE_CACHE_SECONDS = int(os.environ.get("PLAY_LINE_PROBE_CACHE_SECONDS", "300"))
+# 源站级策略（sources.play_line_policy）的进程内缓存秒数。
+# 面板改下拉后立即失效（reset_policy_cache），这个 TTL 只兜底多进程/直接改库的场景。
+PLAY_LINE_POLICY_CACHE_SECONDS = int(os.environ.get("PLAY_LINE_POLICY_CACHE_SECONDS", "30"))
+
+# ---------------------------------------------------------------------------
 # 存量字段回填（v1.9.0）
 #
 # 场景：升级前已全量同步的库，演员/地区/年代列全是空的（旧抓取逻辑没存）。

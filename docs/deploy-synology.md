@@ -97,7 +97,7 @@ services:
 - `curl -s http://群晖IP:8181/healthz` → 返回 `status` / `db` / `version` / `build`，**`"version"` 必须与你要部署的版本一致**
 
   ```json
-  {"status":"ok","db":true,"version":"1.10.1","build":"<commit sha>","time":"..."}
+  {"status":"ok","db":true,"version":"1.11.0","build":"<commit sha>","time":"..."}
   ```
 - 打开 `http://群晖IP:8181/docs` 查看交互式 API 文档
 
@@ -114,8 +114,8 @@ Container Manager → 项目 vodsync → **操作 → 停止 → 构建/拉取 �
 | tag 形式 | 可变性 | 用途 |
 |---|---|---|
 | `latest` | 可变 | 跟随最新（生产默认） |
-| `1.10.1` | 可变 | 版本号，同一版本多次构建指向最新那次 |
-| `1.10.1-<sha7>` | **不可变** | **回滚用这个** |
+| `1.11.0` | 可变 | 版本号，同一版本多次构建指向最新那次 |
+| `1.11.0-<sha7>` | **不可变** | **回滚用这个** |
 | `sha-<sha7>` | **不可变** | 提交级 |
 
 回滚后 `curl http://群晖IP:8181/healthz` 核对 `version` / `build` 是否已是目标版本。
@@ -180,7 +180,7 @@ docker logs -f vodsync
 
 | 现象 | 处理 |
 |---|---|
-| 打不开 8181 | 检查端口占用：`netstat -tlnp | grep 8181`；防火墙/路由器端口 |
+| 打不开 8181 | 检查端口占用：`netstat -tlnp \| grep 8181`；防火墙/路由器端口 |
 | 启动就退出 / 连不上库 | `docker logs vodsync` 看是否 `could not translate host name "postgres"`：PG 没起或不在同一 compose 项目网络。`docker ps` 确认 `vodsync-pg` 在跑，`docker compose up -d postgres` 补起 |
 | 数据没保存 | 确认 `pgdata` 卷挂载了 `/var/lib/postgresql/data`；`ls /volume1/docker/vodsync/pgdata` 应能看到 `PG_VERSION` |
 | 同步一直失败 | `docker logs vodsync` 看具体报错；多为源站 403 风控，调大 `REQUEST_INTERVAL_SECONDS` |

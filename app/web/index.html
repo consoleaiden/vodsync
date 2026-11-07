@@ -95,6 +95,11 @@
     font: inherit; padding: 7px 11px; border: 1px solid var(--line); border-radius: 7px;
     background: #fff; color: var(--text); min-width: 260px; outline: none;
   }
+  /* 播放线路策略下拉（v1.11.0）：表格里用紧凑尺寸，别把行高撑起来 */
+  select.lineSel {
+    font: inherit; font-size: 12px; padding: 2px 5px; border: 1px solid var(--line);
+    border-radius: 6px; background: #fff; color: var(--text); cursor: pointer;
+  }
   input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37,99,235,.1); }
   .bar { height: 6px; background: #eef1f5; border-radius: 999px; overflow: hidden; min-width: 70px; }
   .bar > i { display: block; height: 100%; background: var(--accent); border-radius: 999px; transition: width .3s; }
@@ -459,6 +464,18 @@ async function loadSources() {
         ? `<button class="sm" data-act="edit" data-slug="${esc(s.slug)}" data-origin="custom">编辑</button>
            <button class="sm warn" data-act="del" data-slug="${esc(s.slug)}" data-origin="custom">删除</button>`
         : "";
+      // 播放线路策略（v1.11.0）：inherit 跟随全局；只有「第 1 条线路恒为分享页」的站
+      // （如非凡资源站）才需要单独选 filter，其他站保持 inherit 不被动。
+      const linePolicy = s.play_line_policy || "inherit";
+      const lineStat = s.play_line || { dropped: 0 };
+      const effName = { off: "不过滤", filter: "过滤", whitelist: "只保留直链" }[s.play_line_effective] || s.play_line_effective || "";
+      const lineHint = lineStat.dropped > 0
+        ? `<div class="muted" style="font-size:11px" title="本次服务启动以来，读接口累计剔除的线路上数">已过滤 ${fmtNum(lineStat.dropped)} 条</div>`
+        : "";
+      const lineCell = `<select class="lineSel" data-slug="${esc(s.slug)}" title="播放线路策略：inherit 跟随全局${effName ? "（当前 " + effName + "）" : ""}；filter 剔除 /share/ 这类分享页线路；off 不过滤；whitelist 只保留 m3u8/mp4 等直链">
+          ${[["inherit", "跟随全局"], ["filter", "过滤"], ["off", "不过滤"], ["whitelist", "只保留直链"]]
+            .map(([v, label]) => `<option value="${v}" ${linePolicy === v ? "selected" : ""}>${label}</option>`).join("")}
+        </select>${lineHint}`;
       return `<tr>
         <td><input type="checkbox" class="selRow" data-slug="${esc(s.slug)}" ${selectedSlugs.has(s.slug) ? "checked" : ""}></td>
         <td>
@@ -467,6 +484,7 @@ async function loadSources() {
         </td>
         <td>${originCell}</td>
         <td>${s.status === "ok" ? '<span class="badge ok">在线</span>' : '<span class="badge bad">离线</span>'}${s.paused ? ' <span class="badge warn">本站暂停</span>' : ""}${s.queued ? ' <span class="badge mute">排队中</span>' : ""}${backoffBadge(s)}</td>
+        <td>${lineCell}</td>
         <td class="num">${fmtNum(s.total_videos)}</td>
         <td style="min-width:130px">${prog}</td>
         <td class="muted num" style="font-size:12px">${esc(s.watermark || "-")}</td>
@@ -485,7 +503,7 @@ async function loadSources() {
     $("#sourcesBody").innerHTML = `<table>
       <thead><tr>
         <th style="width:34px" title="全选 / 取消全选"><input type="checkbox" id="selAll" ${allSel ? "checked" : ""}></th>
-        <th>源站</th><th>来源</th><th>状态</th><th>已入库</th><th>全量进度</th><th>增量水位线</th><th>最后同步</th><th>自动同步</th><th>操作</th>
+        <th>源站</th><th>来源</th><th>状态</th><th>线路</th><th>已入库</th><th>全量进度</th><th>增量水位线</th><th>最后同步</th><th>自动同步</th><th>操作</th>
       </tr></thead><tbody>${rows}</tbody></table>`;
     updateBulkButtons(list.filter((s) => s.auto_sync).length);
   } catch (e) { toast("源站列表加载失败：" + e.message, true); }
@@ -592,6 +610,22 @@ $("#sourcesBody").addEventListener("change", async (ev) => {
       toast("设置失败：" + e.message, true);
     } finally {
       delete pendingAuto[slug];
+      loadSources();
+    }
+    return;
+  }
+  // 单站播放线路策略（v1.11.0）
+  if (t.classList.contains("lineSel")) {
+    const slug = t.dataset.slug, policy = t.value;
+    try {
+      const res = await api(
+        `/api/v1/sources/${encodeURIComponent(slug)}/play-line-policy?policy=${encodeURIComponent(policy)}`,
+        { method: "POST" }
+      );
+      toast(res.msg || "已更新线路策略");
+    } catch (e) {
+      toast("线路策略设置失败：" + e.message, true);
+    } finally {
       loadSources();
     }
   }

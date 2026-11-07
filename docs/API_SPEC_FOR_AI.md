@@ -3,7 +3,7 @@
 > **本文档的用途**：把 VodSync 服务作为后端，交由 AI（或 AI 编程助手）开发客户端 App。
 > 文档自包含：只读本文即可完成全部对接，**不需要**阅读服务端源码。
 >
-> 对应服务版本：**v1.10.1** ｜ 文档版本：`2026-11-07` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.11.0** ｜ 文档版本：`2026-11-07` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 **目录**
 
@@ -13,7 +13,7 @@
 | [1](#1-服务能提供什么) | 服务能力概览 |
 | [2](#2-通用约定) | 鉴权 / 响应格式 / 错误码 / 分页 / 编码 |
 | [3](#3-数据模型字段字典) | 数据模型与字段字典 |
-| [4](#4-接口参考) | 44 个接口逐一说明 |
+| [4](#4-接口参考) | 45 个接口逐一说明 |
 | [5](#5-状态语义与推荐-ui最容易做错的部分) | 状态语义与推荐 UI（running / syncing / paused / auto_sync） |
 | [6](#6-端到端流程可直接交给-ai-实现) | 端到端流程（观影 App / 管理 App） |
 | [7](#7-客户端代码骨架) | 客户端代码骨架（TS / Kotlin / Flutter / Swift） |
@@ -33,7 +33,7 @@
 4. `source` 参数是**源站标识 slug**（如 `jkun`、`s361c088099`），**不是**站点名。slug 只能匹配 `^[a-z0-9_]{1,64}$`；中文站名在服务端被哈希成 `s` + 10 位十六进制。
 5. 列表接口的分页参数统一为 `page`（从 1 开始）与 `page_size`（默认 30，上限 100，可用 `API_PAGE_SIZE_DEFAULT` / `API_PAGE_SIZE_MAX` 调整；`/api/v1/search` 与列表保持一致）。**超过上限会直接 422**，不是自动截断——客户端请按上限内取值，三列宫格推荐 30（10 行 × 3 列）。
 6. **一个 URL 只能有一个 `?`**。写成 `?a=1&?b=2` 时第二个键会变成 `?b`（服务端对数据接口做了兼容，但不要依赖）。
-7. 播放地址以 `vod_play_list` 结构化字段为准，`vod_play_url` 是上游原始串，仅作兜底。
+7. 播放地址以 `vod_play_list` 结构化字段为准（v1.11.0 起已过滤掉 `/share/` 这类分享页线路），`vod_play_url` 是上游原始串，仅作兜底；需要未过滤版本时加 `play_raw=1`。
 8. 管理类接口（触发同步、暂停、开关）都是**异步受理**：POST 立即返回，进度靠轮询 `GET /api/v1/sources` 得到。
 9. 不要臆造字段。文档里没写的字段，服务端不会返回；需要新字段请按第 10 节的方式扩展。
 10. 生成 UI 时区分四个独立状态：`running`、`syncing`、`paused`、`auto_sync`（见第 5 节，最容易做错的地方）。
@@ -192,16 +192,26 @@ curl -s http://<host>:8181/api/v1/auth/state
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `vod_content` | string | 简介（可能含 HTML 标签或为空） |
-| `vod_play_url` | string | 上游原始播放串：`线路1$$$线路2`，线路内 `集名$地址#集名$地址` |
-| `vod_play_from` | string | 固定为 `"vodsync"` |
-| `vod_play_list` | PlayLine[] | **结构化播放列表（推荐使用）** |
+| `vod_play_url` | string | 上游原始播放串：`线路1$$$线路2`，线路内 `集名$地址#集名$地址`。**永不被改写**（过滤只作用于 `vod_play_list`） |
+| `vod_play_from` | string | MacCMS 兼容字段，固定为 `"vodsync"` |
+| `play_from` | string | **v1.11.0**：上游 `vod_play_from` 原始串（如 `feifan$$$ffm3u8`），与 `vod_play_url` 的线路顺序一一对应；存量未回填时为空串 |
+| `vod_play_list` | PlayLine[] | **结构化播放列表（推荐使用，已按策略过滤掉不可播的分享页线路）** |
 
 ```ts
 type PlayLine = {
-  name: string;                      // "线路1"（服务端按顺序编号，非上游原名）
+  name: string;            // "线路2 (ffm3u8)" —— 编号是**过滤后**的序号
+  from: string;            // v1.11.0 上游 provider（play_from 缺失时为空串）
+  type: "m3u8" | "mp4" | "flv" | "mkv" | "page" | "unknown";  // v1.11.0
+  playable: boolean;       // v1.11.0：type != "page"
+  original_index: number;  // v1.11.0：在上游 vod_play_url 里的下标（0 基），缓存对齐用
   episodes: { name: string; url: string }[];  // name 如 "第01集"/"高清"
 };
 ```
+
+> **为什么会有 `page` 型线路**：部分源站（如非凡资源站，100% 记录如此）第 1 条线路是
+> H5 分享页 `/share/<hash>` —— 返回 `text/html`，真实 m3u8 由页面 JS 生成且带会过期的
+> `sign`，播放器直接请求必然失败。v1.11.0 起服务端默认把它从 `vod_play_list` 里剔除，
+> 客户端拿到的第一条线路就是能播的。需要原始列表排障时加 `play_raw=1`。
 
 ### 3.4 Category
 
@@ -281,8 +291,9 @@ type PlayLine = {
 | 42 | GET | `/api/v1/star/tags/status` | 管理 | 明星 Tag 覆盖统计（视频数/缺演员数/已映射数） |
 | 43 | GET | `/api/v1/star/works` | 业务 | 按明星查作品（明星为中心，total 不受 limit 影响） |
 | 44 | GET | `/api/v1/star/tags/untracked` | 管理 | 未入词库高频标题词 Top N（扩词库用） |
+| 45 | POST | `/api/v1/sources/{slug}/play-line-policy` | 管理 | **v1.11.0** 单源站播放线路策略（inherit/off/filter/whitelist） |
 
-> 共 **44 个接口**。标「管理」的主要供管理面板使用，客户端 App 只需一枚 Token（见 2.1）即可调用「数据」「业务」类接口。
+> 共 **45 个接口**。标「管理」的主要供管理面板使用，客户端 App 只需一枚 Token（见 2.1）即可调用「数据」「业务」类接口。
 > 鉴权类中 `/api/v1/auth/login` 与 `/api/v1/auth/state` **免鉴权**，其余需登录会话 cookie（`POST /api/v1/auth/password` 等也可用 Token 访问）。
 
 ---
@@ -290,7 +301,7 @@ type PlayLine = {
 ### 4.1 GET `/healthz`
 
 ```json
-{ "status": "ok", "db": true, "version": "1.10.1", "build": "4f249a7299d30827c1e785173d7d5a63a22191ca", "time": "2026-11-07T10:20:31.882914" }
+{ "status": "ok", "db": true, "version": "1.11.0", "build": "4f249a7299d30827c1e785173d7d5a63a22191ca", "time": "2026-11-07T10:20:31.882914" }
 ```
 
 用途：服务可用性探测 + 判断是否启用 API Key（见 2.1）。
@@ -404,6 +415,7 @@ GET /api/v1/videos?source=jkun&type_name=电影
 | `wd` | string | 空 | 名称模糊搜索（单接口内） |
 | `ac` | string | 空 | `detail` 或 `videolist` → 列表返回完整字段 |
 | `ids` | string | 空 | 逗号分隔数字，批量取详情 |
+| `play_raw` | int | 0 | **v1.11.0**：`1`=不过滤/不排序，返回原始 `vod_play_list`（排障用） |
 | `page` | int | 1 | 页码 |
 | `page_size` | int | 30 | 1–100 |
 
@@ -445,15 +457,37 @@ GET /api/v1/videos?source=jkun&type_name=电影
   "vod_year": "2019",
   "vod_tag": "吴京",
   "vod_content": "简介文本…",
-  "vod_play_url": "高清$https://example.com/playlist.m3u8",
+  "vod_play_url": "第01集$https://vip.ffzy-play1.com/share/e5c6…$$$第01集$https://vip.ffzy-play1.com/20221111/14677_4ab87e51/index.m3u8#…",
   "vod_play_from": "vodsync",
+  "play_from": "feifan$$$ffm3u8",
   "vod_play_list": [
-    { "name": "线路1", "episodes": [
-      { "name": "高清", "url": "https://example.com/playlist.m3u8" }
-    ] }
+    {
+      "name": "线路1 (ffm3u8)",
+      "from": "ffm3u8",
+      "type": "m3u8",
+      "playable": true,
+      "original_index": 1,
+      "episodes": [
+        { "name": "第01集", "url": "https://vip.ffzy-play1.com/20221111/14677_4ab87e51/index.m3u8" }
+      ]
+    }
   ]
 }
 ```
+
+> **v1.11.0 播放线路过滤**（上方示例即过滤后的形态：上游 2 条线路，`/share/` 那条被剔除）：
+>
+> | 新增 | 说明 |
+> |---|---|
+> | `play_from` | 上游 `vod_play_from` 原始串（`$$$` 分隔，与 `vod_play_url` 对齐）；未回填时 `""` |
+> | `list[].from` | 该线路的 provider（`play_from` 对应位置，缺失为空串） |
+> | `list[].type` | `m3u8` / `mp4` / `flv` / `mkv` / `page` / `unknown` |
+> | `list[].playable` | `type != "page"`（`unknown` 只是没认出来，不代表不能播） |
+> | `list[].original_index` | 在上游 `vod_play_url` 里的下标（0 基）—— 客户端缓存按它对齐，别用 `name` |
+> | 顶层 `play_line_filtered` | 只在**真的过滤掉线路**时出现（`true`）；`play_raw=1` 时永不出现 |
+>
+> `vod_play_url` 始终是上游原始串（逐字节不变），习惯自己解析的客户端行为不变。
+> 过滤策略可按源站覆盖（`POST /api/v1/sources/{slug}/play-line-policy`），默认 `filter`。
 
 > **v1.10.1 新增 5 个字段**（纯新增，仅详情模式 `ids=` / `ac=detail` 下出现，普通列表模式**不带**以控制体积）：
 >
@@ -501,14 +535,23 @@ GET /api/v1/videos/jkun/134369
     "vod_year": "2019",
     "vod_tag": "吴京",
     "vod_content": "简介文本…",
-    "vod_play_url": "高清$https://example.com/playlist.m3u8",
+    "vod_play_url": "第01集$https://vip.ffzy-play1.com/share/e5c6…$$$第01集$https://…/index.m3u8#…",
     "vod_play_from": "vodsync",
-    "vod_play_list": [ { "name": "线路1", "episodes": [ ... ] } ],
+    "play_from": "feifan$$$ffm3u8",
+    "vod_play_list": [
+      { "name": "线路1 (ffm3u8)", "from": "ffm3u8", "type": "m3u8",
+        "playable": true, "original_index": 1, "episodes": [ ... ] }
+    ],
     "related": [ ... ], "related_fallback": false
-  }
+  },
+  "play_line_filtered": true
 }
 ```
 
+> **v1.11.0**：`vod_play_list` 默认已过滤掉 `/share/`、`/play/`、`.html` 这类分享页线路
+> （返回 text/html，真实流地址由 JS 生成且带过期 sign，播放必失败）。真过滤掉时响应顶层带
+> `play_line_filtered: true`；`?play_raw=1` 返回未过滤列表（排障）。
+>
 > **v1.10.1**：`vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag` 五个字段开始透出
 > （列 v1.9.0 起就在库里，之前只是没返回）。语义与「②③」一致：恒为字符串，缺失为 `""`。
 > NAS 模式下客户端不再需要拿 `star/related` 的 `stars` 去拼演员，标签也有了数据源。
@@ -844,6 +887,46 @@ POST /api/v1/sources/auto-sync?enabled=true&slugs=jkun,t1 # 指定多站开启
 - `slugs` 默认 `all`；也接受 `*`、空串（= 全部）或逗号分隔列表。
 - 状态持久化在数据库，重启保留；`/api/v1/sources` 返回 `auto_sync`。
 - 全局定时调度（默认每 6 小时增量、每 12 小时刷新源站列表）**始终运行**，只跳过被关闭的站。
+
+---
+
+### 4.17 播放线路策略（`play-line-policy`）
+
+只影响**读接口的 `vod_play_list`**，不改 `vod_play_url`，也不需要重新同步。
+
+```http
+POST /api/v1/sources/s70598e18b5/play-line-policy?policy=filter
+```
+
+| policy | 含义 |
+|---|---|
+| `inherit` | **默认**，跟随全局 `PLAY_LINE_POLICY` |
+| `filter` | 剔除 `PLAY_LINE_DROP_PATTERNS` 命中的线路（默认 `/share/`、`/play/`、`.html`、`.htm`） |
+| `off` | 不过滤、不排序（等价 v1.10.x 行为） |
+| `whitelist` | 只保留 `PLAY_LINE_KEEP_EXT`（默认 m3u8/mp4/flv/mkv）里的媒体直链 |
+
+```json
+{ "code": 1, "msg": "源站 非凡资源站 播放线路策略 = filter", "slug": "s70598e18b5",
+  "play_line_policy": "filter", "effective": "filter" }
+```
+
+- 为什么按源站配：只有「第 1 条线路恒为 `/share/` 分享页」的站需要过滤（如非凡资源站，
+  100% 记录如此），一刀切的全局策略会误伤本来正常的站。
+- 非法 policy → `400`；`/api/v1/sources` 每行返回 `play_line_policy` / `play_line_effective` /
+  `play_line`（读侧累计计数）。
+- 安全阀：过滤后线路数低于 `PLAY_LINE_MIN_KEEP`（默认 1）时整条影片回退未过滤结果，
+  并打一条 WARNING —— **绝不把一部片子过滤成「无线路」**。
+
+#### 存量回填 `play_from`
+
+升级后存量行的 `play_from` 为空（旧逻辑丢弃了上游值）。不影响功能（按 URL 形态判断），
+想要线路名里带 provider 才需要回填：
+
+```http
+POST /api/v1/sync/s70598e18b5?mode=backfill_play_from
+```
+
+只翻 `ac=detail` 写 `play_from` 一列，不动其它字段与水位线/断点，可中断可重跑（幂等）。
 
 ---
 
@@ -1266,6 +1349,7 @@ data class VideoDetail(
     val source: String, val vod_id: Long, val type_id: Int, val type_name: String,
     val vod_name: String, val vod_pic: String, val vod_remarks: String, val vod_time: String,
     val vod_content: String, val vod_play_url: String, val vod_play_from: String,
+    val play_from: String = "",                     // v1.11.0 上游 provider 串
     val vod_play_list: List<PlayLine>
 )
 
@@ -1431,6 +1515,12 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 | `RELATED_EVIDENCE_PRIOR` / `RELATED_EVIDENCE_NEUTRAL` | 0.6 / 0.4 | v1.10.0：证据先验强度与中性分（解决稀疏字段得分通胀） |
 | `RELATED_REQUIRE_CONTENT_SIGNAL` | true | v1.10.0：仅标题/演员/导演/编剧命中才算相似，纯分类+地区+年代不进推荐位 |
 | `RELATED_CANDIDATE_CAP` / `RELATED_BRUTE_FORCE_MAX` | 140 / 400 | v1.10.0：倒排候选上限、小表全量比较阈值（旧值 600/3000 是性能悬崖） |
+| `PLAY_LINE_POLICY` | filter | v1.11.0：全局播放线路策略 `off`/`filter`/`whitelist`（源站可单独覆盖） |
+| `PLAY_LINE_DROP_PATTERNS` | `/share/,/play/,.html,.htm` | filter 模式下判为「非播放地址」的路径特征（逗号分隔子串；`re:` 前缀按正则） |
+| `PLAY_LINE_KEEP_EXT` | m3u8,mp4,flv,mkv | whitelist 模式保留的扩展名 |
+| `PLAY_LINE_PREFER_DIRECT` / `PLAY_LINE_NAME_WITH_FROM` | true / true | 直链优先排序 / 线路名追加 provider |
+| `PLAY_LINE_MIN_KEEP` | 1 | 安全阀：过滤后低于该条数则整部回退未过滤结果 |
+| `PLAY_LINE_PROBE_HTML` | false | 对 `unknown` 地址做一次 HEAD 探测（读路径发网络请求，默认关） |
 | `RELATED_FALLBACK_LIMIT` | 6 | v1.10.0：零命中时兜底条数上限（原为 12，与真命中混排） |
 | `RELATED_RECOMPUTE_CONCURRENCY` | 2 | v1.10.0：全局最多几个源站同时整站重算（防内存叠加） |
 | `RELATED_INCREMENT_DEBOUNCE_SECONDS` / `RELATED_INCREMENT_FULL_RATIO` | 60 / 0.3 | v1.10.0：增量重算合并窗口；窗口内累计 id 超整站比例则直接整站重算 |
@@ -1443,7 +1533,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.10.1（当前） | **详情字段透出**：`/api/v1/videos/{slug}/{id}`、`?ids=` 批量详情、`?ac=detail` 列表新增 `vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag` 五个字段（恒为字符串，缺失为 `""`；普通列表模式不带）。纯新增，旧客户端无影响 |
+| v1.11.0（当前） | **播放线路识别 / 过滤 / 排序**：新增 `sources.play_line_policy` 与 `vod_*` 表的 `play_from` 列；详情响应新增 `play_from` 与 PlayLine 的 `from` / `type` / `playable` / `original_index`，过滤生效时顶层带 `play_line_filtered`；新增 `?play_raw=1`（3 个接口）与 `POST /api/v1/sources/{slug}/play-line-policy`、`?mode=backfill_play_from`；`/api/v1/stats` 新增 `play_line` 段。**行为变化**：`vod_play_list` 默认已剔除 `/share/` 这类分享页线路（`vod_play_url` 不变） |
+| v1.10.1 | **详情字段透出**：`/api/v1/videos/{slug}/{id}`、`?ids=` 批量详情、`?ac=detail` 列表新增 `vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag` 五个字段（恒为字符串，缺失为 `""`；普通列表模式不带）。纯新增，旧客户端无影响 |
 | v1.10.0 | **算法与性能升级（无破坏性字段变更）**：`/api/v1/related` 新增 `algo_version` 与卡片级 `reason`（命中原因）；仅同分类/同地区/同年代的配对不再进推荐位、兜底条数降为 6 条且不与真命中混排；`/api/v1/videos` 无筛选时 `total` 改为估值并带 `total_approximate`；`/api/v1/categories` 新增 `cached`；`/api/v1/star/related` 的 `truncated` 改精确判定；`/api/v1/star-terms` 的 `active` 改为进程内生效数。详见 `UPGRADE_2026-11-07_v1.10.x.md` |
 | v1.9.3 | `GET /healthz` 新增 `version` / `build`（镜像构建提交 SHA），便于升级/回滚核对与报障定位；无新增/变更业务接口，**客户端无需改动** |
 | v1.9.2 | **按明星查作品**：`GET /api/v1/star/works`（明星为中心，`total` 不受 limit 影响，无映射返回 200+空列表）；`star/related` 新增 `star_counts`（明星→作品数，Tab 角标）与 `truncated`（截断标志），`stars` 结构不变；`name` 匹配健壮性（空格/全半角/LIKE 转义）；词库 `aliases` 别名归一主名；`star/tags/untracked` 未入词库高频词统计 |

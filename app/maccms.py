@@ -374,6 +374,10 @@ class MacCmsClient:
             "remarks": (item.get("vod_remarks") or "").strip()[:120],
             "content": (item.get("vod_content") or "").strip(),
             "play_url": (item.get("vod_play_url") or "").strip(),
+            # 播放线路来源（v1.11.0）：上游 vod_play_from，`$$$` 分隔，与 play_url 的
+            # 线路顺序一一对应（如 "feifan$$$ffm3u8"）。旧实现在这里丢弃，导致入库后
+            # 再也分不清哪条线路是直链、哪条是 H5 分享页（后者播放必然失败）。
+            "play_from": (item.get("vod_play_from") or "").strip()[:250],
             # ---- 相关推荐信号字段（v1.9.0）：入库前清洗占位值 ----
             "vod_actor": clean_person_field(item.get("vod_actor") or "", 500),
             "vod_director": clean_person_field(item.get("vod_director") or "", 250),

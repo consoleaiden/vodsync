@@ -37,19 +37,17 @@ from sqlalchemy import func, literal, literal_column, select, union_all
 
 from . import config, database
 from .models import build_vod_table
+from .utils import DETAIL_EXTRA_COLS
 
 log = logging.getLogger("vodsync.multiquery")
 
 # 列表页需要的「瘦列」。content / play_url 是 TEXT 大字段，只在 detail 模式补当前页。
 THIN_COLS = ("vod_id", "type_id", "type_name", "name", "pic", "remarks", "vod_time")
-# 详情模式额外带出的列（v1.10.1）：演职员/地区/年代/明星标签。
+# 详情模式额外带出的列（v1.10.1 演职员/标签；v1.11.0 加 play_from）。
 # 列表模式下不带（体积敏感）；detail=True 时和 content/play_url 同一条 SQL 取回，
 # 不增加往返 —— 否则 /videos?ac=detail 的响应里 vod_actor/vod_tag 会是空串，
 # 与 /videos/{slug}/{id} 的字段含义不一致。
-DETAIL_COLS = (
-    "content", "play_url",
-    "vod_actor", "vod_director", "vod_area", "vod_year", "vod_tag",
-)
+DETAIL_COLS = ("content", "play_url") + DETAIL_EXTRA_COLS
 
 # total 缓存：key 是 slugs 元组（筛选条件下的 total 不缓存，参数太分散）
 _total_cache: dict = {}

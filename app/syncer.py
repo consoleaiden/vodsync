@@ -489,6 +489,8 @@ def set_auto_sync_bulk(enabled: bool, slugs: list = None) -> int:
 _UPSERT_COLS = [
     "vod_id", "type_id", "type_name", "name", "pic", "remarks",
     "content", "play_url",
+    # 播放线路来源（v1.11.0）：重跑全量/增量时把老行补上
+    "play_from",
     # 相关推荐信号字段（v1.9.0）：重跑全量回填时能把老行补上这些列
     "vod_actor", "vod_director", "vod_writer", "vod_area", "vod_year", "vod_tag",
     "vod_time",
@@ -496,9 +498,9 @@ _UPSERT_COLS = [
 
 # 可为空的文本列：手工构造的行（老脚本 / 测试 / 外部导入）只给必填字段时补空串。
 # 不补的话 executemany 会报 "A value is required for bind parameter 'vod_actor'"（v1.9.0 扩列后
-# 老脚本就是这样挂的）。抓取路径（extract_row）本来就带全 15 列，不受影响。
+# 老脚本就是这样挂的）。抓取路径（extract_row）本来就带全 16 列，不受影响。
 _OPTIONAL_TEXT_COLS = (
-    "type_name", "pic", "remarks", "content", "play_url",
+    "type_name", "pic", "remarks", "content", "play_url", "play_from",
     "vod_actor", "vod_director", "vod_writer", "vod_area", "vod_year", "vod_tag",
 )
 
@@ -537,6 +539,7 @@ def upsert_batch(slug: str, rows: list) -> tuple:
                 remarks=bindparam("remarks"),
                 content=bindparam("content"),
                 play_url=bindparam("play_url"),
+                play_from=bindparam("play_from"),
                 vod_actor=bindparam("vod_actor"),
                 vod_director=bindparam("vod_director"),
                 vod_writer=bindparam("vod_writer"),
@@ -552,6 +555,11 @@ def upsert_batch(slug: str, rows: list) -> tuple:
         # 明星 tag（star_tags 回填结果），源站真给了非空 tag 才更新
         update_cols["vod_tag"] = func.coalesce(
             func.nullif(stmt.excluded["vod_tag"], ""), table.c.vod_tag
+        )
+        # play_from 同理（v1.11.0）：不是每个源站都返回 vod_play_from，空值不该把
+        # 之前存下的 provider 串擦掉；真给了新值才覆盖。
+        update_cols["play_from"] = func.coalesce(
+            func.nullif(stmt.excluded["play_from"], ""), table.c.play_from
         )
         stmt = stmt.on_conflict_do_update(index_elements=["vod_id"], set_=update_cols)
         conn.execute(stmt, rows)
@@ -743,6 +751,70 @@ def full_sync(slug: str, client: MacCmsClient) -> dict:
 
     _finish_full(slug, class_map)
     log.info("[%s] 全量同步完成: %s", slug, stats)
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# 播放线路来源回填（v1.11.0）—— 只写 play_from 一列
+#
+# 存量 657 万行的 play_from 是空的（旧抓取逻辑丢弃了上游 vod_play_from）。
+# 不做整站全量重抓：这里只翻 ac=detail，把 (vod_id, vod_play_from) 取出来，
+# 逐页 UPDATE 这一列 —— 不碰 play_url/封面/演职员，不动水位线与断点，
+# 中途中断完全无害（幂等，重跑一遍即可）。
+# ---------------------------------------------------------------------------
+def backfill_play_from(slug: str, client: MacCmsClient) -> dict:
+    with database.engine.connect() as conn:
+        src = get_source(conn, slug)
+        if not src:
+            raise MacCmsError(f"源站 {slug} 不存在")
+        api = src["api_url"]
+
+    stats = {"fetched": 0, "inserted": 0, "updated": 0, "pages": 0}
+    first = client.fetch_page(api, "detail", 1)
+    pagecount = int(first.get("pagecount") or 0)
+    if pagecount <= 0:
+        stats["error"] = "源站未返回页数，无法回填"
+        return stats
+
+    table = build_vod_table(slug)
+    stmt = (
+        table.update()
+        .where(table.c.vod_id == bindparam("b_id"))
+        .values(play_from=bindparam("b_play_from"))
+    )
+    log.info("[%s] 播放线路回填开始: %d 页", slug, pagecount)
+    written = 0
+    for pg in range(1, pagecount + 1):
+        # 复用「全量」这层暂停开关：回填本质上就是一次全量翻页
+        if should_stop(slug, "full"):
+            stats["paused"] = True
+            stats["incomplete"] = True
+            stats["error"] = f"回填已暂停于第 {pg}/{pagecount} 页（可重跑，幂等）"
+            return stats
+        payload = first if pg == 1 else client.fetch_page(api, "detail", pg)
+        items = payload.get("list") or []
+        stats["fetched"] += len(items)
+        pairs = []
+        for it in items:
+            try:
+                vid = int(it.get("vod_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            pf = (it.get("vod_play_from") or "").strip()[:250]
+            # 上游没给 play_from 的行直接跳过：不能拿空串把已有值擦掉
+            if vid and pf:
+                pairs.append({"b_id": vid, "b_play_from": pf})
+        if pairs:
+            with database.write_txn() as conn:
+                conn.execute(stmt, pairs)
+            written += len(pairs)
+        stats["pages"] += 1
+        if pg % 20 == 0:
+            log.info("[%s] 播放线路回填进度: %d/%d 页，已写 %d 行", slug, pg, pagecount, written)
+        time.sleep(0.05)
+
+    stats["updated"] = written
+    log.info("[%s] 播放线路回填完成: %d 页，%d 行", slug, stats["pages"], written)
     return stats
 
 
@@ -1233,7 +1305,10 @@ def sync_source(slug: str, mode: str = "auto") -> dict:
         src = get_source(conn, slug)
     if not src:
         raise MacCmsError(f"源站 {slug} 不存在")
-    if mode == "auto":
+    # 回填模式（v1.11.0）：只补 play_from 一列，既不推进水位线也不动断点
+    if mode in ("backfill", "backfill_play_from"):
+        mode = "backfill"
+    elif mode == "auto":
         mode = "full" if not src["watermark"] or src["last_page"] else "incremental"
 
     # ---- 暂停检查：入口处直接受理为"已暂停"，不启动网络请求 ----
@@ -1258,6 +1333,8 @@ def sync_source(slug: str, mode: str = "auto") -> dict:
                 ensure_table(slug)
                 if mode == "full":
                     stats = full_sync(slug, client)
+                elif mode == "backfill":
+                    stats = backfill_play_from(slug, client)
                 else:
                     stats = incremental_sync(slug, client)
                 # 三种终态：完成 / 用户暂停 / 部分完成（有页/有记录没抓到，但断点与水位线都安全）
@@ -1269,7 +1346,9 @@ def sync_source(slug: str, mode: str = "auto") -> dict:
                     status = "success"
                 _finish_log(log_id, status, stats)
                 _apply_health(slug, status, stats)
-                _kick_related(slug, mode, stats)
+                if mode != "backfill":
+                    # 回填只动 play_from，不影响任何推荐信号，没必要触发重算
+                    _kick_related(slug, mode, stats)
                 return {"slug": slug, "mode": mode, "status": status, **stats}
             except Exception as e:
                 log.exception("[%s] 同步失败", slug)

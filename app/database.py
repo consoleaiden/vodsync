@@ -148,6 +148,8 @@ def _migrate():
         # 健康度退避（v1.8.1）
         ("sources", "fail_streak", "INTEGER DEFAULT 0"),
         ("sources", "skip_until", "TIMESTAMP"),
+        # 播放线路策略覆盖（v1.11.0）：inherit / off / filter / whitelist
+        ("sources", "play_line_policy", "VARCHAR(16) DEFAULT 'inherit'"),
         # 明星词库别名（v1.9.2）：逗号分隔，命中后归一到主名
         ("star_terms", "aliases", "VARCHAR(512) DEFAULT ''"),
     ]
@@ -175,6 +177,10 @@ def _migrate():
         ("vod_area", "VARCHAR(64) DEFAULT ''"),
         ("vod_year", "VARCHAR(16) DEFAULT ''"),
         ("vod_tag", "VARCHAR(255) DEFAULT ''"),
+        # 播放线路来源（v1.11.0）：上游 vod_play_from 原始串。
+        # 存量 657 万行补完是空串 —— 读路径按「没这个信息」处理，不需要重同步，
+        # 回填走 POST /api/v1/sync/{slug}?mode=backfill_play_from（只写这一列）。
+        ("play_from", "TEXT DEFAULT ''"),
     ]
     for tname in sorted(existing_tables):
         if not tname.startswith("vod_") or tname == "vod_related":

@@ -22,6 +22,7 @@
 - **按明星查作品**（v1.9.2）：`/api/v1/star/works` 以明星为中心返回完整作品（`total` 不受 limit 影响），配合 `/star/related` 的 `star_counts` 角标与 `truncated` 标志，客户端可直接做「全部 / 按明星」Tab；词库支持别名（多译名归一主名）
 - **推荐算法 v2**（v1.10.0）：证据先验 + 内容信号门控，修掉「仅同分类的不相关影片拿高分」；演员改余弦相似度抑制客串；整站重算 **3.9×**；无筛选列表 `total` 走估值
 - **详情字段透出**（v1.10.1）：详情与批量详情返回 `vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag`，NAS 模式下演员与标签不再无数据
+- **播放线路过滤**（v1.11.0）：入库保留上游 `vod_play_from`，读接口识别线路类型（m3u8/mp4/flv/mkv/page/unknown）并剔除 `/share/` 这类「H5 分享页」——这类线路返回 text/html、真实地址由页面 JS 生成且带过期 sign，客户端按顺序选第一条必然播不出来；可按源站覆盖策略，`vod_play_url` 原始串不改写，`?play_raw=1` 可排障
 
 > 文档入口：[`docs/README.md`](docs/README.md)（按用途索引全部文档）
 
@@ -396,6 +397,14 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
 | `MERGE_CONCURRENCY` | 4 | 列表归并的并行度（每线程占一个连接，别超过 `DB_POOL_SIZE`） |
 | `TOTAL_CACHE_SECONDS` | 60 | 列表 total 的缓存秒数（0 = 每次实时 count） |
 | `TOTAL_APPROXIMATE_ENABLED` | true | 无筛选列表的 total 用 `SUM(sources.total_videos)` 估值（响应带 `total_approximate`） |
+| `PLAY_LINE_POLICY` | filter | 播放线路策略 `off` / `filter` / `whitelist`（源站可单独覆盖，面板下拉） |
+| `PLAY_LINE_DROP_PATTERNS` | `/share/,/play/,.html,.htm` | filter 模式判为「非播放地址」的路径特征（`re:` 前缀按正则） |
+| `PLAY_LINE_KEEP_EXT` | m3u8,mp4,flv,mkv | whitelist 模式保留的扩展名 |
+| `PLAY_LINE_PREFER_DIRECT` | true | 直链优先排序（同类型内保持上游顺序） |
+| `PLAY_LINE_NAME_WITH_FROM` | true | 线路名追加 provider：「线路2 (ffm3u8)」 |
+| `PLAY_LINE_MIN_KEEP` | 1 | 安全阀：过滤后低于该条数则整部回退未过滤结果 |
+| `PLAY_LINE_PROBE_HTML` | false | 对 unknown 地址做 HEAD 探测（读路径发请求，默认关；超时 `PLAY_LINE_PROBE_TIMEOUT`=1.5s） |
+| `PLAY_LINE_POLICY_CACHE_SECONDS` | 30 | 源站级策略缓存（面板改下拉立即失效，此项只兜底多进程/直接改库） |
 | `CATEGORIES_CACHE_SECONDS` | 300 | 分类清单缓存秒数（0 = 不缓存） |
 | `PG_TRGM_ENABLED` | true | 启动后台建 `pg_trgm` GIN 搜索索引（不锁表；无权限只记日志） |
 | `RELATED_ALGO_VERSION` | 2 | 算法版本，改动即清空旧结果并重算（回滚到 1.9.x 请设回 `1`） |
@@ -527,6 +536,7 @@ vodsync/
     ├── deploy-synology.md            # 群晖部署
     ├── APP_TOKEN_UPGRADE.md          # 给已有 App 加 API Token 的施工单（交给 AI 执行）
     ├── UPGRADE_2026-11-07_v1.10.x.md # v1.9.3 → v1.10.x 升级报告（前端对接清单）
+    ├── UPGRADE_2026-11-07_v1.11.0.md # v1.10.x → v1.11.0 升级报告（播放线路过滤）
     ├── REVIEW_2026-11-07.md          # 代码审查报告（v1.9.3 基线，问题已全部落地）
     ├── REVIEW_2026-11-03.md          # 复盘报告（v1.5.2 基线，已在 v1.6.0 修复）
     └── RESPONSE_ENCRYPTION_PLAN.md   # 响应加密/请求签名方案（规划稿，未实施）
@@ -535,6 +545,30 @@ vodsync/
 ## 变更记录
 
 > 按版本号**从新到旧**排列，最新版本在最前。历史版本只做归档记录，细节以对应版本的代码与文档为准。
+
+### v1.11.0
+播放线路识别 / 过滤 / 排序（需求源自线上：非凡资源站 100% 记录的线路 1 是 H5 分享页，
+客户端自动选源必然播放失败）。
+
+- **入库保留线路来源**：`vod_*` 表新增 `play_from`（上游 `vod_play_from` 原样保存，
+  `$$$` 分隔与 `play_url` 对齐）；存量 657 万行留空不影响功能（按 URL 形态判断），
+  需要时用 `POST /api/v1/sync/{slug}?mode=backfill_play_from` 只回填这一列
+- **线路类型识别**：`classify_play_line()` 纯函数按 URL path 判 `m3u8`/`mp4`/`flv`/`mkv`/
+  `page`/`unknown`（`.m3u8` 结尾优先于路径黑名单 —— 避免 `/play/xxx/index.m3u8` 被误杀）
+- **读时过滤 + 排序**：`parse_play_url()` 保持旧签名，新增 `from`/`type`/`playable`/
+  `original_index`；默认剔除分享页线路、直链优先排序，**安全阀**保证绝不过滤成「无线路」
+- **源站级覆盖**：`sources.play_line_policy`（inherit/off/filter/whitelist）+ 面板下拉，
+  只有需要的站开 `filter`，其它站不受影响
+- **接口**：3 个详情类接口支持 `?play_raw=1`（原始列表）；真过滤时顶层带
+  `play_line_filtered: true`；`/api/v1/stats` 新增 `play_line` 段（读侧累计）
+- `vod_play_url` **永不改写**，老客户端零改动即受益（线路从 2 条变 1 条且可播）
+- 测试：`scripts/test_v1110_playline.py`（77 项，覆盖需求第 5 节全部验收标准）
+
+完整对接说明（前端要改什么、怎么排障、回填怎么做）见
+[`docs/UPGRADE_2026-11-07_v1.11.0.md`](docs/UPGRADE_2026-11-07_v1.11.0.md)。
+
+**升级步骤（v1.10.x → v1.11.0）**：`docker compose pull vodsync && docker compose up -d`。
+补列在启动时自动完成，无需手工 SQL、无需重新同步；`/healthz` 应返回 `"version":"1.11.0"`。
 
 ### v1.10.1
 详情接口透出演职员与明星标签：NAS 模式下「演员/标签」不再无数据。

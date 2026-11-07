@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.10.1"
+    "version": "1.11.0"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -466,6 +466,55 @@
         }
       }
     },
+    "/api/v1/sources/{slug}/play-line-policy": {
+      "post": {
+        "summary": "Set Play Line Policy",
+        "description": "设置单个源站的播放线路策略（v1.11.0，持久化，立即生效）。\n\n为什么按源站配：只有「第 1 条线路恒为 /share/ 分享页」这类站点需要过滤\n（如非凡资源站，100% 记录如此），一刀切的全局策略会误伤本来正常的站。\n默认 `inherit` 跟随 `PLAY_LINE_POLICY`，其余站点不必动。\n\n只影响读接口的 `vod_play_list`，不重写 `vod_play_url`，也不需要重新同步。",
+        "operationId": "set_play_line_policy_api_v1_sources__slug__play_line_policy_post",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Slug"
+            }
+          },
+          {
+            "name": "policy",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "inherit=跟随全局 / off=不过滤 / filter=剔除分享页线路 / whitelist=只保留媒体直链",
+              "title": "Policy"
+            },
+            "description": "inherit=跟随全局 / off=不过滤 / filter=剔除分享页线路 / whitelist=只保留媒体直链"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/sources/{slug}/pause": {
       "post": {
         "summary": "Pause One Source",
@@ -768,7 +817,7 @@
     "/api/v1/sync/{slug}": {
       "post": {
         "summary": "Trigger Sync",
-        "description": "手动触发单源站同步（后台执行，立即返回受理结果）。\n\n并发受全局闸门（SOURCE_SYNC_CONCURRENCY）限制：名额已满时任务进入排队，\n同一源站已在排队/运行时不会重复提交（返回 status=already_running）。",
+        "description": "手动触发单源站同步（后台执行，立即返回受理结果）。\n\n并发受全局闸门（SOURCE_SYNC_CONCURRENCY）限制：名额已满时任务进入排队，\n同一源站已在排队/运行时不会重复提交（返回 status=already_running）。\n\n`mode=backfill_play_from`（v1.11.0）：只翻 ac=detail 把上游 `vod_play_from`\n回填进库（只写这一列），不动其它字段、不推进水位线、不动断点，可中断可重跑。\n存量库刚升级时用它补齐 provider 信息；不回填也能正常工作（只按 URL 形态判断）。",
         "operationId": "trigger_sync_api_v1_sync__slug__post",
         "parameters": [
           {
@@ -786,10 +835,12 @@
             "required": false,
             "schema": {
               "type": "string",
-              "pattern": "^(auto|full|incremental)$",
+              "pattern": "^(auto|full|incremental|backfill|backfill_play_from)$",
+              "description": "auto / full / incremental / backfill_play_from（只回填播放线路来源）",
               "default": "auto",
               "title": "Mode"
-            }
+            },
+            "description": "auto / full / incremental / backfill_play_from（只回填播放线路来源）"
           }
         ],
         "responses": {
@@ -1023,7 +1074,7 @@
     "/api/v1/videos": {
       "get": {
         "summary": "Video List",
-        "description": "视频列表 / 批量详情。\n\n四种用法：\n  1. 列表：      /api/v1/videos?source=jkun&page=1&page_size=20\n  2. 批量详情：  /api/v1/videos?source=jkun&ids=134369       （含 vod_play_url）\n  3. 完整列表：  /api/v1/videos?source=jkun&ac=detail         （列表带播放地址）\n  4. 分类浏览：  /api/v1/videos?source=jkun&type_id=6         （配合 /api/v1/categories）\n\nv1.10.1（纯新增）：详情模式（`ids=` 批量 / `ac=detail` 列表）额外返回\n`vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag` 五个字段，\n恒为字符串（库里 NULL 也返回 \"\"），普通列表模式不带（控制体积）。\n\nv1.10.0（纯新增）：不带筛选条件的全站列表（无 wd / type_id / type_name / ids）\n的 `total` 改为估值，并在响应里带 `total_approximate: true`。\n出处是 sources.total_videos（后台同步一直维护），省掉 52 张表各跑一次 count(*)。\n`pagecount` 随之由估值算出，翻到末页可能有 1~2 页偏差；带筛选时仍是精确值。\n客户端若做「共 N 条 / 最后一页」的强展示，请判断该字段后自行降级为「约 N 条」。",
+        "description": "视频列表 / 批量详情。\n\n四种用法：\n  1. 列表：      /api/v1/videos?source=jkun&page=1&page_size=20\n  2. 批量详情：  /api/v1/videos?source=jkun&ids=134369       （含 vod_play_url）\n  3. 完整列表：  /api/v1/videos?source=jkun&ac=detail         （列表带播放地址）\n  4. 分类浏览：  /api/v1/videos?source=jkun&type_id=6         （配合 /api/v1/categories）\n\nv1.11.0（播放线路）：默认按 `PLAY_LINE_POLICY`（源站可覆盖）过滤掉\n`/share/`、`/play/`、`.html` 这类「H5 分享页」线路 —— 它们返回 text/html，\n真实流地址由页面 JS 生成且带会过期的 sign，客户端直接播必然失败。\n`vod_play_url` 原始串不变；过滤只作用于结构化的 `vod_play_list`\n（每条线路新增 `from` / `type` / `playable` / `original_index`）。\n默认响应若真的过滤掉了线路，顶层带 `play_line_filtered: true`；\n`play_raw=1` 可拿到未过滤的原始列表（排障用，同时关闭排序）。\n\nv1.10.1（纯新增）：详情模式（`ids=` 批量 / `ac=detail` 列表）额外返回\n`vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag` 五个字段，\n恒为字符串（库里 NULL 也返回 \"\"），普通列表模式不带（控制体积）。\n\nv1.10.0（纯新增）：不带筛选条件的全站列表（无 wd / type_id / type_name / ids）\n的 `total` 改为估值，并在响应里带 `total_approximate: true`。\n出处是 sources.total_videos（后台同步一直维护），省掉 52 张表各跑一次 count(*)。\n`pagecount` 随之由估值算出，翻到末页可能有 1~2 页偏差；带筛选时仍是精确值。\n客户端若做「共 N 条 / 最后一页」的强展示，请判断该字段后自行降级为「约 N 条」。",
         "operationId": "video_list_api_v1_videos_get",
         "parameters": [
           {
@@ -1100,6 +1151,20 @@
             "description": "按 ID 批量取详情（逗号分隔），返回含播放地址"
           },
           {
+            "name": "play_raw",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1,
+              "minimum": 0,
+              "description": "v1.11.0：1=不做线路过滤/排序，返回原始 vod_play_list（排障用）",
+              "default": 0,
+              "title": "Play Raw"
+            },
+            "description": "v1.11.0：1=不做线路过滤/排序，返回原始 vod_play_list（排障用）"
+          },
+          {
             "name": "page",
             "in": "query",
             "required": false,
@@ -1152,7 +1217,7 @@
     "/api/v1/videos/{slug}/{vod_id}": {
       "get": {
         "summary": "Video Detail",
-        "description": "视频详情（含结构化播放地址列表）。RELATED_IN_DETAIL=true 时附带 related 推荐数组。\n\nv1.10.1（纯新增）：返回 `vod_actor` / `vod_director` / `vod_area` / `vod_year` /\n`vod_tag` 五个字段 —— 列 v1.9.0 起就在库里，之前没透出，NAS 模式的客户端拿不到\n演员与明星标签。字段恒为字符串（缺失/NULL 为 \"\"），客户端不必判 null。",
+        "description": "视频详情（含结构化播放地址列表）。RELATED_IN_DETAIL=true 时附带 related 推荐数组。\n\nv1.11.0（播放线路）：`vod_play_list` 默认已过滤掉 `/share/`、`/play/`、`.html`\n这类「H5 分享页」线路（返回 text/html，真实流地址由 JS 生成且带过期 sign）。\n每条线路带 `from`（上游 provider）/`type`/`playable`/`original_index`；\n`vod_play_url` 原始串不变。真的过滤掉线路时响应顶层带 `play_line_filtered: true`。\n\nv1.10.1（纯新增）：返回 `vod_actor` / `vod_director` / `vod_area` / `vod_year` /\n`vod_tag` 五个字段 —— 列 v1.9.0 起就在库里，之前没透出，NAS 模式的客户端拿不到\n演员与明星标签。字段恒为字符串（缺失/NULL 为 \"\"），客户端不必判 null。",
         "operationId": "video_detail_api_v1_videos__slug___vod_id__get",
         "parameters": [
           {
@@ -1172,6 +1237,20 @@
               "type": "integer",
               "title": "Vod Id"
             }
+          },
+          {
+            "name": "play_raw",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1,
+              "minimum": 0,
+              "description": "v1.11.0：1=不做线路过滤/排序，返回原始 vod_play_list（排障用）",
+              "default": 0,
+              "title": "Play Raw"
+            },
+            "description": "v1.11.0：1=不做线路过滤/排序，返回原始 vod_play_list（排障用）"
           }
         ],
         "responses": {
@@ -1866,7 +1945,7 @@
     "/api/v1/{slug}": {
       "get": {
         "summary": "Maccms Compat",
-        "description": "与苹果 CMS 采集接口输出结构一致：\n  ?ac=list   -> {code,page,pagecount,limit,total,class,list:[轻量字段]}\n  ?ac=detail -> {code,page,pagecount,limit,total,class,list:[全字段含播放地址]}",
+        "description": "与苹果 CMS 采集接口输出结构一致：\n  ?ac=list   -> {code,page,pagecount,limit,total,class,list:[轻量字段]}\n  ?ac=detail -> {code,page,pagecount,limit,total,class,list:[全字段含播放地址]}\n\nv1.11.0：`vod_play_list` 已按策略过滤（默认剔除 /share/、/play/、.html 这类\n分享页线路），`vod_play_url` 原始串保持不变 —— 采集端若自己解析原始串，\n行为与旧版完全一致；用 vod_play_list 的客户端自动拿到可播线路。",
         "operationId": "maccms_compat_api_v1__slug__get",
         "parameters": [
           {
@@ -1921,6 +2000,20 @@
               "default": "",
               "title": "Wd"
             }
+          },
+          {
+            "name": "play_raw",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1,
+              "minimum": 0,
+              "description": "v1.11.0：1=不做线路过滤/排序（排障用）",
+              "default": 0,
+              "title": "Play Raw"
+            },
+            "description": "v1.11.0：1=不做线路过滤/排序（排障用）"
           },
           {
             "name": "page",

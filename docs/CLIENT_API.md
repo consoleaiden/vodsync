@@ -5,7 +5,7 @@
 > 本文档面向「调用 VodSync 服务的客户端 App」（原生 App / H5 / 小程序 / 播放器 / 采集器均可）。
 > 目标：一个 AI 客户端开发者（或 AI 编程助手）拿这份文档即可完成全部对接，无需阅读服务端代码。
 >
-> 对应服务版本：**v1.10.1** ｜ 文档版本：`2026-11-07` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.11.0** ｜ 文档版本：`2026-11-07` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 ---
 
@@ -193,7 +193,8 @@ GET /api/v1/videos?source=jkun&type_id=6&page=1
 GET /api/v1/videos?source=jkun&type_name=电影
 ```
 
-**通用可选参数**：`wd`（名称模糊搜索）、`type_name`、`type_id`、`page`、`page_size`
+**通用可选参数**：`wd`（名称模糊搜索）、`type_name`、`type_id`、`page`、`page_size`、
+`play_raw`（v1.11.0：`1`=返回未过滤的原始播放线路，排障用）
 
 **列表模式响应**（①④，轻量字段，无播放地址）：
 
@@ -218,21 +219,35 @@ GET /api/v1/videos?source=jkun&type_name=电影
 ```json
 {
   "vod_content": "简介文本...",
-  "vod_play_url": "线路1$第01集$https://.../e1.m3u8#第02集$https://.../e2.m3u8",
-  "vod_play_from": "vodsync",
+  "vod_play_url": "第01集$https://.../share/e5c6...$$$第01集$https://.../index.m3u8#...",
+  "vod_play_from": "vodsync",          // MacCMS 兼容字段，常量
+  "play_from": "feifan$$$ffm3u8",      // v1.11.0：上游 provider 串（未回填时为空串）
   "vod_play_list": [
     {
-      "name": "线路1",
+      "name": "线路1 (ffm3u8)",        // v1.11.0：编号是过滤后的序号，括号内是 provider
+      "from": "ffm3u8",                // v1.11.0
+      "type": "m3u8",                  // v1.11.0：m3u8/mp4/flv/mkv/page/unknown
+      "playable": true,                // v1.11.0：type != "page"
+      "original_index": 1,             // v1.11.0：在上游 vod_play_url 里的下标（0 基）
       "episodes": [
-        { "name": "第01集", "url": "https://.../e1.m3u8" },
-        { "name": "第02集", "url": "https://.../e2.m3u8" }
+        { "name": "第01集", "url": "https://.../index.m3u8" },
+        { "name": "第02集", "url": "https://.../index2.m3u8" }
       ]
     }
   ]
 }
 ```
 
-**播放地址使用建议**：优先取 `vod_play_list[*].episodes[*].url`（已结构化）；`vod_play_url` 是源站原始串仅作兜底。地址多为 m3u8 直链，可直接交给播放器内核。
+**播放地址使用建议**：优先取 `vod_play_list[*].episodes[*].url`（已结构化且**已过滤掉不可播的分享页线路**）；
+`vod_play_url` 是源站原始串仅作兜底。地址多为 m3u8 直链，可直接交给播放器内核。
+
+> **v1.11.0：`vod_play_list` 默认已过滤。** 部分源站的第 1 条线路是 H5 分享页
+> （`/share/<hash>` → 返回 `text/html`，真实地址由页面 JS 生成且带会过期的 `sign`），
+> 播放器直接播必然失败。服务端现在默认把这类线路剔除，客户端「选第一条线路」就能播。
+> - 真的过滤掉时，响应顶层多一个 `"play_line_filtered": true`（诊断用，可忽略）；
+> - `?play_raw=1` 可拿到未过滤的原始列表（排障）；
+> - `vod_play_url` **从未被改写**，自己解析原始串的逻辑不受影响；
+> - 客户端若缓存线路列表，请按 `original_index` 对齐，别用 `name`（编号会随过滤变化）。
 
 > **v1.10.0：`total` 可能是估值。** 不带 `wd` / `type_id` / `type_name` / `ids` 的全站列表，`total` 改为取 `SUM(sources.total_videos)`（后台同步一直维护的数字），并在响应里带 `"total_approximate": true`，省掉 52 张表各跑一次 `count(*)`。
 > 影响：`total` 与 `pagecount` 可能有 1~2 页级别的偏差（翻到最末页才看得出来）。带筛选条件时仍是精确值。
@@ -250,6 +265,11 @@ GET /api/v1/videos/jkun/134369
 ```
 
 响应 `{"code":1, "detail": { ...详情字段，同 3.3 详情模式... }}`。不存在返回 404。
+
+> **v1.11.0：播放线路默认已过滤**（同 3.3）。`detail.vod_play_list` 里不会再出现
+> `/share/` 这类 H5 分享页；每条线路多 `from` / `type` / `playable` / `original_index`，
+> `detail.play_from` 是上游 provider 串；真过滤了线路时响应顶层带 `"play_line_filtered": true`。
+> `?play_raw=1` 返回未过滤列表。
 
 > **v1.10.1：详情多了 5 个字段**（纯新增，旧客户端忽略即可）：
 > `vod_actor`（演员，逗号分隔）、`vod_director`（导演）、`vod_area`（地区）、
@@ -398,7 +418,7 @@ GET /api/v1/star/works?slug=jkun&term=吴京&limit=30&exclude_id=134369
 ### 3.8 管理接口详情
 
 #### GET `/healthz`
-`{"status":"ok","db":true,"version":"1.9.3","build":"7b44587...","time":"..."}`；**免鉴权**（容器健康检查用），不反映业务状态。
+`{"status":"ok","db":true,"version":"1.11.0","build":"<40 位提交 SHA>","time":"..."}`；**免鉴权**（容器健康检查用），不反映业务状态。
 `version`/`build` 是服务端版本与构建提交，可在「关于」页展示，便于用户报障时定位版本。
 
 #### GET `/api/v1/stats`
@@ -413,6 +433,13 @@ GET /api/v1/star/works?slug=jkun&term=吴京&limit=30&exclude_id=134369
   "pause": {
     "global": false, "full": false, "incremental": false,
     "updated_at": { "full": "2026-10-30T14:08:30" }
+  },
+  "play_line": {                       // v1.11.0：播放线路过滤（本次进程启动以来的累计值）
+    "policy": "filter",                // 全局策略
+    "filtered_total": 148,             // 累计剔除的线路上数
+    "fallback_total": 2,               // 触发安全阀（整部回退）的次数
+    "page_lines_total": 150,           // 识别出的分享页线路总数
+    "lines_total": 4200, "uptime_seconds": 3600
   },
   "last_error": { "slug": "t1", "error": "timeout...", "at": "..." } | null,
   "server_time": "..."
@@ -507,9 +534,17 @@ POST /api/v1/sources/auto-sync?enabled=true&slugs=jkun,t1  # 只开启指定站
     "last_page": 120, "total_pages": 6710, // 断点位置
     "paused": false,                       // 单源站暂停标记（持久化）
     "paused_at": null,
-    "last_sync_at": "2026-10-30T13:00:30"
+    "last_sync_at": "2026-10-30T13:00:30",
+    // ---- v1.11.0：播放线路策略 ----
+    "play_line_policy": "inherit",         // inherit / off / filter / whitelist
+    "play_line_effective": "filter",       // 实际生效值（inherit 时取全局）
+    "play_line": { "lines": 120, "dropped": 118, "fallback": 0 }  // 读侧累计（进程内，重启清零）
 }]}
 ```
+
+> **v1.11.0 单源站线路策略**：`POST /api/v1/sources/{slug}/play-line-policy?policy=filter`
+> （`inherit`/`off`/`filter`/`whitelist`，非法值 400）。只有「第 1 条线路恒为分享页」的站
+> （如非凡资源站）需要设 `filter`，其余保持 `inherit`；改了立即生效，无需重新同步。
 
 > **`running` 与 `syncing` 的区别（客户端务必分清）**：
 > - `running=true` → 该源站此刻正在执行同步，**只有此时才应显示「暂停」按钮**
@@ -522,10 +557,12 @@ POST /api/v1/sources/auto-sync?enabled=true&slugs=jkun,t1  # 只开启指定站
 #### POST `/api/v1/sources/refresh`（可选 `?full_sync=true`）
 `{"code":1,"new_sources":["新站slug",...],"full_sync_started":false}`
 
-#### POST `/api/v1/sync/{slug}?mode=auto|full|incremental`
+#### POST `/api/v1/sync/{slug}?mode=auto|full|incremental|backfill_play_from`
 - `auto`：有数据走增量，无数据走全量（**推荐默认**）
 - `full`：从第 1 页重新全量（支持断点续传）
 - `incremental`：仅增量
+- `backfill_play_from`（v1.11.0）：只回填播放线路来源（`play_from`）一列，
+  不动其它字段/水位线/断点，可中断可重跑。存量库升级后按需对个别源站执行
 
 #### POST `/api/v1/sync-all?mode=auto|full|incremental`
 同上，作用于全部启用源站（后台逐站执行）。

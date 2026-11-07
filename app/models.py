@@ -84,6 +84,14 @@ sources = Table(
     Column("fail_streak", Integer, default=0, server_default="0"),
     # 退避截止时间：调度器跳过 skip_until > now 的源站（手动触发不受限）。
     Column("skip_until", DateTime),
+    # ---- 播放线路策略覆盖（v1.11.0）----
+    # inherit  跟随全局 PLAY_LINE_POLICY（默认，其他站不受影响）
+    # off      该站不过滤（源站线路本来就是直链，或用户想原样下发）
+    # filter   该站按黑名单剔除 page 型线路
+    # whitelist 该站只保留媒体直链
+    # 为什么按源站配：只有「第 1 条线路恒为 /share/ 分享页」这类站点需要过滤，
+    # 一刀切的全局策略会误伤本来正常的站。
+    Column("play_line_policy", String(16), default="inherit", server_default="inherit"),
     Column("last_sync_at", DateTime),                     # 最近一次成功同步时间
     Column("created_at", DateTime, server_default=func.now()),
     Column("updated_at", DateTime, server_default=func.now(), onupdate=func.now()),
@@ -225,6 +233,11 @@ def build_vod_table(slug: str) -> Table:
             Column("vod_area", String(64), default=""),
             Column("vod_year", String(16), default=""),
             Column("vod_tag", String(255), default=""),
+            # ---- 播放线路来源（v1.11.0）----
+            # 上游 vod_play_from 原样保存（"feifan$$$ffm3u8"，与 play_url 的线路顺序一一对应）。
+            # 这是「哪条线路是可播直链」的唯一权威信息：旧实现入库时把它丢了，只能靠 URL 形态猜。
+            # 存量行该列为空串 —— 读路径必须容忍（play_from 空 → 只按 URL 形态判断）。
+            Column("play_from", Text, default=""),
             Column("vod_time", String(32), default=""),
             Column("synced_at", DateTime, server_default=func.now()),
             # v1.10.0 / C14：这里原来还有一个 UniqueConstraint("vod_id")，
