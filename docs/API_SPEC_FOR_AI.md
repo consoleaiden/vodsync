@@ -3,7 +3,7 @@
 > **本文档的用途**：把 VodSync 服务作为后端，交由 AI（或 AI 编程助手）开发客户端 App。
 > 文档自包含：只读本文即可完成全部对接，**不需要**阅读服务端源码。
 >
-> 对应服务版本：**v1.12.0** ｜ 文档版本：`2026-11-09` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.12.1** ｜ 文档版本：`2026-11-09` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 **目录**
 
@@ -283,7 +283,7 @@ type PlayLine = {
 | 34 | GET | `/api/v1/related` | 数据 | **相关推荐**（预计算直读，P95<50ms） |
 | 35 | GET | `/api/v1/related/status` | 管理 | 各源站推荐覆盖率 |
 | 36 | GET/POST | `/api/v1/star-terms` | 管理 | 明星词库查询/批量添加（面板用） |
-| 37 | PATCH/DELETE | `/api/v1/star-terms/{id}` | 管理 | 词条改名/启停/删除（面板用） |
+| 37 | PATCH/DELETE | `/api/v1/star-terms/{term_id}` | 管理 | 词条改名/启停/删除（面板用） |
 | 38 | POST | `/api/v1/star-terms/recompute` | 管理 | 词库变更后全量重算推荐（面板用） |
 | 39 | POST | `/api/v1/maintenance/related-recompute` | 管理 | 手动重算指定/全部源站推荐 |
 | 40 | GET | `/api/v1/star/related` | 业务 | 明星作品推荐：与目标视频共享明星的其他视频 |
@@ -303,7 +303,7 @@ type PlayLine = {
 ### 4.1 GET `/healthz`
 
 ```json
-{ "status": "ok", "db": true, "version": "1.11.0", "build": "4f249a7299d30827c1e785173d7d5a63a22191ca", "time": "2026-11-07T10:20:31.882914" }
+{ "status": "ok", "db": true, "version": "1.12.1", "build": "<commit sha>", "time": "2026-11-09T09:07:31.882914" }
 ```
 
 用途：服务可用性探测 + 判断是否启用 API Key（见 2.1）。
@@ -1109,8 +1109,8 @@ GET /api/v1/related?slug=jkun&id=134369&limit=8
 |---|---|---|
 | GET | `/api/v1/star-terms` | 词库清单 + `infer_mode`/`factor`/`active` 生效数 |
 | POST | `/api/v1/star-terms` | 批量添加。`{"terms": "..."}` **格式自动识别**：JSON 数组 / 带引号片段 `"名字",` / 逗号、全角逗号、顿号、竖线、换行分隔 |
-| PATCH | `/api/v1/star-terms/{id}` | 改名/备注/启停：`{"term": "...", "note": "...", "enabled": false}` |
-| DELETE | `/api/v1/star-terms/{id}` | 删除词条 |
+| PATCH | `/api/v1/star-terms/{term_id}` | 改名/备注/启停：`{"term": "...", "note": "...", "enabled": false}` |
+| DELETE | `/api/v1/star-terms/{term_id}` | 删除词条 |
 | POST | `/api/v1/star-terms/recompute` | 词库变更后对全部源站重算推荐（后台） |
 | POST | `/api/v1/maintenance/related-recompute?slug=all` | 手动重算指定/全部源站推荐 |
 
@@ -1194,7 +1194,7 @@ GET /api/v1/related?slug=jkun&id=134369&limit=8
 `{sample_titles, candidates:[{term, count}]}`。结果 10 分钟缓存；
 **是候选不是结论**，请人工确认后加入词库（自动入库会把噪声写进词库）。
 
-**词库别名（v1.9.2）**：`star_terms.aliases` 逗号分隔，`PATCH /api/v1/star-terms/{id}`
+**词库别名（v1.9.2）**：`star_terms.aliases` 逗号分隔，`PATCH /api/v1/star-terms/{term_id}`
 的 `{"aliases": "京哥,Wu Jing"}` 可维护。别名参与匹配（标题扫描 + 演员交集），
 命中后统一归一到主名 —— `star_map.term` / `vod_tag` 只存主名，避免同一演员
 多译名把作品拆散。别名变更后同样需 `POST /api/v1/star-terms/recompute` 生效。
@@ -1211,10 +1211,11 @@ GET /api/v1/related?slug=jkun&id=134369&limit=8
 {
   "code": 1,
   "tables": [
-    { "name": "sources", "kind": "system", "rows": 57,
+    { "name": "sources", "kind": "system", "label": "sources", "rows": 57,
       "columns": [ { "name": "id", "type": "INTEGER", "pk": true },
                    { "name": "name", "type": "VARCHAR(128)", "pk": false } ] },
-    { "name": "vod_feifan", "kind": "vod", "rows": 320000, "columns": [ ... ] }
+    { "name": "vod_s361c088099", "kind": "vod", "label": "新极品资源站",
+      "rows": 72721, "columns": [ ... ] }
   ]
 }
 ```
@@ -1222,6 +1223,10 @@ GET /api/v1/related?slug=jkun&id=134369&limit=8
 - 可浏览：内置 5 张表（`sources` / `sync_logs` / `star_terms` / `vod_related` / `star_map`）+ 全部 `vod_{slug}`。
 - **`settings` 有意不在清单里**：存密码哈希 / API Token / 会话密钥，只读浏览不提供。
 - 行数口径：系统表实时 `count`；`vod_*` 用 `sources.total_videos` 缓存值（`POST /api/v1/maintenance/recount` 后更新），**不做大表实时 count**。
+- **`label`（v1.12.1）**：面板显示名。`vod_*` 表取 `sources.name`（如「新极品资源站」），系统表与 `name` 相同。`name` 仍是实际表名，始终用它请求 `/rows`。
+  - 表存在但 `sources` 里没有对应行（历史遗留表 / 手工建表）→ `label` 为 `{slug}（无对应源站）`，不为空串。
+  - 两个源站同名 → `label` 追加 `（{表名}）` 去歧义，保证下拉里两项可分辨。
+  - `vod_*` 段按 `label` 升序排列（源站名比 slug 有排序意义）。
 
 #### `GET /api/v1/admin/tables/{name}/rows` — 分页浏览表数据
 
@@ -1585,7 +1590,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.12.0（当前） | **管理面板数据表浏览**：新增 `GET /api/v1/admin/tables`（表清单 + 列元信息）与 `GET /api/v1/admin/tables/{name}/rows`（分页 / 按字段或全表搜索 / 页码跳转）；面板新增「数据表浏览」区块。纯新增管理接口，客户端 App 无需改动 |
+| v1.12.1（当前） | **数据表浏览显示源站名称**：清单接口每项新增 `label`（`vod_*` 取 `sources.name`，如「新极品资源站」）；`name` 仍为表名，请求路径不变。孤儿表标「无对应源站」、同名源站追加表名去歧义。纯展示层变更，无接口破坏 |
+| v1.12.0 | **管理面板数据表浏览**：新增 `GET /api/v1/admin/tables`（表清单 + 列元信息）与 `GET /api/v1/admin/tables/{name}/rows`（分页 / 按字段或全表搜索 / 页码跳转）；面板新增「数据表浏览」区块。纯新增管理接口，客户端 App 无需改动 |
 | v1.11.0 | **播放线路识别 / 过滤 / 排序**：新增 `sources.play_line_policy` 与 `vod_*` 表的 `play_from` 列；详情响应新增 `play_from` 与 PlayLine 的 `from` / `type` / `playable` / `original_index`，过滤生效时顶层带 `play_line_filtered`；新增 `?play_raw=1`（3 个接口）与 `POST /api/v1/sources/{slug}/play-line-policy`、`?mode=backfill_play_from`；`/api/v1/stats` 新增 `play_line` 段。**行为变化**：`vod_play_list` 默认已剔除 `/share/` 这类分享页线路（`vod_play_url` 不变） |
 | v1.10.1 | **详情字段透出**：`/api/v1/videos/{slug}/{id}`、`?ids=` 批量详情、`?ac=detail` 列表新增 `vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag` 五个字段（恒为字符串，缺失为 `""`；普通列表模式不带）。纯新增，旧客户端无影响 |
 | v1.10.0 | **算法与性能升级（无破坏性字段变更）**：`/api/v1/related` 新增 `algo_version` 与卡片级 `reason`（命中原因）；仅同分类/同地区/同年代的配对不再进推荐位、兜底条数降为 6 条且不与真命中混排；`/api/v1/videos` 无筛选时 `total` 改为估值并带 `total_approximate`；`/api/v1/categories` 新增 `cached`；`/api/v1/star/related` 的 `truncated` 改精确判定；`/api/v1/star-terms` 的 `active` 改为进程内生效数。详见 `UPGRADE_2026-11-07_v1.10.x.md` |

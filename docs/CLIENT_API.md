@@ -5,7 +5,7 @@
 > 本文档面向「调用 VodSync 服务的客户端 App」（原生 App / H5 / 小程序 / 播放器 / 采集器均可）。
 > 目标：一个 AI 客户端开发者（或 AI 编程助手）拿这份文档即可完成全部对接，无需阅读服务端代码。
 >
-> 对应服务版本：**v1.12.0** ｜ 文档版本：`2026-11-09` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.12.1** ｜ 文档版本：`2026-11-09` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 ---
 
@@ -109,7 +109,7 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 | POST | `/api/v1/sources/auto-sync?enabled=&slugs=` | 批量自动同步开关（`slugs=all` 或逗号分隔列表） |
 | GET | `/api/v1/logs?limit=50` | 最近同步日志（跨源站） |
 | POST | `/api/v1/maintenance/recount` | 条数校准（异步执行） |
-| GET | `/api/v1/admin/tables` | **v1.12.0** 数据表浏览：可浏览表清单（含列元信息与行数；`settings` 有意排除） |
+| GET | `/api/v1/admin/tables` | **v1.12.0** 数据表浏览：可浏览表清单（含列元信息与行数；`settings` 有意排除）。**v1.12.1** 每项新增 `label`（`vod_*` 表显示源站名，如「新极品资源站」），请求仍用 `name`（表名） |
 | GET | `/api/v1/admin/tables/{name}/rows` | **v1.12.0** 数据表浏览：分页查看数据（`page` / `page_size`≤100 / `field` / `q`，页码越界自动夹回） |
 
 > 管理接口全部为**异步受理**模式：POST 立即返回 `{"code":1,"msg":"...已受理"}`，实际进度通过轮询 `/api/v1/sources`（看 `syncing`/`progress` 字段）与 `/api/v1/logs` 获取。

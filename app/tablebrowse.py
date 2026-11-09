@@ -108,17 +108,25 @@ def list_browsable() -> list:
     """
     可浏览表清单（面板下拉）。不查任何一张 vod_* 大表的真实行数 ——
     那些行数用 sources.total_videos（条数校准任务维护的缓存值）。
+
+    vod_{slug} 的 `label` 用源站名称（如「新极品资源站」）而不是 slug：
+    面板上看到 vod_s361c088099 与看到「新极品资源站」的信息量完全不同，
+    后者才知道自己在看哪个站的数据。表名仍放在 `name` 里（接口契约不变），
+    前端只把它放进 option 的 title，鼠标悬停可查。
     """
     existing = database.list_tables()
 
-    # vod_{slug} 的行数一次性取回（52 行查询），避免逐表 count
-    vod_rows: dict = {}
+    # vod_{slug} 的行数与源站名一次性取回（一次查询），避免逐表 count
+    vod_meta: dict = {}
     try:
         with database.engine.connect() as conn:
-            vod_rows = {
-                r[0]: int(r[1] or 0)
-                for r in conn.execute(select(sources.c.slug, sources.c.total_videos)).all()
-            }
+            for slug, total, sname in conn.execute(
+                select(sources.c.slug, sources.c.total_videos, sources.c.name)
+            ).all():
+                vod_meta[slug] = {
+                    "rows": int(total or 0),
+                    "label": (sname or "").strip(),
+                }
     except Exception:  # noqa: BLE001 - sources 表还没建等极端情况，行数显示 0 即可
         pass
 
@@ -129,21 +137,40 @@ def list_browsable() -> list:
         out.append({
             "name": name,
             "kind": "system",
+            "label": name,          # 系统表没有更友好的名字，直接显示表名
             "rows": _system_count(tbl),
             "columns": _column_infos(tbl),
         })
+
+    vod_items = []
     for name in sorted(existing):
         if not name.startswith("vod_") or name == "vod_related":
             continue
         tbl = resolve_table(name)
         if tbl is None:
             continue
-        out.append({
+        slug = name[4:]
+        meta = vod_meta.get(slug) or {}
+        vod_items.append({
             "name": name,
             "kind": "vod",
-            "rows": vod_rows.get(name[4:], 0),
+            # 源站已被删除但表还留着（历史库/手工建表）时不能显示空字符串
+            "label": meta.get("label") or f"{slug}（无对应源站）",
+            "rows": meta.get("rows", 0),
             "columns": _column_infos(tbl),
         })
+
+    # 同名源站（极少但可能，name 不唯一）在下拉里会变成两条一模一样的选项，
+    # 这时退回「名称（表名）」，让管理者仍能区分
+    dup = {}
+    for it in vod_items:
+        dup[it["label"]] = dup.get(it["label"], 0) + 1
+    for it in vod_items:
+        if dup[it["label"]] > 1:
+            it["label"] = f'{it["label"]}（{it["name"]}）'
+
+    # 按显示名排序：源站名比 slug 排序有意义（中文按码点，近似按拼音分组）
+    out.extend(sorted(vod_items, key=lambda x: (x["label"], x["name"])))
     return out
 
 

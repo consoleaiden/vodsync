@@ -145,6 +145,7 @@
   select.tbSel {
     font: inherit; font-size: 13px; padding: 6px 9px; border: 1px solid var(--line);
     border-radius: 7px; background: #fff; color: var(--text); cursor: pointer; outline: none;
+    max-width: 260px;   /* 源站名可能很长，别把整行工具栏撑开 */
   }
   select.tbSel:focus { border-color: var(--accent); }
   #tbQuery { min-width: 220px; }
@@ -829,8 +830,9 @@ async function tbLoadTables(keep) {
       return;
     }
     const prev = keep ? sel.value : "";
+    // 显示名用 label（vod_* 表是源站名称），真实表名放进 title 备查
     sel.innerHTML = tbState.tables.map((t) =>
-      `<option value="${esc(t.name)}">${esc(t.name)}（${fmtNum(t.rows)} 条）</option>`).join("");
+      `<option value="${esc(t.name)}" title="${esc(t.name)}">${esc(t.label || t.name)}（${fmtNum(t.rows)} 条）</option>`).join("");
     if (prev && tbState.tables.some((t) => t.name === prev)) sel.value = prev;
     tbOnTableChange();
   } catch (e) { toast("表清单加载失败：" + e.message, true); }
