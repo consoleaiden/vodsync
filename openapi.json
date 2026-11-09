@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.11.0"
+    "version": "1.12.0"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -1047,6 +1047,114 @@
               "default": 50,
               "title": "Limit"
             }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/tables": {
+      "get": {
+        "summary": "Admin List Tables",
+        "description": "可浏览的表清单（含列元信息与行数）。settings 表有意不在列表里 ——\n它存密码哈希 / 会话密钥，只读浏览不该把它们端出来。",
+        "operationId": "admin_list_tables_api_v1_admin_tables_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/tables/{name}/rows": {
+      "get": {
+        "summary": "Admin Browse Table",
+        "description": "分页浏览一张表的数据。表不存在 404；字段不存在 400。",
+        "operationId": "admin_browse_table_api_v1_admin_tables__name__rows_get",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "页码，超出范围自动夹回边界",
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "页码，超出范围自动夹回边界"
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "description": "每页条数，最大 100",
+              "default": 20,
+              "title": "Page Size"
+            },
+            "description": "每页条数，最大 100"
+          },
+          {
+            "name": "field",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "按该字段搜索；留空=全表搜索（所有列 OR）",
+              "default": "",
+              "title": "Field"
+            },
+            "description": "按该字段搜索；留空=全表搜索（所有列 OR）"
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "关键词（部分匹配，大小写不敏感）；留空=不过滤",
+              "default": "",
+              "title": "Q"
+            },
+            "description": "关键词（部分匹配，大小写不敏感）；留空=不过滤"
           }
         ],
         "responses": {

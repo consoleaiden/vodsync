@@ -141,6 +141,17 @@
   .ep { display: inline-block; margin: 4px 6px 0 0; padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px; font-size: 12px; background: #fff; text-decoration: none; color: var(--accent); }
   .ep:hover { background: #eff6ff; }
   .switch { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; cursor: pointer; }
+  /* 数据表浏览（v1.12.0） */
+  select.tbSel {
+    font: inherit; font-size: 13px; padding: 6px 9px; border: 1px solid var(--line);
+    border-radius: 7px; background: #fff; color: var(--text); cursor: pointer; outline: none;
+  }
+  select.tbSel:focus { border-color: var(--accent); }
+  #tbQuery { min-width: 220px; }
+  td.clamp { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: zoom-in; }
+  td.clamp.open { white-space: pre-wrap; word-break: break-all; cursor: zoom-out; }
+  .tb-pager { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); }
+  .tb-pager input { width: 72px; min-width: 72px; padding: 5px 6px; text-align: center; }
 </style>
 </head>
 <body>
@@ -217,6 +228,45 @@
       </form>
     </div>
     <div class="body" id="searchResults"></div>
+  </section>
+
+  <!-- 数据表浏览（v1.12.0，只读） -->
+  <section class="panel">
+    <div class="head">
+      <h2>数据表浏览</h2>
+      <span class="hint">只读查看数据库内容 · 表行数为缓存值（点「条数校准」后更新）· 全字段搜索在大表上较慢</span>
+      <span style="flex:1"></span>
+      <button class="sm" id="tbReloadTables" title="重新读取表清单（新添加源站后用）">↻ 表清单</button>
+    </div>
+    <div class="body pad">
+      <form class="row" id="tbForm">
+        <select class="tbSel" id="tbTable" title="选择数据表"><option value="">加载中…</option></select>
+        <select class="tbSel" id="tbField" title="搜索字段：选「全部字段」则所有列参与匹配"><option value="">全部字段</option></select>
+        <input type="search" id="tbQuery" placeholder="关键词（部分匹配，留空=浏览全表）" autocomplete="off">
+        <button class="primary" type="submit">搜索</button>
+        <button type="button" id="tbReset">重置</button>
+        <label class="muted" style="font-size:12px;display:inline-flex;align-items:center;gap:5px">每页
+          <select class="tbSel" id="tbSize">
+            <option value="10">10 条</option>
+            <option value="20" selected>20 条</option>
+            <option value="50">50 条</option>
+            <option value="100">100 条</option>
+          </select>
+        </label>
+      </form>
+    </div>
+    <div class="body" id="tbBody"><div class="empty">选择一张表开始浏览</div></div>
+    <div class="body pad tb-pager" id="tbPager" style="display:none">
+      <button class="sm" id="tbFirst">首页</button>
+      <button class="sm" id="tbPrev">上一页</button>
+      <span id="tbPageInfo">-</span>
+      <button class="sm" id="tbNext">下一页</button>
+      <button class="sm" id="tbLast">末页</button>
+      <span style="flex:1"></span>
+      <span>跳转到</span>
+      <input type="number" id="tbJump" min="1" value="1">
+      <button class="sm" id="tbGo">跳转</button>
+    </div>
   </section>
 
   <!-- 源站列表 -->
@@ -762,6 +812,130 @@ $("#searchResults").addEventListener("click", async (ev) => {
   } catch (e) { toast("详情加载失败：" + e.message, true); }
 });
 
+// ---------------- 数据表浏览（v1.12.0，只读） ----------------
+// 注意：这个面板不进 5 秒轮询（refreshAll）—— 用户的翻页/搜索状态不能被覆盖
+const tbState = { tables: [], cols: [], page: 1, total: 0, pages: 0, busy: false };
+
+function tbCurName() { return $("#tbTable").value; }
+
+async function tbLoadTables(keep) {
+  const sel = $("#tbTable");
+  try {
+    const d = await api("/api/v1/admin/tables");
+    tbState.tables = d.tables || [];
+    if (!tbState.tables.length) {
+      sel.innerHTML = `<option value="">（无可浏览的表）</option>`;
+      $("#tbBody").innerHTML = `<div class="empty">没有可浏览的数据表</div>`;
+      return;
+    }
+    const prev = keep ? sel.value : "";
+    sel.innerHTML = tbState.tables.map((t) =>
+      `<option value="${esc(t.name)}">${esc(t.name)}（${fmtNum(t.rows)} 条）</option>`).join("");
+    if (prev && tbState.tables.some((t) => t.name === prev)) sel.value = prev;
+    tbOnTableChange();
+  } catch (e) { toast("表清单加载失败：" + e.message, true); }
+}
+
+// 切表：重建字段下拉、清空搜索条件、回到第 1 页
+function tbOnTableChange() {
+  const t = tbState.tables.find((x) => x.name === tbCurName());
+  $("#tbField").innerHTML = `<option value="">全部字段</option>` +
+    (t ? (t.columns || []).map((c) =>
+      `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join("") : "");
+  tbState.page = 1;
+  $("#tbQuery").value = "";
+  tbLoad();
+}
+
+async function tbLoad(page) {
+  const name = tbCurName();
+  if (!name || tbState.busy) return;   // busy：上一发请求没回来就忽略（防连点）
+  tbState.busy = true;
+  if (page) tbState.page = page;
+  $("#tbBody").innerHTML = `<div class="empty">加载中…</div>`;
+  try {
+    const params = new URLSearchParams({
+      page: tbState.page,
+      page_size: Number($("#tbSize").value) || 20,
+      field: $("#tbField").value,
+      q: $("#tbQuery").value.trim(),
+    });
+    const d = await api(`/api/v1/admin/tables/${encodeURIComponent(name)}/rows?${params}`);
+    tbState.cols = d.columns || [];
+    tbState.rows = d.rows || [];
+    tbState.total = Number(d.total || 0);
+    tbState.pages = Number(d.pages || 1);
+    tbState.page = Number(d.page || 1);   // 后端会把越界页码夹回边界
+    tbRender();
+  } catch (e) {
+    $("#tbBody").innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+    $("#tbPager").style.display = "none";
+  } finally { tbState.busy = false; }
+}
+
+// 单元格：null/空显示 -；ISO 时间去掉 T；超长文本 clamp（点击展开）
+function tbCell(v) {
+  if (v === null || v === undefined || v === "") return `<td class="muted">-</td>`;
+  const text = String(v);
+  const shown = /^\d{4}-\d{2}-\d{2}T/.test(text) ? text.replace("T", " ") : text;
+  return text.length > 60
+    ? `<td class="clamp" title="点击展开 / 收起">${esc(shown)}</td>`
+    : `<td>${esc(shown)}</td>`;
+}
+
+function tbRender() {
+  const cols = tbState.cols;
+  const rows = tbState.rows || [];
+  if (!cols.length) {
+    $("#tbBody").innerHTML = `<div class="empty">该表没有列</div>`;
+    $("#tbPager").style.display = "none";
+    return;
+  }
+  const th = cols.map((c) =>
+    `<th title="${esc(c.type)}${c.pk ? " · 主键" : ""}">${esc(c.name)}${c.pk ? " 🔑" : ""}</th>`).join("");
+  const body = rows.length
+    ? rows.map((r) => `<tr>${cols.map((c) => tbCell(r[c.name])).join("")}</tr>`).join("")
+    : "";
+  $("#tbBody").innerHTML = body
+    ? `<table><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table>`
+    : `<div class="empty">没有匹配的行（换个关键词试试，或点「重置」）</div>`;
+  // 翻页条
+  $("#tbPager").style.display = "flex";
+  $("#tbPageInfo").textContent = `共 ${fmtNum(tbState.total)} 条 · 第 ${tbState.page} / ${tbState.pages} 页`;
+  $("#tbFirst").disabled = $("#tbPrev").disabled = tbState.page <= 1;
+  $("#tbNext").disabled = $("#tbLast").disabled = tbState.page >= tbState.pages;
+  const jump = $("#tbJump");
+  jump.max = tbState.pages;
+  jump.value = tbState.page;
+}
+
+$("#tbTable").addEventListener("change", tbOnTableChange);
+$("#tbSize").addEventListener("change", () => { tbState.page = 1; tbLoad(); });
+$("#tbForm").addEventListener("submit", (ev) => { ev.preventDefault(); tbState.page = 1; tbLoad(); });
+$("#tbReset").addEventListener("click", () => {
+  $("#tbQuery").value = "";
+  $("#tbField").value = "";
+  tbState.page = 1;
+  tbLoad();
+});
+$("#tbFirst").onclick = () => tbLoad(1);
+$("#tbPrev").onclick = () => tbLoad(tbState.page - 1);
+$("#tbNext").onclick = () => tbLoad(tbState.page + 1);
+$("#tbLast").onclick = () => tbLoad(tbState.pages);
+$("#tbGo").onclick = () => {
+  const n = parseInt($("#tbJump").value, 10);
+  if (n >= 1) tbLoad(n);
+};
+$("#tbJump").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); $("#tbGo").click(); }
+});
+$("#tbReloadTables").onclick = () => tbLoadTables(true);
+// 长文本单元格：点击展开 / 收起
+$("#tbBody").addEventListener("click", (ev) => {
+  const td = ev.target.closest("td.clamp");
+  if (td) td.classList.toggle("open");
+});
+
 // ---------------- 弹窗 ----------------
 function openModal(title, bodyHtml) {
   const mask = document.createElement("div");
@@ -1177,6 +1351,7 @@ async function boot() {
     return;
   }
   await refreshAll();
+  tbLoadTables();   // 数据表浏览：只加载一次，不进 5 秒轮询（翻页状态不能被覆盖）
   schedule();
 }
 boot();

@@ -3,7 +3,7 @@
 > **本文档的用途**：把 VodSync 服务作为后端，交由 AI（或 AI 编程助手）开发客户端 App。
 > 文档自包含：只读本文即可完成全部对接，**不需要**阅读服务端源码。
 >
-> 对应服务版本：**v1.11.0** ｜ 文档版本：`2026-11-07` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.12.0** ｜ 文档版本：`2026-11-09` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 **目录**
 
@@ -13,7 +13,7 @@
 | [1](#1-服务能提供什么) | 服务能力概览 |
 | [2](#2-通用约定) | 鉴权 / 响应格式 / 错误码 / 分页 / 编码 |
 | [3](#3-数据模型字段字典) | 数据模型与字段字典 |
-| [4](#4-接口参考) | 45 个接口逐一说明 |
+| [4](#4-接口参考) | 47 个接口逐一说明 |
 | [5](#5-状态语义与推荐-ui最容易做错的部分) | 状态语义与推荐 UI（running / syncing / paused / auto_sync） |
 | [6](#6-端到端流程可直接交给-ai-实现) | 端到端流程（观影 App / 管理 App） |
 | [7](#7-客户端代码骨架) | 客户端代码骨架（TS / Kotlin / Flutter / Swift） |
@@ -292,8 +292,10 @@ type PlayLine = {
 | 43 | GET | `/api/v1/star/works` | 业务 | 按明星查作品（明星为中心，total 不受 limit 影响） |
 | 44 | GET | `/api/v1/star/tags/untracked` | 管理 | 未入词库高频标题词 Top N（扩词库用） |
 | 45 | POST | `/api/v1/sources/{slug}/play-line-policy` | 管理 | **v1.11.0** 单源站播放线路策略（inherit/off/filter/whitelist） |
+| 46 | GET | `/api/v1/admin/tables` | 管理 | **v1.12.0** 数据表浏览：可浏览表清单（含列元信息与行数） |
+| 47 | GET | `/api/v1/admin/tables/{name}/rows` | 管理 | **v1.12.0** 数据表浏览：分页查看表数据（按字段/全表搜索） |
 
-> 共 **45 个接口**。标「管理」的主要供管理面板使用，客户端 App 只需一枚 Token（见 2.1）即可调用「数据」「业务」类接口。
+> 共 **47 个接口**。标「管理」的主要供管理面板使用，客户端 App 只需一枚 Token（见 2.1）即可调用「数据」「业务」类接口。
 > 鉴权类中 `/api/v1/auth/login` 与 `/api/v1/auth/state` **免鉴权**，其余需登录会话 cookie（`POST /api/v1/auth/password` 等也可用 Token 访问）。
 
 ---
@@ -1199,6 +1201,56 @@ GET /api/v1/related?slug=jkun&id=134369&limit=8
 
 ---
 
+### 4.24 数据表浏览（v1.12.0，管理面板专用，只读）
+
+管理面板的「数据表浏览」区块背后的两个接口。客户端 App **不需要**它们。
+
+#### `GET /api/v1/admin/tables` — 可浏览表清单
+
+```json
+{
+  "code": 1,
+  "tables": [
+    { "name": "sources", "kind": "system", "rows": 57,
+      "columns": [ { "name": "id", "type": "INTEGER", "pk": true },
+                   { "name": "name", "type": "VARCHAR(128)", "pk": false } ] },
+    { "name": "vod_feifan", "kind": "vod", "rows": 320000, "columns": [ ... ] }
+  ]
+}
+```
+
+- 可浏览：内置 5 张表（`sources` / `sync_logs` / `star_terms` / `vod_related` / `star_map`）+ 全部 `vod_{slug}`。
+- **`settings` 有意不在清单里**：存密码哈希 / API Token / 会话密钥，只读浏览不提供。
+- 行数口径：系统表实时 `count`；`vod_*` 用 `sources.total_videos` 缓存值（`POST /api/v1/maintenance/recount` 后更新），**不做大表实时 count**。
+
+#### `GET /api/v1/admin/tables/{name}/rows` — 分页浏览表数据
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `page` | 1 | 页码，`ge=1`；**超出 [1, pages] 自动夹回边界**（跳页不用自己算） |
+| `page_size` | 20 | 每页条数，1~100 |
+| `field` | `""` | 按该字段搜索；留空 = **全表搜索**（所有列 OR）；非法字段 → `400` |
+| `q` | `""` | 关键词，部分匹配、大小写不敏感；留空 = 不过滤纯翻页；上限 200 字符 |
+
+响应：
+
+```json
+{
+  "code": 1, "table": "vod_feifan",
+  "columns": ["vod_id", "type_id", "type_name", "name"],
+  "rows": [ { "vod_id": 1, "type_id": 1, "type_name": "国产剧", "name": "三体" } ],
+  "total": 320000, "page": 1, "page_size": 20, "pages": 16000
+}
+```
+
+- 结果恒按主键排序（无主键表用第一列），翻页稳定不重不漏。
+- 文本列直接 ILIKE（`name` 列能吃到 pg_trgm 索引）；整数/时间列 cast 成字符串再匹配，所以「按 type_id 搜 1」「按时间搜 2026-11」都能用。
+- LIKE 通配符（`%` `_` `\`）已被转义：搜 `%` 不会变成全表匹配。
+- 安全边界：表名 / 字段名全部来自服务端元数据白名单（坏表名 `404`、坏字段 `400`），关键词走 bind param —— 不存在注入面。
+- 性能提示：全字段搜索在大表（百万行）上是顺序扫描，面板排障场景可接受，别拿它当业务搜索接口用。
+
+---
+
 ## 5. 状态语义与推荐 UI（最容易做错的部分）
 
 ### 5.1 单源站状态判定（按顺序）
@@ -1533,7 +1585,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.11.0（当前） | **播放线路识别 / 过滤 / 排序**：新增 `sources.play_line_policy` 与 `vod_*` 表的 `play_from` 列；详情响应新增 `play_from` 与 PlayLine 的 `from` / `type` / `playable` / `original_index`，过滤生效时顶层带 `play_line_filtered`；新增 `?play_raw=1`（3 个接口）与 `POST /api/v1/sources/{slug}/play-line-policy`、`?mode=backfill_play_from`；`/api/v1/stats` 新增 `play_line` 段。**行为变化**：`vod_play_list` 默认已剔除 `/share/` 这类分享页线路（`vod_play_url` 不变） |
+| v1.12.0（当前） | **管理面板数据表浏览**：新增 `GET /api/v1/admin/tables`（表清单 + 列元信息）与 `GET /api/v1/admin/tables/{name}/rows`（分页 / 按字段或全表搜索 / 页码跳转）；面板新增「数据表浏览」区块。纯新增管理接口，客户端 App 无需改动 |
+| v1.11.0 | **播放线路识别 / 过滤 / 排序**：新增 `sources.play_line_policy` 与 `vod_*` 表的 `play_from` 列；详情响应新增 `play_from` 与 PlayLine 的 `from` / `type` / `playable` / `original_index`，过滤生效时顶层带 `play_line_filtered`；新增 `?play_raw=1`（3 个接口）与 `POST /api/v1/sources/{slug}/play-line-policy`、`?mode=backfill_play_from`；`/api/v1/stats` 新增 `play_line` 段。**行为变化**：`vod_play_list` 默认已剔除 `/share/` 这类分享页线路（`vod_play_url` 不变） |
 | v1.10.1 | **详情字段透出**：`/api/v1/videos/{slug}/{id}`、`?ids=` 批量详情、`?ac=detail` 列表新增 `vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag` 五个字段（恒为字符串，缺失为 `""`；普通列表模式不带）。纯新增，旧客户端无影响 |
 | v1.10.0 | **算法与性能升级（无破坏性字段变更）**：`/api/v1/related` 新增 `algo_version` 与卡片级 `reason`（命中原因）；仅同分类/同地区/同年代的配对不再进推荐位、兜底条数降为 6 条且不与真命中混排；`/api/v1/videos` 无筛选时 `total` 改为估值并带 `total_approximate`；`/api/v1/categories` 新增 `cached`；`/api/v1/star/related` 的 `truncated` 改精确判定；`/api/v1/star-terms` 的 `active` 改为进程内生效数。详见 `UPGRADE_2026-11-07_v1.10.x.md` |
 | v1.9.3 | `GET /healthz` 新增 `version` / `build`（镜像构建提交 SHA），便于升级/回滚核对与报障定位；无新增/变更业务接口，**客户端无需改动** |

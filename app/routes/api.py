@@ -1237,6 +1237,42 @@ def recent_logs(limit: int = Query(50, ge=1, le=200)):
 
 
 # ---------------------------------------------------------------------------
+# 数据表浏览（v1.12.0，管理面板，只读）
+# 逻辑在 tablebrowse.py：表名白名单 + 列名白名单，这是接口里仅有的两处
+# 「标识符进 SQL」的位置，改这里之前先读那个模块的安全边界说明。
+# ---------------------------------------------------------------------------
+@router.get("/api/v1/admin/tables")
+def admin_list_tables():
+    """
+    可浏览的表清单（含列元信息与行数）。settings 表有意不在列表里 ——
+    它存密码哈希 / 会话密钥，只读浏览不该把它们端出来。
+    """
+    from .. import tablebrowse
+
+    return {"code": 1, "tables": tablebrowse.list_browsable()}
+
+
+@router.get("/api/v1/admin/tables/{name}/rows")
+def admin_browse_table(
+    name: str,
+    page: int = Query(1, ge=1, description="页码，超出范围自动夹回边界"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数，最大 100"),
+    field: str = Query("", max_length=64,
+                       description="按该字段搜索；留空=全表搜索（所有列 OR）"),
+    q: str = Query("", max_length=200, description="关键词（部分匹配，大小写不敏感）；留空=不过滤"),
+):
+    """分页浏览一张表的数据。表不存在 404；字段不存在 400。"""
+    from .. import tablebrowse
+
+    try:
+        return tablebrowse.browse(name, page, page_size, field, q)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"表不存在或不可浏览: {name}") from None
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"未知字段: {e}") from None
+
+
+# ---------------------------------------------------------------------------
 # REST 风格数据接口（source 参数区分源站）
 # ---------------------------------------------------------------------------
 @router.get("/api/v1/videos")
