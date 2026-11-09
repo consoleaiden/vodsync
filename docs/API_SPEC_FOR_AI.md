@@ -3,7 +3,7 @@
 > **本文档的用途**：把 VodSync 服务作为后端，交由 AI（或 AI 编程助手）开发客户端 App。
 > 文档自包含：只读本文即可完成全部对接，**不需要**阅读服务端源码。
 >
-> 对应服务版本：**v1.12.1** ｜ 文档版本：`2026-11-09` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.12.2** ｜ 文档版本：`2026-11-09` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 **目录**
 
@@ -1590,7 +1590,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.12.1（当前） | **数据表浏览显示源站名称**：清单接口每项新增 `label`（`vod_*` 取 `sources.name`，如「新极品资源站」）；`name` 仍为表名，请求路径不变。孤儿表标「无对应源站」、同名源站追加表名去歧义。纯展示层变更，无接口破坏 |
+| v1.12.2（当前） | **修复数据表浏览「查询没有数据」**：面板把 `/rows` 返回的列名（字符串数组）当对象取 `.name`，导致表头空白、每格渲染成 `-`；改由 `tbCols()` 归一化后再渲染。接口无变化，纯前端修复 |
+| v1.12.1 | **数据表浏览显示源站名称**：清单接口每项新增 `label`（`vod_*` 取 `sources.name`，如「新极品资源站」）；`name` 仍为表名，请求路径不变。孤儿表标「无对应源站」、同名源站追加表名去歧义。纯展示层变更，无接口破坏 |
 | v1.12.0 | **管理面板数据表浏览**：新增 `GET /api/v1/admin/tables`（表清单 + 列元信息）与 `GET /api/v1/admin/tables/{name}/rows`（分页 / 按字段或全表搜索 / 页码跳转）；面板新增「数据表浏览」区块。纯新增管理接口，客户端 App 无需改动 |
 | v1.11.0 | **播放线路识别 / 过滤 / 排序**：新增 `sources.play_line_policy` 与 `vod_*` 表的 `play_from` 列；详情响应新增 `play_from` 与 PlayLine 的 `from` / `type` / `playable` / `original_index`，过滤生效时顶层带 `play_line_filtered`；新增 `?play_raw=1`（3 个接口）与 `POST /api/v1/sources/{slug}/play-line-policy`、`?mode=backfill_play_from`；`/api/v1/stats` 新增 `play_line` 段。**行为变化**：`vod_play_list` 默认已剔除 `/share/` 这类分享页线路（`vod_play_url` 不变） |
 | v1.10.1 | **详情字段透出**：`/api/v1/videos/{slug}/{id}`、`?ids=` 批量详情、`?ac=detail` 列表新增 `vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag` 五个字段（恒为字符串，缺失为 `""`；普通列表模式不带）。纯新增，旧客户端无影响 |

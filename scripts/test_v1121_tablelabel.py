@@ -147,9 +147,14 @@ def main():
           {t["name"]: t["label"] for t in items})
 
     # ---- H. 版本 ----
+    # 只断言「不低于 1.12.1」：后续补丁版（1.12.2…）复用同一套件，不该误报
     from app import __version__
 
-    check("H1 版本号 1.12.1", __version__ == "1.12.1", __version__)
+    try:
+        ver = tuple(int(x) for x in __version__.split(".")[:3])
+    except ValueError:
+        ver = (0, 0, 0)
+    check("H1 版本号不低于 1.12.1", ver >= (1, 12, 1), __version__)
 
     print()
     print("=" * 50)

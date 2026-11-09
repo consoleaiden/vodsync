@@ -885,8 +885,20 @@ function tbCell(v) {
     : `<td>${esc(shown)}</td>`;
 }
 
+// 列名 -> {name,type,pk}。
+// /rows 返回的 columns 是**列名字符串数组**；类型与主键在表清单的 columns 里，
+// 这里合并一次，渲染时统一按对象用（v1.12.0 曾直接把字符串当对象取 c.name，
+// 结果表头空白、每个单元格都是 "-"）。
+function tbCols() {
+  const t = tbState.tables.find((x) => x.name === tbCurName());
+  const meta = {};
+  ((t && t.columns) || []).forEach((c) => { if (c && c.name) meta[c.name] = c; });
+  return (tbState.cols || []).map((c) =>
+    typeof c === "string" ? (meta[c] || { name: c }) : c);
+}
+
 function tbRender() {
-  const cols = tbState.cols;
+  const cols = tbCols();
   const rows = tbState.rows || [];
   if (!cols.length) {
     $("#tbBody").innerHTML = `<div class="empty">该表没有列</div>`;
@@ -894,7 +906,7 @@ function tbRender() {
     return;
   }
   const th = cols.map((c) =>
-    `<th title="${esc(c.type)}${c.pk ? " · 主键" : ""}">${esc(c.name)}${c.pk ? " 🔑" : ""}</th>`).join("");
+    `<th title="${esc(c.type || "")}${c.pk ? " · 主键" : ""}">${esc(c.name)}${c.pk ? " 🔑" : ""}</th>`).join("");
   const body = rows.length
     ? rows.map((r) => `<tr>${cols.map((c) => tbCell(r[c.name])).join("")}</tr>`).join("")
     : "";
