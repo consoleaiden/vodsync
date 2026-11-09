@@ -106,33 +106,57 @@ curl -s http://<host>:8181/api/v1/auth/state
 
 ### 2.2 统一响应与错误
 
+> **v1.14.0 / B-11 起语义收紧，字段一个没改名。**
+> 成功 = HTTP 2xx **且** `code == 0`；业务失败 = **非 2xx** + `{code, error, detail}`。
+> 不再出现「HTTP 200 + `code:1` 表示失败」这种二义形态。
+> 成功码由 `API_SUCCESS_CODE` 控制（默认 `0`）；灰度期设成 `1` 可退回 v1.13 行为。
+> **例外**：`/api/v1/{slug}`（苹果 CMS 兼容接口）恒为 `code:1` —— 那是采集端约定。
+
 成功（HTTP 200）：
 
 ```json
-{ "code": 1, "total": 6160, "list": [ ... ] }
+{ "code": 0, "total": 6160, "list": [ ... ] }
 ```
 
 失败（HTTP 4xx/5xx）：
 
 ```json
-{ "detail": "源站 xxx 不存在" }
+{
+  "code": 40001,
+  "error": "bad_request",
+  "detail": "参数错误：page 输入应大于等于 1",
+  "message": "参数错误：page 输入应大于等于 1",
+  "field": "page"
+}
 ```
 
-`422` 时 `detail` 是 FastAPI 标准校验数组：
-
-```json
-{ "detail": [ { "loc": ["query","wd"], "msg": "field required", "type": "value_error.missing" } ] }
-```
-
-| 状态码 | 含义 | 典型触发 |
+| 字段 | 类型 | 说明 |
 |---|---|---|
-| 200 | 成功 | — |
-| 400 | 参数语义错误 | `ids` 非数字、`slug` 非法、搜索关键词为空 |
-| 401 | 未授权：Token 缺失 / 错误 / 已被重置 | 服务端启用了访问控制（`/api/v1/auth/state` 查 `enabled`） |
-| 404 | 资源不存在 | 源站不存在、视频未入库、源站尚未同步数据、ids 全部未命中 |
-| 422 | 参数校验失败（类型/范围） | `page=0`、`page_size=1000`、`scope` 取值不在枚举内 |
-| 503 | 服务临时过载（**可重试**） | 数据库连接池排队超时 / 数据库写锁忙。响应带 `Retry-After: 5` |
-| 500 | 服务端异常 | 其它未预期异常 |
+| `code` | int | 程序判据。`0` = 成功；`4xxxx`/`5xxxx` 见下表 |
+| `error` | string | **稳定英文串**（不随文案改版变化），用于 i18n / 埋点分类 |
+| `detail` | string | 人可读中文。**老客户端与面板一直读这个字段**，永远保留 |
+| `message` | string | 与 `detail` 同值（部分客户端读 `message`），纯新增 |
+| `field` | string? | 仅参数校验失败时出现，指出具体字段，便于高亮输入框 |
+| `required` | string? | 仅 403 出现，说明需要什么权限（`admin`） |
+
+错误码表（v1.14.0 起固定，改动即破坏客户端判定）：
+
+| HTTP | `code` | `error` | 场景 |
+|---|---|---|---|
+| 200 | 0 | — | 成功 |
+| 400 | 40001 | `bad_request` | 参数缺失/类型错误/超范围（**原先是 422**） |
+| 401 | 40101 | `invalid_token` | 未带 Token / Token 错误 / 已被轮换 |
+| 401 | 40102 | `token_expired` | 预留（当前 Token 不过期，仅轮换） |
+| 403 | 40301 | `insufficient_scope` | 只读 Token 调写接口，带 `required: "admin"` |
+| 404 | 40401 | `not_found` | 影片/源站/表不存在 |
+| 405 | 40001 | `method_not_allowed` | 方法不支持 |
+| 409 | 40901 | `conflict` | 重复登记源站 |
+| 429 | 42901 | `rate_limited` | 预留 |
+| 500 | 50001 | `internal_error` | 未捕获异常（**不回显堆栈**，详情见服务端日志） |
+| 503 | 50001 | `service_unavailable` | 数据库繁忙/连接池排队，带 `Retry-After` |
+
+**客户端判定建议**：`status_code >= 400 || code != 0` → 失败；展示优先用 `message`（缺失时退回
+`detail`），分类埋点用 `error`。
 
 **404 的 `detail` 通常带补救建议**（比如提示改用搜索接口确认 `vod_id`），可直接展示给用户或用于日志。
 
@@ -145,9 +169,19 @@ curl -s http://<host>:8181/api/v1/auth/state
 | 参数 | 类型 | 默认 | 范围 | 说明 |
 |---|---|---|---|---|
 | `page` | int | 1 | ≥1 | 页码，从 1 开始 |
-| `page_size` | int | 30 | 1–100 | 每页条数；默认值/上限由 `API_PAGE_SIZE_DEFAULT` / `API_PAGE_SIZE_MAX` 控制，超上限 422 |
+| `page_size` | int | **18** | 1–100 | 每页条数。**v1.14.0 起默认 18**（与客户端固定传值一致）；上限 `API_PAGE_SIZE_MAX`，超上限返回 `400 / 40001` |
 
-**翻页终止条件**：`page > pagecount`，或本页 `list` 为空。不要依赖 `total` 做精确翻页（搜索接口的 `total` 是近似值，见 4.5）。
+**`pagecount` 语义（v1.14.0 / B-04 冻结）**：`pagecount = ceil(total / page_size)`，
+即**以当前 `page_size` 为基准的页数**，不是条目数、也不是固定 1。客户端翻页到底完全依赖它。
+
+**`total_approximate`（恒出现）**：`true` 表示 `total` 取自 `sources.total_videos` 的估算
+（无筛选条件的全站列表），客户端应显示「约 N 条」；`false` 表示精确值。
+字段**始终存在**（v1.13 及以前只在近似时才带，客户端无法区分「缺字段」与「精确」）。
+
+**`query_ms`（恒出现）**：本次查询耗时（毫秒），用于客户端性能埋点与慢查询排查。
+
+**翻页终止条件**：`page > pagecount`，或本页 `list` 为空。不要依赖 `total` 做精确翻页
+（近似模式下 `total` 与真实条数可能差 1~2 页的量级）。
 
 ### 2.4 时间与编码
 
@@ -185,28 +219,62 @@ curl -s http://<host>:8181/api/v1/auth/state
 | `vod_name` | string | 片名 |
 | `vod_pic` | string | 封面图 URL |
 | `vod_remarks` | string | 备注：清晰度 / 「更新至第 N 集」/「全 30 集」 |
+| `remarks` | string | **v1.14.0**：与 `vod_remarks` **同值**（契约里叫 `remarks`）。两个都给，两版客户端都不用改 |
+| `vod_area` | string | **v1.14.0**：地区（如 `大陆`/`美国`），列表卡片展示用，列表模式也返回 |
+| `vod_year` | string | **v1.14.0**：年份（如 `2024`），同上 |
 | `vod_time` | string | 更新时间 |
+
+> 列表模式（不带 `ac=detail` / `ids`）**不带** `vod_actor` / `vod_director` / `vod_tag` /
+> `vod_content` / `vod_play_url` —— 这些是重字段（演员/标签串/简介/播放串），
+> 只在详情模式返回以控制体积。`vod_area` / `vod_year` 很短，v1.14.0 起列表也带。
 
 ### 3.3 VideoDetail（详情 = Summary + 以下字段）
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `vod_content` | string | 简介（可能含 HTML 标签或为空） |
-| `vod_play_url` | string | 上游原始播放串：`线路1$$$线路2`，线路内 `集名$地址#集名$地址`。**永不被改写**（过滤只作用于 `vod_play_list`） |
+| `vod_actor` | string | 演员，`,` 分隔；无数据时为空串（**字段恒存在，不缺 key**） |
+| `vod_director` | string | 导演，同上 |
+| `vod_area` | string | 地区，同上 |
+| `vod_year` | string | 年份，同上 |
+| `vod_tag` | string | 标签串，`,` 分隔（客户端按 `,`/`，`/`/` 再切分都兼容）；无数据时为空串 |
+| `tag` | string | **v1.14.0**：与 `vod_tag` **同值**（契约里叫 `tag`） |
+| `vod_play_url` | string | 上游原始播放串：`线路1$$$线路2`，线路内 `集名$地址#集名$地址`。**永不被改写**（过滤只作用于 `vod_play_list` / `play_lines`） |
 | `vod_play_from` | string | MacCMS 兼容字段，固定为 `"vodsync"` |
 | `play_from` | string | **v1.11.0**：上游 `vod_play_from` 原始串（如 `feifan$$$ffm3u8`），与 `vod_play_url` 的线路顺序一一对应；存量未回填时为空串 |
 | `vod_play_list` | PlayLine[] | **结构化播放列表（推荐使用，已按策略过滤掉不可播的分享页线路）** |
+| `play_lines` | PlayLine[] | **v1.14.0**：与 `vod_play_list` **同值**（契约里叫 `play_lines`）。实测两版客户端各读一个名字，所以同值双发；JSON 里重复的部分 gzip 会压掉 |
 
 ```ts
 type PlayLine = {
   name: string;            // "线路2 (ffm3u8)" —— 编号是**过滤后**的序号
   from: string;            // v1.11.0 上游 provider（play_from 缺失时为空串）
   type: "m3u8" | "mp4" | "flv" | "mkv" | "page" | "unknown";  // v1.11.0
-  playable: boolean;       // v1.11.0：type != "page"
+  playable: boolean;       // v1.11.0：type != "page"；false = 置灰 + 跳过自动连播
   original_index: number;  // v1.11.0：在上游 vod_play_url 里的下标（0 基），缓存对齐用
-  episodes: { name: string; url: string }[];  // name 如 "第01集"/"高清"
+  episodes: {              // v1.14.0：逐集也带 from/type/playable
+    name: string;          //   "第01集" / "高清"；无集名时为 "EP{线路下标}"
+    url: string;
+    from: string;          //   该集所属线路的 provider
+    type: "m3u8" | "mp4" | "flv" | "mkv" | "page" | "unknown";
+    playable: boolean;     //   false = 这一集不可播（线路里混了 H5 页面时单集置灰）
+  }[];
 };
 ```
+
+> **`original_index` 契约（v1.14.0 / B-03 书面化，语义不可变）**
+>
+> - 定义：上游 `vod_play_from` 按 `$$$` 切分后的下标（**0 基，空段也占号**）。
+> - 任何策略（`off` / `filter` / `whitelist`）、任何排序下**都按上游原下标输出，不重排**。
+>   被过滤掉的线路不出现，但留下来的线路编号不变。
+> - 客户端历史记录里的 `lineKey` 存的就是它。语义一旦漂移，用户续播会串到别的线路。
+> - 验收：同一部多线路影片，切换 `PLAY_LINE_POLICY` 前后 `play_lines[].original_index` 集合不变。
+
+> **`playable` 语义（v1.14.0 / B-02 确认）**
+>
+> - `false`：该线路/该集不可播（客户端置灰并跳过自动连播）。
+> - 字段缺失或 `null`：**按可播处理**（兼容旧缓存/旧服务端）。
+> - `type` 仅用于展示与诊断，可为空串。
 
 > **为什么会有 `page` 型线路**：部分源站（如非凡资源站，100% 记录如此）第 1 条线路是
 > H5 分享页 `/share/<hash>` —— 返回 `text/html`，真实 m3u8 由页面 JS 生成且带会过期的
@@ -294,32 +362,69 @@ type PlayLine = {
 | 45 | POST | `/api/v1/sources/{slug}/play-line-policy` | 管理 | **v1.11.0** 单源站播放线路策略（inherit/off/filter/whitelist） |
 | 46 | GET | `/api/v1/admin/tables` | 管理 | **v1.12.0** 数据表浏览：可浏览表清单（含列元信息与行数） |
 | 47 | GET | `/api/v1/admin/tables/{name}/rows` | 管理 | **v1.12.0** 数据表浏览：分页查看表数据（按字段/全表搜索） |
+| 48 | GET | `/api/v1/tag/status` | 管理 | **v1.14.0** 标签索引状态（就绪/行数/各源站回填进度） |
+| 49 | POST | `/api/v1/maintenance/tag-index` | 管理 | **v1.14.0** 手动回填标签索引（可断点续跑，可指定单源站） |
+| 50 | GET | `/api/v1/auth/tokens` | 鉴权 | **v1.14.0** 已签发 Token 清单（不返回明文） |
+| 51 | POST | `/api/v1/auth/tokens` | 鉴权 | **v1.14.0** 新增具名 Token（`scope=read\|admin`，明文只返回一次） |
+| 52 | DELETE | `/api/v1/auth/tokens/{token_id}` | 鉴权 | **v1.14.0** 吊销具名 Token（id=0 的存量 Token 不可单独吊销） |
 
-> 共 **47 个接口**。标「管理」的主要供管理面板使用，客户端 App 只需一枚 Token（见 2.1）即可调用「数据」「业务」类接口。
+> 共 **52 个接口**。标「管理」的主要供管理面板使用，客户端 App 只需一枚 Token（见 2.1）即可调用「数据」「业务」类接口。
 > 鉴权类中 `/api/v1/auth/login` 与 `/api/v1/auth/state` **免鉴权**，其余需登录会话 cookie（`POST /api/v1/auth/password` 等也可用 Token 访问）。
 
 ---
 
 ### 4.1 GET `/healthz`
 
-```json
-{ "status": "ok", "db": true, "version": "1.12.1", "build": "<commit sha>", "time": "2026-11-09T09:07:31.882914" }
-```
+**免鉴权**（`/healthz` 永远不需要 Token —— 客户端连接测试与容器探针都打它）。
 
-用途：服务可用性探测 + 判断是否启用 API Key（见 2.1）。
+```json
+{
+  "status": "ok",
+  "db": true,
+  "version": "1.14.0",
+  "build": "<commit sha>",
+  "capabilities": ["backfill_play_from", "play_line_filter", "error_codes",
+                   "token_scope", "star_tags", "related", "paging_v2", "tag_search"],
+  "time": "2026-11-09T09:07:31.882914"
+}
+```
 
 `version` / `build`（v1.9.3 起，纯新增）：服务版本号与构建所用提交的完整 SHA
 （本地源码直跑时 `build` 为 `dev`）。客户端可在「关于/诊断」页展示，便于反馈问题时定位版本；
 运维升级或回滚后用它确认容器里跑的到底是哪一版。
 
-**重要（v1.4.1 起）**：即使数据库繁忙，本接口**仍返回 200**，此时 `status` 为 `"degraded"`、`db` 为 `false`。
+### `capabilities`（v1.14.0 / B-10）
+
+**能力是否可用，看清单里有没有这个名字，不要比版本号。** 版本号只增不减，但某项能力
+可能被灰度关掉，用版本号判断会误判。
+
+| 能力名 | 含义 | 客户端据此做什么 |
+|---|---|---|
+| `tag_search` | `?tag=` 精确检索可用**且索引已建完** | 标签胶囊点击走 `tag=`；没有则退化为 `wd=` 模糊检索 |
+| `backfill_play_from` | `?mode=backfill_play_from` 可回填 `play_from` | 控制台显示「回填线路」按钮 |
+| `play_line_filter` | 详情线路带 `from`/`type`/`playable`/`original_index` | 按 `playable` 置灰线路 |
+| `error_codes` | 失败响应为「非 2xx + `{code,error}`」 | 用服务端 `message` 代替「网络错误」文案 |
+| `token_scope` | 可签发 `read` / `admin` 两档 Token | 控制台写操作改用 admin Token |
+| `star_tags` | `/star/works`、`/star/related`、`/star/tags/*` 可用 | 详情页明星作品/相关推荐 |
+| `related` | 服务端预计算的相关推荐可用 | 详情页推荐栏 |
+| `paging_v2` | `pagecount` 恒以 `page_size` 为基准，缺省 18 | 按 `pagecount` 判定翻页到底 |
+
+形态：**数组**（推荐）。也接受对象形态 `{"tag_search": true, ...}`（加 `?detail=1` 时返回，
+给人看的，客户端不用）。
+
+灰度：`CAPABILITIES_DISABLE=tag_search` 可单独关掉某项（重启生效，无需改代码）；
+`CAPABILITIES_EXTRA` 仅排障用。
+
+**重要（v1.4.1 起）**：即使数据库繁忙，本接口**仍返回 200**，此时 `status` 为 `"degraded"`、`db` 为 `false`，
+且 `capabilities` 自动收缩（`tag_search` / `star_tags` / `related` 这类依赖数据库的能力一律不声明；
+`error_codes` / `paging_v2` 这类描述服务端行为契约的静态能力照常声明）。
 Docker/K8s 健康检查只看状态码，若这里因数据库排队返回 5xx，编排系统会把一个还在正常干活的容器判定为不健康并重启（v1.4.0 的真实故障）。
 因此：
 
-| 场景 | HTTP | `status` | `db` |
-|---|---|---|---|
-| 一切正常 | 200 | `ok` | `true` |
-| 数据库繁忙/暂不可用 | 200 | `degraded` | `false` |
+| 场景 | HTTP | `status` | `db` | `capabilities` |
+|---|---|---|---|---|
+| 一切正常 | 200 | `ok` | `true` | 全量（索引就绪时含 `tag_search`） |
+| 数据库繁忙/暂不可用 | 200 | `degraded` | `false` | 仅静态项 |
 
 App 端不要把 `degraded` 当"服务已死"，应降级提示并退避重试；只有网络层失败（连不上）才视为服务不可用。
 
@@ -418,17 +523,19 @@ GET /api/v1/videos?source=jkun&type_name=电影
 | `ac` | string | 空 | `detail` 或 `videolist` → 列表返回完整字段 |
 | `ids` | string | 空 | 逗号分隔数字，批量取详情 |
 | `play_raw` | int | 0 | **v1.11.0**：`1`=不过滤/不排序，返回原始 `vod_play_list`（排障用） |
+| `tag` | string | 空 | **v1.14.0**：标签精确检索（与 `wd` 二选一，同时传以 `tag` 为准），见 4.6 |
 | `page` | int | 1 | 页码 |
-| `page_size` | int | 30 | 1–100 |
+| `page_size` | int | 18 | 1–100（v1.14.0 起默认 18） |
 
 **① ④ 响应**：
 
 ```json
 {
-  "code": 1,
+  "code": 0,
   "page": 1,
   "pagecount": 308,
   "total": 6160,
+  "total_approximate": true,
   "query_ms": 23,
   "list": [{
     "source": "jkun",
@@ -438,10 +545,16 @@ GET /api/v1/videos?source=jkun&type_name=电影
     "vod_name": "示例影片",
     "vod_pic": "https://example.com/cover.jpg",
     "vod_remarks": "高清",
+    "remarks": "高清",
+    "vod_area": "大陆",
+    "vod_year": "2024",
     "vod_time": "2026-10-30 10:59:06"
   }]
 }
 ```
+
+> **v1.14.0 / B-04**：`total_approximate` **恒出现**（`true`=估值，显示「约 N 条」；
+> `false`=精确）。旧版只在近似时才带，客户端无法区分「缺字段」与「精确」。
 
 > **v1.7.0 新增字段**（都可忽略，不影响解析）：
 > - `query_ms`：服务端本次查询耗时（毫秒），可用于客户端埋点
@@ -565,32 +678,39 @@ GET /api/v1/videos/jkun/134369
 ### 4.6 GET `/api/v1/search` — 跨源站聚合搜索
 
 ```http
+# 名称模糊搜索（老行为，未变）
 GET /api/v1/search?wd=三体
 GET /api/v1/search?wd=三体&source=jkun,t1
 GET /api/v1/search?wd=三体&type_name=电影&page=1&page_size=20
+
+# 标签精确检索（v1.14.0 / B-01）—— 详情页标签胶囊点进去就用这个
+GET /api/v1/search?tag=%E6%82%AC%E7%96%91&source=ffzy&page=1&page_size=18
 ```
 
 | 参数 | 类型 | 默认 | 范围 | 说明 |
 |---|---|---|---|---|
-| `wd` | string | — | 1–64 字 | **必填**，影视名称关键词 |
+| `wd` | string | 空 | 1–64 字 | 影视名称关键词（`wd` 与 `tag` **至少给一个**） |
+| `tag` | string | 空 | 1–64 字 | **v1.14.0**：标签精确检索。与 `wd` 同时传时**以 `tag` 为准** |
 | `source` | string | 空 | — | 限定源站（更快）；空=全部 |
 | `type_name` | string | 空 | — | 按分类名过滤 |
 | `page` | int | 1 | ≥1 | 页码 |
-| `page_size` | int | 20 | 1–100 | 每页条数 |
-| `per_source_limit` | int | 200 | 10–1000 | 每个源站最多返回的候选数（一般不用动） |
+| `page_size` | int | 18 | 1–100 | 每页条数 |
+| `per_source_limit` | int | 200 | 10–1000 | 每个源站最多返回的候选数（仅 `wd` 路径；一般不用动） |
 
 ```json
 {
-  "code": 1,
+  "code": 0,
   "wd": "三体",
   "page": 1,
-  "page_size": 20,
+  "page_size": 18,
   "pagecount": 1,
   "total": 5,
+  "total_approximate": true,
   "total_is_partial": false,
   "truncated_sources": [],
   "sources_searched": 52,
   "sources_failed": [],
+  "query_ms": 76,
   "elapsed_ms": 76,
   "list": [{
     "source": "jkun",
@@ -601,6 +721,9 @@ GET /api/v1/search?wd=三体&type_name=电影&page=1&page_size=20
     "vod_name": "三体",
     "vod_pic": "https://example.com/cover.jpg",
     "vod_remarks": "全30集",
+    "remarks": "全30集",
+    "vod_area": "大陆",
+    "vod_year": "2023",
     "vod_time": "2026-10-29 21:33:12"
   }]
 }
@@ -610,8 +733,23 @@ GET /api/v1/search?wd=三体&type_name=电影&page=1&page_size=20
 - `total` 是「各源站候选上限内的命中数」，**不是全库精确总数**；`total_is_partial=true` 表示有源站结果被截断（`truncated_sources` 列出）。
 - 单个源站查询失败不影响整体：结果照常返回，失败源站列入 `sources_failed`（`[{slug, error}]`）。
 - 结果按 `vod_time` 倒序。
-- 翻页以 `pagecount` 为准；`elapsed_ms` 可用于性能埋点。
-- **错误**：`wd` 为空 → 422（缺少参数）；无可搜索源站 → 404。
+- 翻页以 `pagecount` 为准；`query_ms` / `elapsed_ms`（同值）可用于性能埋点。
+- **错误**：`wd` 与 `tag` 都为空 → `400 / 40001`；无可搜索源站 → `404 / 40401`。
+
+#### `?tag=` 的匹配规则（v1.14.0 / B-01）
+
+1. **分词后精确匹配**：把 `vod_tag` 按 `,` `，` `/` `|` `、` `;` `；` 切开，逐段去首尾空白、
+   压缩内部空白、ASCII 转小写，然后**整段相等**才算命中。
+   - `tag=悬疑` 命中 `vod_tag="悬疑,犯罪"`；
+   - **不命中** `vod_tag="悬疑喜剧"`、`"反悬疑"` —— 不做子串包含（CJK 无词边界，子串匹配语义不可控）。
+2. **大小写不敏感（仅 ASCII）**：`tag=SCI-FI` 与 `sci-fi` 命中同一批。
+3. **`source` 过滤**：只传一个源站时只搜它；不传则跨站合并（结果同 `/videos` 的排序）。
+4. **结果结构**与 `/videos` 完全一致（`list` / `pagecount` / `total` / `query_ms`），
+   但 `total_approximate` **恒为 `false`** —— 标签结果集能由索引精确计数。
+5. **空结果是 200**：`{"code":0,"total":0,"pagecount":0,"list":[]}`，不是 404
+   （「没有带这个标签的片」是正常结果，不该让客户端弹错误）。
+6. **能力门控**：`/healthz.capabilities` 里没有 `tag_search` 时不要用这个参数
+   （索引没建完会漏数据），退回 `wd=` 检索。
 
 ---
 
@@ -1258,6 +1396,107 @@ GET /api/v1/related?slug=jkun&id=134369&limit=8
 
 ---
 
+### 4.25 标签索引状态与回填（v1.14.0 / B-01，管理面板专用）
+
+#### `GET /api/v1/tag/status` — 索引状态
+
+```json
+{
+  "code": 0,
+  "ready": true,
+  "enabled": true,
+  "on_sync": true,
+  "building": [],
+  "rows": 604128,
+  "sources": [{
+    "slug": "ffzy",
+    "status": "done",
+    "cursor": 138942,
+    "total": 138942,
+    "indexed": 375104,
+    "progress": 100.0,
+    "error": "",
+    "finished_at": "2026-11-09T15:20:41"
+  }]
+}
+```
+
+- `ready`：**唯一**决定 `/healthz` 是否声明 `tag_search` 的判据。判定条件 = 所有「启用且已有
+  数据表」的源站都 `status=done`，且 `video_tags` 至少有一行。
+- `progress` 以 `cursor / total` 计算，`cursor` 是已处理到的最大 `vod_id`（不是条数）。
+- `building` 是正在回填的 slug 列表（空数组表示没有任务在跑）。
+
+#### `POST /api/v1/maintenance/tag-index` — 手动回填
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `slug` | string | 空 | 只回填该源站；空=全部启用源站 |
+| `force` | int | 0 | `1`=先清空该源站标签行再从头建（怀疑索引脏了才用） |
+
+后台线程执行，立即返回受理回执。**幂等**（先删后插 + 主键去重）、**可断点续跑**
+（游标落 `tag_index_state`）、**可重复点**（同一 slug 已在跑时不会重复启动）。
+
+```json
+{ "code": 0, "msg": "标签索引回填已受理", "slug": "", "force": false, "started": true }
+```
+
+`started=false` 表示同参数任务已在跑（不是错误）。
+
+---
+
+### 4.26 Token 权限粒度（v1.14.0 / B-08）
+
+| scope | 允许 | 典型调用方 |
+|---|---|---|
+| `read` | GET 列表/详情/搜索/分类/统计/暂停状态/`/healthz`、`/related/status`、`/star/tags/status` | App 浏览主链路 |
+| `admin` | 全部写操作、`/auth/*`、`/admin/*`、`/maintenance/*`、词库 CRUD | 同步控制台 |
+
+#### `GET /api/v1/auth/tokens` — 已签发 Token 清单（**不返回明文**）
+
+```json
+{
+  "code": 0,
+  "list": [
+    { "id": 0, "kind": "legacy", "scope": "admin",
+      "note": "存量单 Token（面板「设置」可查看/重置）",
+      "created_at": "2026-10-31T16:19:14", "last_used_at": null, "present": true },
+    { "id": 3, "kind": "scoped", "scope": "read", "note": "App 只读",
+      "created_at": "2026-11-09T15:31:02", "last_used_at": "2026-11-09T15:40:11", "present": true }
+  ]
+}
+```
+
+`id=0` 恒为 `settings` 里那枚存量 Token（`kind=legacy`），它与 `api_tokens` 表里的具名
+Token 并存：升级后不需要动任何客户端配置。
+
+#### `POST /api/v1/auth/tokens` — 新增具名 Token
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `scope` | string | `read` | `read` / `admin`；非法值按 `read` 处理 |
+| `note` | string | 空 | 用途备注（≤128 字），轮换时避免误删 |
+
+```json
+{ "code": 0, "id": 3, "token": "vs_xxx", "scope": "read", "note": "App 只读", "created_at": "..." }
+```
+
+**明文只在这里返回一次**（库里只存 `sha256`），丢了只能吊销重发。
+
+#### `DELETE /api/v1/auth/tokens/{token_id}` — 吊销
+
+幂等；`id=0`（存量 Token）返回 `404`，那枚只能通过 `POST /api/v1/auth/token` 轮换。
+
+#### 强制校验与灰度
+
+- 默认 `TOKEN_SCOPE_ENFORCE=false`：**所有 Token 等价 admin**（升级当天零影响）。
+- 打开后，只读 Token 调写接口返回 `403 / 40301 / insufficient_scope / required: "admin"`。
+- `TOKEN_SCOPE_LEGACY_BELOW=1.6.0` 时，低于该版本的客户端（`X-Client-Version` 头或
+  `client_version` 参数自报）按 admin 放行；**不自报版本的也放行**（宽进严出），
+  避免老 App 整站失效。
+- 回滚：把 `TOKEN_SCOPE_ENFORCE` 设回 `false` 重启，不需要改数据。
+
+---
+
 ## 5. 状态语义与推荐 UI（最容易做错的部分）
 
 ### 5.1 单源站状态判定（按顺序）
@@ -1592,7 +1831,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.13.0（当前） | **面板布局调整 + 管理能力补齐（无接口变更）**：「明星词库」从设置弹层移到主面板独立区块；`main` 去掉 1280px 限宽改为全屏自适应；面板新增此前只有 API 的 5 个维护能力入口 —— 明星 Tag 覆盖统计（`/star/tags/status`）、高频词建议（`/star/tags/untracked`，支持一键加入词库）、重建明星 Tag（`/maintenance/star-tags`）、推荐覆盖率（`/related/status`）、按源站重算推荐（`/maintenance/related-recompute`），以及源站行的「回填线路」（`/sync/{slug}?mode=backfill_play_from`） |
+| v1.14.0（当前） | **后端契约升级（B-01/B-02/B-03/B-04/B-05/B-06/B-08/B-09/B-10/B-11）**：`/healthz` 新增 `capabilities` 能力清单（`tag_search` / `error_codes` / `token_scope` …，DB 降级时自动收缩）；错误码统一为「非 2xx + `{code, error, detail, message}`」（`40001`/`40101`/`40301`/`40401`，参数校验由 422 改 400 并带 `field`）；**成功码默认 0**（`API_SUCCESS_CODE` 可退回 1，MacCMS 兼容接口恒 1）；`/api/v1/search` 与 `/api/v1/videos` 新增 `?tag=` 标签精确检索（倒排表 `video_tags`，索引就绪才声明能力）；列表新增 `remarks` / `vod_area` / `vod_year`，详情新增 `play_lines` / `tag` 同值别名，剧集新增 `from`/`type`/`playable`；`total_approximate` 恒出现；`page_size` 缺省改 18；新增 `GET /api/v1/tag/status`、`POST /api/v1/maintenance/tag-index`、`GET\|POST /api/v1/auth/tokens`、`DELETE /api/v1/auth/tokens/{id}`（read/admin 两档权限，默认宽权限放行）。详见 `MIGRATION_NOTES.md` |
+| v1.13.0 | **面板布局调整 + 管理能力补齐（无接口变更）**：「明星词库」从设置弹层移到主面板独立区块；`main` 去掉 1280px 限宽改为全屏自适应；面板新增此前只有 API 的 5 个维护能力入口 —— 明星 Tag 覆盖统计（`/star/tags/status`）、高频词建议（`/star/tags/untracked`，支持一键加入词库）、重建明星 Tag（`/maintenance/star-tags`）、推荐覆盖率（`/related/status`）、按源站重算推荐（`/maintenance/related-recompute`），以及源站行的「回填线路」（`/sync/{slug}?mode=backfill_play_from`） |
 | v1.12.2 | **修复数据表浏览「查询没有数据」**：面板把 `/rows` 返回的列名（字符串数组）当对象取 `.name`，导致表头空白、每格渲染成 `-`；改由 `tbCols()` 归一化后再渲染。接口无变化，纯前端修复 |
 | v1.12.1 | **数据表浏览显示源站名称**：清单接口每项新增 `label`（`vod_*` 取 `sources.name`，如「新极品资源站」）；`name` 仍为表名，请求路径不变。孤儿表标「无对应源站」、同名源站追加表名去歧义。纯展示层变更，无接口破坏 |
 | v1.12.0 | **管理面板数据表浏览**：新增 `GET /api/v1/admin/tables`（表清单 + 列元信息）与 `GET /api/v1/admin/tables/{name}/rows`（分页 / 按字段或全表搜索 / 页码跳转）；面板新增「数据表浏览」区块。纯新增管理接口，客户端 App 无需改动 |

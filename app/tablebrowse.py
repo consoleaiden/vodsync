@@ -30,6 +30,7 @@ import math
 from sqlalchemy import String, cast, func, or_, select
 
 from . import database
+from .apiresp import SUCCESS_CODE
 from .models import (
     star_map,
     star_terms,
@@ -220,7 +221,8 @@ def browse(name: str, page: int, page_size: int, field: str = "", q: str = "") -
         ).mappings().all()
 
     return {
-        "code": 1,
+        # v1.14.0：与其它接口统一的成功码（默认 0；见 config.API_SUCCESS_CODE）
+        "code": SUCCESS_CODE,
         "table": name,
         "columns": colnames,
         "rows": [dict(r) for r in rows],

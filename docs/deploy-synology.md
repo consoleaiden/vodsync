@@ -194,3 +194,8 @@ Control Panel → Login Portal → Advanced → Reverse Proxy：
 - 来源：`https://vodsync.example.com:443`
 - 目的地：`http://localhost:8181`
 然后配合 DSM 的 Let's Encrypt 证书即可。
+
+> **v1.14.0 起 Token 建议走 HTTPS。** 完整的双栈上线顺序、必须检查的 5 个点（鉴权头透传、
+> XFF 覆盖而非追加、超时、gzip、TLS 版本）、验收命令与回退方式见
+> [DEPLOY_HTTPS.md](./DEPLOY_HTTPS.md)。**不要用自签证书** —— Android 7+ 不信任用户自签 CA，
+> 表现是「连不上」而不是「证书警告」。

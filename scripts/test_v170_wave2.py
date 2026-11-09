@@ -186,10 +186,10 @@ def main():
     check("不带 source 返回 200", r.status_code == 200, r.status_code)
     check("API 总数 15", body.get("total") == 15, body.get("total"))
     check("API 返回 query_ms", isinstance(body.get("query_ms"), int), body.keys())
-    check("API 列表项字段完整",
-          set(body["list"][0]) == {"source", "vod_id", "type_id", "type_name",
-                                   "vod_name", "vod_pic", "vod_remarks", "vod_time"},
-          str(body["list"][0].keys()))
+    # v1.14.0：新增 remarks（契约名）/ vod_area / vod_year，用子集断言避免下次加字段又红
+    need = {"source", "vod_id", "type_id", "type_name", "vod_name", "vod_pic",
+            "vod_remarks", "remarks", "vod_area", "vod_year", "vod_time"}
+    check("API 列表项字段完整", need <= set(body["list"][0]), str(body["list"][0].keys()))
     r = client.get("/api/v1/videos?page=1&page_size=3&ac=detail")
     check("ac=detail 带播放地址",
           r.status_code == 200 and "vod_play_list" in r.json()["list"][0], r.status_code)

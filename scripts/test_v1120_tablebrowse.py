@@ -149,9 +149,13 @@ def main():
           r["total"])
 
     # ---- G. 参数校验 ----
-    check("G1 page=0 -> 422", client.get("/api/v1/admin/tables/sources/rows?page=0").status_code == 422)
-    check("G2 page_size=101 -> 422",
-          client.get("/api/v1/admin/tables/sources/rows?page_size=101").status_code == 422)
+    # v1.14.0 / B-11：参数校验错误从 FastAPI 默认的 422 统一为 400 + code=40001
+    r = client.get("/api/v1/admin/tables/sources/rows?page=0")
+    check("G1 page=0 -> 400", r.status_code == 400 and r.json().get("code") == 40001,
+          r.status_code)
+    r = client.get("/api/v1/admin/tables/sources/rows?page_size=101")
+    check("G2 page_size=101 -> 400", r.status_code == 400 and r.json().get("code") == 40001,
+          r.status_code)
     check("G3 合法 page_size=50 -> 200",
           client.get("/api/v1/admin/tables/sources/rows?page_size=50").status_code == 200)
 

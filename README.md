@@ -25,6 +25,16 @@
 - **播放线路过滤**（v1.11.0）：入库保留上游 `vod_play_from`，读接口识别线路类型（m3u8/mp4/flv/mkv/page/unknown）并剔除 `/share/` 这类「H5 分享页」——这类线路返回 text/html、真实地址由页面 JS 生成且带过期 sign，客户端按顺序选第一条必然播不出来；可按源站覆盖策略，`vod_play_url` 原始串不改写，`?play_raw=1` 可排障
 - **数据表浏览**（v1.12.0 / v1.12.1）：管理面板新增只读数据浏览器——下拉切表（`vod_*` 表显示**源站名称**而不是 slug）、按指定字段或全表搜关键词、每页 10/20/50/100 条、页码直跳；后端 `GET /api/v1/admin/tables` 与 `/api/v1/admin/tables/{name}/rows`（表名/字段名走服务端白名单，`settings` 密码哈希表有意排除）
 
+- **标签精确检索**（v1.14.0）：详情页标签胶囊点进去按「分词后整段相等」检索（`?tag=`），
+  而不是把标签当关键词模糊搜 —— 后者会搜进「悬疑喜剧」「反悬疑」、又漏掉片名不含但标签是的片。
+  倒排表 `video_tags` + `(tag_norm, source)` 索引支撑，`total` 精确计数；同步增量维护、
+  升级后启动自动回填（可断点续跑），**索引没建完不会对外声明能力**，客户端继续用 `wd` 检索
+- **能力清单与统一错误码**（v1.14.0）：`/healthz` 返回 `capabilities`（`tag_search` /
+  `error_codes` / `token_scope` …），前后端发版不再需要同时完成；业务失败统一为
+  「非 2xx + `{code, error, detail}`」（`40001`/`40101`/`40301`/`40401`），不再有
+  「200 + code:1 表示失败」的二义形态；Token 拆 `read`/`admin` 两档（默认宽权限放行，
+  打开强制前不影响现网）
+
 > 文档入口：[`docs/README.md`](docs/README.md)（按用途索引全部文档）
 
 ## 技术选型说明
@@ -436,14 +446,14 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
 | tag | 示例 | 是否可变 | 用途 |
 |---|---|---|---|
 | `latest` | `…/vodsync:latest` | 可变 | 生产默认跟随最新（只在 main 分支构建时更新） |
-| 版本号 | `…/vodsync:1.13.0` | 可变 | 同一版本多次构建时指向最新一次 |
-| 次版本号 | `…/vodsync:1.12` | 可变 | 小版本内快速定位 |
-| 版本 + 提交 | `…/vodsync:1.13.0-2a5c29f` | **不可变** | **回滚用这个** —— 一个提交一个镜像，永不被覆盖 |
-| 提交短 SHA | `…/vodsync:sha-2a5c29f` | **不可变** | 按提交回滚 / 溯源 |
+| 版本号 | `…/vodsync:1.14.0` | 可变 | 同一版本多次构建时指向最新一次 |
+| 次版本号 | `…/vodsync:1.13` | 可变 | 小版本内快速定位 |
+| 版本 + 提交 | `…/vodsync:1.14.0-<sha7>` | **不可变** | **回滚用这个** —— 一个提交一个镜像，永不被覆盖 |
+| 提交短 SHA | `…/vodsync:sha-<sha7>` | **不可变** | 按提交回滚 / 溯源 |
 
 版本号唯一来源是 `app/__init__.py` 里的 `__version__`：CI 从这里读出来生成 tag，
 `/docs` 与 `/healthz` 也读同一个值。推 `vX.Y.Z` git tag 时 CI 会校验 tag 与代码里的版本号一致，
-不一致直接构建失败（防止「镜像说 1.13.0、代码其实是 1.12.2」这种回滚事故）。
+不一致直接构建失败（防止「镜像说 1.14.0、代码其实是 1.13.0」这种回滚事故）。
 每次构建的日志开头会打印「构建版本：…」，Actions 页面即可查到某一版打了哪些 tag。
 
 ### 升级（跟随最新）
@@ -455,20 +465,21 @@ sudo docker compose pull vodsync && sudo docker compose up -d
 
 ### 回滚到指定版本
 
-> 下例以「回到 v1.13.0 这次构建」为样本，把 tag 换成你要回到的那一版即可。
+> 下例以「回到 v1.14.0 这次构建」为样本。`<sha7>` 换成那次构建的提交短 SHA
+> （`git log --oneline -1` 的前 7 位，或 Actions 构建日志里的 tag 列表）。
 
 ```bash
 # 1) 看有哪些版本：GitHub → 仓库右侧 Packages → vodsync（或 Actions 里某次构建的 tag 列表）
 #    也可以直接试拉，404 就是没有这个版本
-sudo docker pull ghcr.io/consoleaiden/vodsync:1.13.0-2a5c29f
+sudo docker pull ghcr.io/consoleaiden/vodsync:1.14.0-<sha7>
 
 # 2) 改 compose 里的镜像 tag（推荐用不可变的「版本 + 提交」tag）
-#    image: ghcr.io/consoleaiden/vodsync:1.13.0-2a5c29f
+#    image: ghcr.io/consoleaiden/vodsync:1.14.0-<sha7>
 sudo docker compose up -d
 
 # 3) 核对真的回滚成功了（version/build 对不上说明 tag 或缓存不对）
 curl -s http://127.0.0.1:8181/healthz
-# {"status":"ok","db":true,"version":"1.13.0","build":"2a5c29f8d10a9f637a145b2578d4fb944dca4353",...}
+# {"status":"ok","db":true,"version":"1.14.0","build":"<完整 40 位 sha>",...}
 ```
 
 要点：
@@ -477,7 +488,7 @@ curl -s http://127.0.0.1:8181/healthz
   旧版本忽略它们即可 —— 本项目迁移均为「加列/加表」，不删不改，因此前后兼容。
   唯一的例外是算法类升级（如相关推荐算法版本）：旧镜像启动后会把 `algo_version` 视为不匹配并重算，
   属预期行为。
-- **生产环境建议把 `latest` 钉成具体版本**（`1.13.0-2a5c29f`），否则下次 `docker compose pull`
+- **生产环境建议把 `latest` 钉成具体版本**（`1.14.0-<sha7>`），否则下次 `docker compose pull`
   又会回到最新；想「只升指定版本」就永远别用 `latest`。
 - `docker compose pull` 发现有同名 tag 被覆盖时才会更新，所以**用不可变 tag 时拉取是幂等的**。
 - `build` 字段取自镜像构建时的提交 SHA（本地 `build: .` 时为 `unknown`），是区分「同名版本不同构建」的唯一凭据。
@@ -540,6 +551,9 @@ vodsync/
     ├── APP_TOKEN_UPGRADE.md          # 给已有 App 加 API Token 的施工单（交给 AI 执行）
     ├── UPGRADE_2026-11-07_v1.10.x.md # v1.9.3 → v1.10.x 升级报告（前端对接清单）
     ├── UPGRADE_2026-11-07_v1.11.0.md # v1.10.x → v1.11.0 升级报告（播放线路过滤）
+    ├── UPGRADE_2026-11-09_v1.14.0.md # v1.13.0 → v1.14.0 升级报告（能力清单/错误码/标签检索）
+    ├── MIGRATION_NOTES.md            # v1.14.0 建表 DDL、回填脚本、灰度与回滚
+    ├── DEPLOY_HTTPS.md               # HTTPS 双栈上线（Nginx / Caddy / 群晖）
     ├── REVIEW_2026-11-07.md          # 代码审查报告（v1.9.3 基线，问题已全部落地）
     ├── REVIEW_2026-11-03.md          # 复盘报告（v1.5.2 基线，已在 v1.6.0 修复）
     └── RESPONSE_ENCRYPTION_PLAN.md   # 响应加密/请求签名方案（规划稿，未实施）
@@ -548,6 +562,43 @@ vodsync/
 ## 变更记录
 
 > 按版本号**从新到旧**排列，最新版本在最前。历史版本只做归档记录，细节以对应版本的代码与文档为准。
+
+### v1.14.0
+后端契约升级（对接 `BACKEND_UPGRADE_REQUIREMENTS_2026-11-09.md` 的 B-01 ~ B-11）：
+加能力、收错误码，**不改任何既有字段名**。详见 `docs/UPGRADE_2026-11-09_v1.14.0.md`。
+
+- **能力清单**（B-10）：`/healthz` 新增 `capabilities[]`（`tag_search` / `error_codes` /
+  `token_scope` / `backfill_play_from` / `play_line_filter` / `star_tags` / `related` /
+  `paging_v2`），客户端据此判断「能不能用新参数」，不再靠版本号比较；数据库不可用时
+  依赖库的能力自动收缩，静态能力照常声明。新增 `CAPABILITIES_DISABLE` / `CAPABILITIES_EXTRA`
+  两个环境变量做灰度
+- **统一错误码**（B-11）：业务失败一律「非 2xx + `{code, error, detail, message}`」；
+  参数校验 422 → 400（带 `field`），鉴权 40101、权限 40301、不存在 40401、内部错误 50001；
+  成功码改为 **0**（`API_SUCCESS_CODE=1` 可退回，MacCMS 兼容接口恒 1）
+- **标签精确检索**（B-01）：`/search` 与 `/videos` 新增 `?tag=`，按 `,` `，` `/` `|` `、` 切分后
+  **整段相等**匹配（大小写仅 ASCII 不敏感，不做子串包含）；新增 `video_tags` 倒排表 +
+  `(tag_norm, source)` 索引、`tag_index_state` 进度表；同步增量维护，启动自动回填
+  （游标断点续跑）、`GET /api/v1/tag/status`、`POST /api/v1/maintenance/tag-index`、
+  `scripts/backfill_tags.py` 三种方式可观测/可干预；**索引就绪才声明 `tag_search`**，
+  面板新增「标签索引」区块
+- **Token 权限粒度**（B-08）：新增 `api_tokens` 表与 `GET|POST /api/v1/auth/tokens`、
+  `DELETE /api/v1/auth/tokens/{id}`，`read`（浏览）/ `admin`（写操作与维护）两档；
+  默认 `TOKEN_SCOPE_ENFORCE=false` 全放行（升级零影响），打开后只读 Token 调写接口返回
+  `403 / 40301 / required:admin`；`TOKEN_SCOPE_LEGACY_BELOW` 可按客户端版本宽限，回滚只需关开关
+- **契约书面化**（B-02/B-03/B-04/B-05/B-06）：`original_index` 语义（上游 `$$$` 切分下标、
+  空段占号、任何策略下不重排）、`playable` 缺省即「可播」、`pagecount = ceil(total/page_size)`
+  全部写进文档；`page_size` 缺省 30 → **18**（与客户端固定传值一致）；`total_approximate`
+  恒出现（精确时为 `false`）
+- **字段补齐**：列表新增 `remarks`（= `vod_remarks`）、`vod_area`、`vod_year`；详情新增
+  `play_lines`（= `vod_play_list`）、`tag`（= `vod_tag`）同值别名；剧集新增 `from` / `type` /
+  `playable`（逐集判定，线路里混 H5 页面时单集置灰）。别名双发是为了让「按契约写的新客户端」
+  与「现网 v1.5.x 老客户端」都不用改；重复内容由 gzip 吃掉
+- **HTTPS 双栈**（B-09）：新增 `deploy/nginx-vodsync.conf`、`deploy/Caddyfile` 与
+  `docs/DEPLOY_HTTPS.md`（443 与 8181 并行、TLS1.2/1.3、HSTS 延后开启、gzip、
+  `proxy_read_timeout`、鉴权头与 XFF 覆盖、验收命令、群晖图形界面要点）
+- 迁移与回滚：`docs/MIGRATION_NOTES.md`（3 张新表 DDL、回填耗时、灰度开关、自检命令）
+- 测试：`scripts/test_v1140_contract.py` 123 项（能力清单 / 错误码 / 分页 / 标签检索 /
+  索引维护 / Token 权限 / 详情契约 / 回归）；全量 21 套回归全绿
 
 ### v1.13.0
 面板布局调整：明星词库独立成区块 + 内容区自适应全屏。

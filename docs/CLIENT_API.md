@@ -38,26 +38,43 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 
 ### 1.2 统一响应结构
 
-**成功**：HTTP 200，业务字段 `code: 1`：
+> **v1.14.0 起语义收紧（字段名一个没改）**：成功 = HTTP 2xx **且** `code == 0`；
+> 业务失败 = **非 2xx** + `{code, error, detail}`。不再有「200 + code:1 表示失败」。
+> 成功码可用服务端 `API_SUCCESS_CODE` 改回 1（灰度回滚开关）；
+> **例外**：`/api/v1/{slug}`（苹果 CMS 兼容）恒为 `code:1`。
+
+**成功**：HTTP 200，`code: 0`：
 
 ```json
-{ "code": 1, "total": 100, "list": [ ... ] }
+{ "code": 0, "total": 100, "list": [ ... ] }
 ```
 
-**失败**：HTTP 状态码 + `detail` 文本：
+**失败**：HTTP 4xx/5xx：
 
 ```json
-{ "detail": "源站 xxx 不存在" }
+{ "code": 40001, "error": "bad_request", "detail": "参数错误：page 输入应大于等于 1",
+  "message": "参数错误：page 输入应大于等于 1", "field": "page" }
 ```
+
+| 字段 | 说明 |
+|---|---|
+| `code` | 程序判据。`0` 成功；`40001` 参数、`40101` 鉴权、`40301` 权限、`40401` 不存在、`50001` 内部错误 |
+| `error` | 稳定英文串（`bad_request` / `invalid_token` / `insufficient_scope` / `not_found` / `internal_error`） |
+| `detail` | 人可读中文（**历史上客户端读的就是它**，永远保留） |
+| `message` | 与 `detail` 同值（新客户端可只读这个） |
+| `field` | 参数错误时指出具体字段 |
+| `required` | 403 时说明需要什么权限（`admin`） |
 
 | HTTP 状态码 | 含义 |
 |---|---|
-| 200 | 成功 |
-| 400 | 参数错误（如 ids 格式、非法 slug、空关键词） |
-| 401 | API Key 缺失/错误 |
-| 404 | 资源不存在（源站 / 视频 / 尚未同步数据），detail 中带补救建议 |
-| 422 | 参数校验失败（FastAPI 标准格式，`detail` 为数组） |
-| 500 | 服务端异常 |
+| 200 | 成功（`code=0`） |
+| 400 | 参数错误（含**校验失败**，v1.14.0 起原 422 统一为 400 并带 `field`） |
+| 401 | 未授权：Token 缺失/错误/已轮换（`code=40101`） |
+| 403 | 权限不足：只读 Token 调写接口（`code=40301`，`required: "admin"`） |
+| 404 | 资源不存在（源站 / 视频 / 尚未同步数据 / 表），`detail` 中带补救建议 |
+| 429 | 预留（限流） |
+| 500 | 服务端异常（**不回显堆栈**） |
+| 503 | 数据库繁忙，带 `Retry-After`，按指数退避重试 1–3 次 |
 
 ### 1.3 通用参数
 
@@ -65,7 +82,8 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 |---|---|---|
 | `source` | videos / categories / search | 源站标识（slug），**逗号分隔可多源合并**；留空 = 全部源站。slug 从 `/source` 或 `/api/v1/sources` 获取，仅允许 `a-z 0-9 _` |
 | `page` / `pg` | 列表类 | 页码，从 1 开始 |
-| `page_size` | 列表类 | 每页条数，默认 30（`API_PAGE_SIZE_DEFAULT`），上限 100（`API_PAGE_SIZE_MAX`）；三列宫格建议 30 |
+| `page_size` | 列表类 | 每页条数，**v1.14.0 起默认 18**（与客户端固定传值一致），上限 100；超上限返回 `400 / 40001` |
+| `tag` | search / videos | **v1.14.0**：标签精确检索（与 `wd` 二选一，同时传以 `tag` 为准），见 3.5 |
 
 ### 1.4 时间格式
 
@@ -133,7 +151,7 @@ App 初始化时调用一次，得到全部可用源站及其对接路径。
 
 ```json
 {
-  "code": 1, "total": 52, "alive": 52, "ready": 1,
+  "code": 0, "total": 52, "alive": 52, "ready": 1,
   "server_time": "2026-10-30T13:00:00",
   "list": [{
     "name": "JKUN资源站",            // 展示名
@@ -163,7 +181,7 @@ App 初始化时调用一次，得到全部可用源站及其对接路径。
 
 ```json
 {
-  "code": 1, "total": 23,
+  "code": 0, "total": 23,
   "list": [
     { "type_id": 1, "type_name": "电影", "count": 1203, "sources": ["jkun","t1"] },
     { "type_id": 6, "type_name": "连续剧", "count": 890, "sources": ["jkun"] }
@@ -202,7 +220,7 @@ GET /api/v1/videos?source=jkun&type_name=电影
 
 ```json
 {
-  "code": 1, "page": 1, "pagecount": 133, "total": 2640,
+  "code": 0, "page": 1, "pagecount": 133, "total": 2640,
   "list": [{
     "source": "jkun",          // ★ 详情请求时回传的 slug
     "vod_id": 134369,          // ★ 详情请求时回传的 id
@@ -211,6 +229,9 @@ GET /api/v1/videos?source=jkun&type_name=电影
     "vod_name": "XXX",
     "vod_pic": "https://.../cover.jpg",
     "vod_remarks": "HD",       // 通常为清晰度/更新至第N集
+    "remarks": "HD",           // v1.14.0：与 vod_remarks 同值（契约名），两个都给
+    "vod_area": "大陆",        // v1.14.0：地区（列表卡片展示用）
+    "vod_year": "2024",        // v1.14.0：年份
     "vod_time": "2026-10-29 21:33:12"
   }]
 }
@@ -232,13 +253,22 @@ GET /api/v1/videos?source=jkun&type_name=电影
       "playable": true,                // v1.11.0：type != "page"
       "original_index": 1,             // v1.11.0：在上游 vod_play_url 里的下标（0 基）
       "episodes": [
-        { "name": "第01集", "url": "https://.../index.m3u8" },
-        { "name": "第02集", "url": "https://.../index2.m3u8" }
+        { "name": "第01集", "url": "https://.../index.m3u8",
+          "from": "ffm3u8", "type": "m3u8", "playable": true },   // v1.14.0：逐集也带这三项
+        { "name": "第02集", "url": "https://.../index2.m3u8",
+          "from": "ffm3u8", "type": "m3u8", "playable": true }
       ]
     }
-  ]
+  ],
+  "play_lines": [ /* v1.14.0：与 vod_play_list 同值，契约里叫 play_lines */ ],
+  "tag": "悬疑,犯罪"                  // v1.14.0：与 vod_tag 同值
 }
 ```
+
+> **v1.14.0：`play_lines` / `remarks` / `tag` 是同值别名。** 契约文档里这三个字段叫这个名字，
+> 但历史接口一直叫 `vod_play_list` / `vod_remarks` / `vod_tag`。两边都不能删（改哪个都会让
+> 一半客户端白屏），所以同值双发；JSON 里重复的部分 gzip 会压掉，带宽代价接近 0。
+> 新代码建议用契约名，老代码不用动。
 
 **播放地址使用建议**：优先取 `vod_play_list[*].episodes[*].url`（已结构化且**已过滤掉不可播的分享页线路**）；
 `vod_play_url` 是源站原始串仅作兜底。地址多为 m3u8 直链，可直接交给播放器内核。
@@ -266,7 +296,7 @@ GET /api/v1/videos?source=jkun&type_name=电影
 GET /api/v1/videos/jkun/134369
 ```
 
-响应 `{"code":1, "detail": { ...详情字段，同 3.3 详情模式... }}`。不存在返回 404。
+响应 `{"code":0, "detail": { ...详情字段，同 3.3 详情模式... }}`。不存在返回 `404 / 40401`。
 
 > **v1.11.0：播放线路默认已过滤**（同 3.3）。`detail.vod_play_list` 里不会再出现
 > `/share/` 这类 H5 分享页；每条线路多 `from` / `type` / `playable` / `original_index`，
@@ -288,13 +318,29 @@ GET /api/v1/search?wd=三体&source=jkun,t1         # 限定源站（更快）
 GET /api/v1/search?wd=三体&type_name=电影&page=1
 ```
 
-**参数**：`wd` 必填（1-64 字）；`source`、`type_name` 可选；`page`、`page_size`（默认 30，≤100）；`per_source_limit`（每源站候选上限，默认 200，一般不用动）。
+**参数**：`wd`（1-64 字）与 `tag`（1-64 字）**至少给一个**，同时传时以 `tag` 为准；`source`、`type_name` 可选；
+`page`、`page_size`（**默认 18**，≤100）；`per_source_limit`（每源站候选上限，默认 200，仅 `wd` 路径生效）。
+
+#### `?tag=` 标签精确检索（v1.14.0）
+
+```bash
+GET /api/v1/search?tag=悬疑&source=ffzy&page=1&page_size=18
+```
+
+详情页的标签胶囊点进去用这个，**不要**用 `wd=悬疑` —— 后者是名称模糊搜索，命中的是
+「片名里含悬疑」的片，和「标签是悬疑」完全不是一回事。
+
+- 匹配规则：`vod_tag` 按 `,` `，` `/` `|` `、` 切开后**整段相等**（大小写仅 ASCII 不敏感）。
+  `tag=悬疑` 命中 `"悬疑,犯罪"`，**不命中** `"悬疑喜剧"` / `"反悬疑"`。
+- `total` / `pagecount` 精确，`total_approximate` 恒为 `false`。
+- 空结果是 **200 + 空 list**（不是 404）。
+- **能力门控**：`/healthz.capabilities` 含 `tag_search` 才用；没有就退回 `wd=`（索引没建完会漏数据）。
 
 **响应**：
 
 ```json
 {
-  "code": 1, "wd": "三体", "page": 1, "page_size": 20, "pagecount": 1,
+  "code": 0, "wd": "三体", "page": 1, "page_size": 20, "pagecount": 1,
   "total": 5,
   "total_is_partial": false,       // true 表示部分源站候选被截断，total 非精确全库数
   "truncated_sources": [],
@@ -324,6 +370,9 @@ GET /api/v1/jkun?ac=list&wd=三体     # 搜索
 ```
 
 响应结构：`{code, msg, page, pagecount, limit, total, class:[{type_id,type_name}], list:[...]}`，`ac=detail` 时 list 元素含 `vod_content / vod_play_url / vod_play_from / vod_play_list`。
+
+> **这一节是唯一仍返回 `code:1` 的地方**（v1.14.0 起其余接口成功码统一为 0）。
+> 苹果 CMS 采集端按 `code==1` 判成功，改它会让第三方采集器/播放器直接失效，故保持原样。
 
 ### 3.7 推荐与明星接口（v1.9.0 ~ v1.10.1）
 
@@ -355,7 +404,7 @@ GET /api/v1/star/related?slug=jkun&name=流浪地球      # 名称兜底（先�
 
 ```json
 {
-  "code": 1,
+  "code": 0,
   "target": {"vod_id": 134369, "vod_name": "流浪地球"},
   "stars": ["吴京", "郭帆"],
   "star_counts": {"吴京": 42, "郭帆": 7},
@@ -386,7 +435,7 @@ GET /api/v1/star/works?slug=jkun&term=吴京&limit=30&exclude_id=134369
 
 ```json
 {
-  "code": 1, "slug": "jkun", "term": "吴京", "total": 42,
+  "code": 0, "slug": "jkun", "term": "吴京", "total": 42,
   "list": [{
     "vod_id": 135001, "vod_name": "战狼2", "vod_pic": "https://...",
     "vod_remarks": "HD国语", "type_name": "动作片", "source": "jkun",
@@ -426,7 +475,7 @@ GET /api/v1/star/works?slug=jkun&term=吴京&limit=30&exclude_id=134369
 #### GET `/api/v1/stats`
 ```json
 {
-  "code": 1,
+  "code": 0,
   "sources_total": 52, "sources_enabled": 52,
   "sources_syncing": 3,        // 此刻真正在跑的任务数（不是"有断点"的站数）
   "sources_unfinished": 5,     // 全量未跑完（有断点）的站数，供"待续传"提示用
@@ -460,13 +509,13 @@ POST /api/v1/resume?scope=full            # 继续（自动续跑受影响的源
 
 **暂停响应**：
 ```json
-{ "code": 1, "msg": "同步暂停已生效: full（进行中的批次将在下一个检查点停止）",
+{ "code": 0, "msg": "同步暂停已生效: full（进行中的批次将在下一个检查点停止）",
   "state": { "global": false, "full": true, "incremental": false, "updated_at": {...} } }
 ```
 
 **继续响应**：
 ```json
-{ "code": 1, "msg": "同步已继续: full",
+{ "code": 0, "msg": "同步已继续: full",
   "resumed_sources": ["jkun", "t1"],      // 已自动续跑的源站
   "state": { ... } }
 ```
@@ -488,10 +537,10 @@ POST /api/v1/sources/jkun/resume     # 继续该源站（自动按 auto 续跑�
 
 ```json
 // pause 响应
-{ "code": 1, "msg": "源站 JKUN资源站 的同步已暂停", "slug": "jkun", "paused": true }
+{ "code": 0, "msg": "源站 JKUN资源站 的同步已暂停", "slug": "jkun", "paused": true }
 
 // resume 响应（若上层仍有暂停，blocked_by 会给出被阻断的层级）
-{ "code": 1, "msg": "源站 ... 的同步已继续（但当前存在全局暂停，任务将等待）",
+{ "code": 0, "msg": "源站 ... 的同步已继续（但当前存在全局暂停，任务将等待）",
   "slug": "jkun", "paused": false, "blocked_by": "full" }
 ```
 
@@ -512,9 +561,9 @@ POST /api/v1/sources/auto-sync?enabled=true&slugs=jkun,t1  # 只开启指定站
 
 ```json
 // 单站响应
-{ "code": 1, "msg": "源站 JKUN资源站 自动同步已暂停", "slug": "jkun", "auto_sync": false }
+{ "code": 0, "msg": "源站 JKUN资源站 自动同步已暂停", "slug": "jkun", "auto_sync": false }
 // 批量响应
-{ "code": 1, "msg": "已暂停 52 个源站的自动同步", "updated": 52, "auto_sync": false }
+{ "code": 0, "msg": "已暂停 52 个源站的自动同步", "updated": 52, "auto_sync": false }
 ```
 
 - 状态持久化在 `sources.auto_sync` 列（默认 1，重启保留），`/api/v1/sources` 返回 `auto_sync`
@@ -523,7 +572,7 @@ POST /api/v1/sources/auto-sync?enabled=true&slugs=jkun,t1  # 只开启指定站
 
 #### GET `/api/v1/sources`
 ```json
-{ "code": 1, "list": [{
+{ "code": 0, "list": [{
     "slug": "jkun", "name": "JKUN资源站", "api_url": "https://...", 
     "status": "ok", "enabled": true,
     "total_videos": 2640,
@@ -571,7 +620,7 @@ POST /api/v1/sources/auto-sync?enabled=true&slugs=jkun,t1  # 只开启指定站
 
 #### GET `/api/v1/logs?limit=50`（1-200）
 ```json
-{ "code": 1, "list": [{
+{ "code": 0, "list": [{
     "id": 99, "slug": "jkun", "mode": "full", "status": "success"|"incomplete"|"failed"|"paused"|"interrupted",
     "fetched": 500, "inserted": 480, "updated": 20, "pages": 25,
     "error": "", "started_at": "...", "finished_at": "..."

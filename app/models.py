@@ -179,6 +179,69 @@ star_map = Table(
 Index("idx_star_map_term", star_map.c.slug, star_map.c.term)
 
 # ---------------------------------------------------------------------------
+# 标签倒排表（v1.14.0 / B-01）
+#
+# 详情页点标签胶囊 -> 「同一标签的影片」，必须**分词后精确匹配**：把 vod_tag
+# 按 , ， / | 、 切开，逐段归一化（去空白、ASCII 小写）后存一行。
+# 直接用 `vod_tag LIKE '%悬疑%'` 会把「悬疑喜剧」「反悬疑」一起搜出来，语义错。
+#
+# 为什么不放进 vod_{slug} 表：一个视频有多个标签，塞进主表要么存 JSON 无法走
+# 索引，要么拆成多行破坏主键。独立关联表 + (source, tag_norm) 复合索引是标准解。
+# 主键 (source, vod_id, tag_norm) 同时承担「某视频的全部标签」查询。
+# ---------------------------------------------------------------------------
+video_tags = Table(
+    "video_tags",
+    META,
+    Column("source", String(64), primary_key=True),     # 源站 slug
+    Column("vod_id", Integer, primary_key=True),
+    Column("tag_norm", String(64), primary_key=True),   # 归一化后的标签
+)
+# 按标签找影片走这把：WHERE source IN (...) AND tag_norm = ?
+# （主键是 (source, vod_id, tag_norm)，tag_norm 在第三列，无法直接支撑 tag 前缀检索）
+Index("idx_video_tags_tag", video_tags.c.tag_norm, video_tags.c.source)
+
+# ---------------------------------------------------------------------------
+# 标签索引回填进度（v1.14.0）
+#
+# 白万级行的回填必须可断点续跑、可观测：cursor 是已处理到的最大 vod_id，
+# 重启后从 cursor 继续，不会从头再扫一遍。status 用于能力声明：
+# 所有启用源站都 done 才认为索引就绪（才在 /healthz 里声明 tag_search）。
+# ---------------------------------------------------------------------------
+tag_index_state = Table(
+    "tag_index_state",
+    META,
+    Column("slug", String(64), primary_key=True),
+    Column("cursor", Integer, default=0),                 # 已处理的 vod_id 水位
+    Column("indexed", Integer, default=0),                # 已写入的 (视频,标签) 行数
+    Column("total", Integer, default=0),                  # 该源站总行数（进度分母）
+    Column("status", String(16), default="pending"),      # pending/running/done/failed
+    Column("error", Text, default=""),
+    Column("started_at", DateTime),
+    Column("finished_at", DateTime),
+    Column("updated_at", DateTime, server_default=func.now()),
+)
+
+# ---------------------------------------------------------------------------
+# 多 Token 与权限粒度（v1.14.0 / B-08）
+#
+# 存量单 Token 仍在 settings 里（api_token），这里只存**新增**的具名 Token。
+# 只存 sha256 摘要：数据库被读走也不等于凭据泄露（与面板密码同样处理）。
+# 两者并存是刻意的：老部署只有 settings 那一枚，升级后继续可用；
+# 想给 App 发一枚只读 Token 时再在面板/接口里新建，不需要轮换现有 Token。
+# ---------------------------------------------------------------------------
+api_tokens = Table(
+    "api_tokens",
+    META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("token_hash", String(64), nullable=False, unique=True),  # sha256 hex
+    Column("scope", String(16), default="read", server_default="read"),  # read / admin
+    Column("note", String(128), default=""),              # 用途备注，便于轮换时不误删
+    Column("created_at", DateTime, server_default=func.now()),
+    Column("last_used_at", DateTime),
+    Column("revoked", Integer, default=0, server_default="0"),
+)
+
+# ---------------------------------------------------------------------------
 # vod_{slug} 动态表缓存：避免重复构建 Table 对象
 # ---------------------------------------------------------------------------
 _vod_table_cache: dict = {}

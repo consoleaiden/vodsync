@@ -392,7 +392,9 @@ def main():
     check("无筛选：total 取 sources.total_videos 之和", b["total"] == len(SAMPLES), b["total"])
     r = client.get("/api/v1/videos?type_name=科幻片")
     b2 = r.json()
-    check("有筛选：不带 total_approximate（精确统计）", "total_approximate" not in b2, b2.keys())
+    # v1.14.0 / B-04：字段恒出现，精确统计时为 false（缺字段会让客户端无法区分）
+    check("有筛选：total_approximate=false（精确统计）",
+          b2.get("total_approximate") is False, b2.keys())
     check("有筛选：total 为精确 3 条（科幻片）", b2["total"] == 3, b2["total"])
 
     # ==================================================================

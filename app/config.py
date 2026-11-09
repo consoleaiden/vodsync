@@ -184,15 +184,83 @@ PROXY_PREF_TTL_MINUTES = int(os.environ.get("PROXY_PREF_TTL_MINUTES", "30"))
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
-# 每页条数默认值：30 是「三列宫格 × 10 行」的整数倍，App 列表用它一页正好整行，
-# 不会出现最后一页只剩 1~2 格 + 空白的观感问题。上限 100 是为了避免单次响应过大。
-API_PAGE_SIZE_DEFAULT = int(os.environ.get("API_PAGE_SIZE_DEFAULT", "30"))
+# 每页条数默认值（v1.14.0 / B-04）：契约固定为 18 —— 客户端固定传 18，
+# 缺省值必须与之一致，否则「不传 page_size」的调用会拿到与客户端不同的
+# pagecount，翻页到底判断会错位。上限 100 是为了避免单次响应过大。
+API_PAGE_SIZE_DEFAULT = int(os.environ.get("API_PAGE_SIZE_DEFAULT", "18"))
 API_PAGE_SIZE_MAX = int(os.environ.get("API_PAGE_SIZE_MAX", "100"))
 
 # API 访问密钥（可选）。设置后，所有接口需要在 Header 携带 X-API-Key: <key> 或 ?apikey=<key>
 # v1.5.0 起改由「访问控制」统一管理（面板里可生成/重置 Token），此项仍兼容：
 # 设置了就作为一枚额外有效的 Token，适合不想改客户端的环境变量部署。
 API_KEY = os.environ.get("API_KEY", "").strip()
+
+# ---------------------------------------------------------------------------
+# 响应包络与错误码（v1.14.0 / B-11）
+#
+# 契约：成功 = HTTP 2xx + code==0；业务失败 = HTTP 4xx/5xx + {code, error, detail}。
+#
+# 为什么给 code 做成可配置：v1.13 及更早的成功响应是 MacCMS 风格的 code=1，
+# 而客户端契约要求 code=0。改常量是唯一改动点，灰度期真出问题只要把
+# API_SUCCESS_CODE 设回 1 并重启即可回滚，不需要改代码或回退镜像。
+# 注意：/api/v1/{slug}（MacCMS 兼容接口）**不受此开关影响**，恒为 1 —— 那是
+# 苹果 CMS 采集端的约定，改它会让第三方采集器/播放器直接失效。
+# ---------------------------------------------------------------------------
+API_SUCCESS_CODE = int(os.environ.get("API_SUCCESS_CODE", "0"))
+
+# ---------------------------------------------------------------------------
+# 能力清单灰度开关（v1.14.0 / B-10）
+#
+# `/healthz.capabilities` 是客户端「能不能用新参数」的唯一判据。灰度期需要
+# 单独关掉某一项（例如 tag 索引只建了一半）而不用改代码：
+#   CAPABILITIES_DISABLE=tag_search        强制不声明
+#   CAPABILITIES_EXTRA=demo_thing          强制声明（仅排障用）
+# 两者都只影响声明，不影响接口本身能不能调。
+# ---------------------------------------------------------------------------
+CAPABILITIES_DISABLE = {
+    x.strip() for x in os.environ.get("CAPABILITIES_DISABLE", "").split(",") if x.strip()
+}
+CAPABILITIES_EXTRA = [
+    x.strip() for x in os.environ.get("CAPABILITIES_EXTRA", "").split(",") if x.strip()
+]
+
+# ---------------------------------------------------------------------------
+# 标签精确检索（v1.14.0 / B-01）
+#
+# 详情页的标签胶囊点击后，按「分词后精确匹配 vod_tag」检索，而不是把标签
+# 当全文关键词去 LIKE '%悬疑%'（后者会把「悬疑喜剧」也搜出来，语义错误）。
+# 数据落在 video_tags 关联表，(source, tag_norm) 复合索引支撑检索。
+# ---------------------------------------------------------------------------
+TAG_SEARCH_ENABLED = os.environ.get("TAG_SEARCH_ENABLED", "true").lower() == "true"
+# 同步入库时同步维护 video_tags（关掉后只能靠全量回填，一般不需要关）
+TAG_INDEX_ON_SYNC = os.environ.get("TAG_INDEX_ON_SYNC", "true").lower() == "true"
+# 启动时检查索引是否建完，没建完就后台补（可断点续跑；建完的站不会重扫）
+TAG_INDEX_ON_STARTUP = os.environ.get("TAG_INDEX_ON_STARTUP", "true").lower() == "true"
+# 回填批大小与批间休眠：串行写、主动让路给同步任务，避免把 NAS 的 IO 打满
+TAG_INDEX_BATCH = int(os.environ.get("TAG_INDEX_BATCH", "2000"))
+TAG_INDEX_SLEEP_MS = int(os.environ.get("TAG_INDEX_SLEEP_MS", "50"))
+# 能力声明的额外闸门：TAG_SEARCH_FORCE=true 时忽略「索引是否建完」直接声明
+# （排障用）；false 且索引没建完则不声明，客户端会继续用 wd 全文检索。
+TAG_SEARCH_FORCE = os.environ.get("TAG_SEARCH_FORCE", "false").lower() == "true"
+# 单次 tag 检索每个源站最多取多少条候选（与 multiquery 的 top-K 归并同思路）
+TAG_SEARCH_PER_SOURCE_LIMIT = int(os.environ.get("TAG_SEARCH_PER_SOURCE_LIMIT", "500"))
+
+# ---------------------------------------------------------------------------
+# Token 权限粒度（v1.14.0 / B-08，分阶段上线）
+#
+# 迁移铁律：先上线 scope 能力但**默认全放行**（等价全部 admin），客户端发版
+# 切到 read Token 之后，再打开强制校验。打开后：
+#   read  -> 只读接口（列表/详情/搜索/分类/统计/healthz）
+#   admin -> 一切写操作、/auth/*、/admin/*、/maintenance/*、词库 CRUD
+# 回滚：把 TOKEN_SCOPE_ENFORCE 设回 false 重启即可，不需要动数据。
+# ---------------------------------------------------------------------------
+TOKEN_SCOPE_ENFORCE = os.environ.get("TOKEN_SCOPE_ENFORCE", "false").lower() == "true"
+# 强制校验时，低于该版本的客户端一律按 admin 放行（老版本 App 不会因为
+# 拿不到 admin Token 而整站 401）。客户端可用 X-Client-Version 头或
+# client_version 查询参数自报版本；不自报也按 admin 放行（宽进严出）。
+TOKEN_SCOPE_LEGACY_BELOW = os.environ.get("TOKEN_SCOPE_LEGACY_BELOW", "").strip()
+# API_KEY 环境变量那枚 Token 的权限（默认 admin，保持既有部署行为）
+API_KEY_SCOPE = os.environ.get("API_KEY_SCOPE", "admin").strip().lower() or "admin"
 
 # ---------------------------------------------------------------------------
 # 访问控制（v1.5.0）

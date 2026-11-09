@@ -140,17 +140,34 @@ def _probe_is_page(url: str) -> bool:
     return playline.probe_is_page(url)
 
 
-def _parse_episodes(line: str, line_index: int) -> list:
-    """单条线路内的分集解析：`集名$地址#集名$地址`（无 `$` 的段落按 URL 处理）。"""
+def _parse_episodes(line: str, line_index: int, provider: str = "") -> list:
+    """
+    单条线路内的分集解析：`集名$地址#集名$地址`（无 `$` 的段落按 URL 处理）。
+
+    v1.14.0 / B-02：每集也带 `type` / `playable` / `from`（纯新增字段）。
+    为什么要按集判断而不是继承线路：源站偶有「同一条线路里前 20 集是 m3u8、
+    后 10 集插了个 H5 页面」的脏数据，客户端按线路级 playable 渲染会把
+    那 10 集当可播、点了必然黑屏。单集判定成本是一次 path 正则，可忽略。
+    """
     episodes = []
     for seg in line.split("#"):
         seg = seg.strip()
         if "$" in seg:
             name, url = seg.split("$", 1)
-            episodes.append({"name": name.strip(), "url": url.strip()})
+            name, url = name.strip(), url.strip()
         elif seg:
             # 老行为：没有集名时用 EP{线路下标}，保持逐字节兼容（客户端可能在做去重）
-            episodes.append({"name": f"EP{line_index}", "url": seg})
+            name, url = f"EP{line_index}", seg
+        else:
+            continue
+        kind = classify_play_line(url, provider)
+        episodes.append({
+            "name": name,
+            "url": url,
+            "type": kind,                 # m3u8 / mp4 / flv / mkv / page / unknown
+            "playable": kind != "page",   # 与线路级同义：false=置灰并跳过自动连播
+            "from": provider,             # 该集所属线路的 provider
+        })
     return episodes
 
 
@@ -200,10 +217,11 @@ def parse_play_lines(
         line = line.strip()
         if not line:
             continue
-        episodes = _parse_episodes(line, i)
+        # provider 必须先算：分集里每一条都要带上它（v1.14.0）
+        provider = providers[i].strip() if i < len(providers) else ""
+        episodes = _parse_episodes(line, i, provider)
         if not episodes:
             continue
-        provider = providers[i].strip() if i < len(providers) else ""
         first_url = next((e["url"] for e in episodes if e["url"]), "")
         kind = classify_play_line(first_url, provider)
         if kind == "unknown":

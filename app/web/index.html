@@ -347,6 +347,32 @@
     </div>
   </section>
 
+  <!-- 标签索引（v1.14.0）：详情页标签胶囊精确检索依赖它 -->
+  <section class="panel" id="tagPanel">
+    <div class="head">
+      <h2>标签索引</h2>
+      <span class="hint">标签精确检索（<code>?tag=</code>）依赖的倒排表 · 未建完时客户端不启用该能力</span>
+      <span style="flex:1"></span>
+      <span class="badge" id="tagReady">-</span>
+      <span class="muted" id="tagRows" style="font-size:12px"></span>
+      <button class="sm" id="btnTagStatus" title="查看各源站回填进度（游标 / 总数 / 已写行数）">索引状态</button>
+      <button class="sm warn" id="btnTagRebuild" title="对全部启用源站回填标签倒排（后台串行，可断点续跑）">重建索引</button>
+    </div>
+    <div class="body pad">
+      <div class="muted" style="font-size:12px;line-height:1.75">
+        同步入库时会增量维护；升级后启动时自动补齐（可断点续跑）。完建前 <code>/healthz</code>
+        不声明 <code>tag_search</code>，客户端继续用名称模糊检索 —— 两边都不需要回滚。
+      </div>
+    </div>
+    <div class="body pad" id="tagStatusBox" style="display:none">
+      <div class="row" style="margin-bottom:8px">
+        <span class="muted" id="tagStatusHint" style="font-size:12px;flex:1"></span>
+        <button class="sm" id="btnTagStatusClose">收起</button>
+      </div>
+      <div style="border:1px solid var(--line);border-radius:8px;overflow:auto" id="tagStatusBody"></div>
+    </div>
+  </section>
+
   <!-- 源站列表 -->
   <section class="panel">
     <div class="head">
@@ -1230,6 +1256,19 @@ function openSettings() {
     </div>
     <div style="color:var(--muted);font-size:12px;margin-top:6px" id="tokMeta"></div>
 
+    <!-- Token 权限粒度（v1.14.0 / B-08）：Admin 留给同步控制台，App 用只读 -->
+    <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
+      <span class="badge" id="tokScopeBadge">-</span>
+      <button class="sm" id="btnIssueRead" title="新增一枚只读 Token（不影响现有 Token），适合发给 App 浏览用">签发只读 Token</button>
+      <button class="sm" id="btnTokenList">Token 清单</button>
+    </div>
+    <div style="color:var(--muted);font-size:12px;line-height:1.75;margin-top:6px">
+      <code>read</code> 只能读列表/详情/搜索/分类/统计；<code>admin</code> 可写（同步、维护、改密码）。
+      服务端默认「强制校验」是<b>关闭</b>的（所有 Token 等价 admin），确认客户端已切到只读 Token 后，
+      再把 <code>TOKEN_SCOPE_ENFORCE=true</code> 打开；出问题关掉即回滚。
+    </div>
+    <div id="tokListBox" style="display:none;margin-top:8px;border:1px solid var(--line);border-radius:8px;overflow:auto"></div>
+
     <hr style="border:none;border-top:1px solid var(--line);margin:16px 0">
     <div style="font-weight:600;font-size:13px;margin-bottom:8px">修改管理密码</div>
     <div style="display:grid;gap:8px">
@@ -1264,7 +1303,43 @@ function openSettings() {
   api("/api/v1/auth/token").then((t) => {
     tokVal.value = t.token || "";
     q("#tokMeta").textContent = t.created_at ? "生成于 " + t.created_at : "";
+    const sb = q("#tokScopeBadge");
+    sb.textContent = "权限 " + (t.scope || "admin");
+    sb.className = "badge " + ((t.scope || "admin") === "admin" ? "ok" : "mute");
   }).catch(() => {});
+
+  // ---- Token 权限（v1.14.0 / B-08）：签发只读 Token / 查看清单 ----
+  q("#btnIssueRead").addEventListener("click", async () => {
+    try {
+      const r = await _jsonPost("/api/v1/auth/tokens", { scope: "read", note: "App 只读" });
+      tokVal.value = r.token || "";
+      q("#tokMeta").textContent = "只读 Token 仅显示这一次，请立即复制保存";
+      toast("已签发只读 Token（明文只显示一次）");
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  q("#btnTokenList").addEventListener("click", async () => {
+    const box = q("#tokListBox");
+    try {
+      const r = await api("/api/v1/auth/tokens");
+      const rows = (r.list || []).map((it) => `
+        <tr>
+          <td>${it.id}</td>
+          <td>${esc(it.kind)}</td>
+          <td><span class="badge ${it.scope === "admin" ? "ok" : "mute"}">${esc(it.scope)}</span></td>
+          <td style="font-size:11px">${esc(it.note || "")}</td>
+          <td style="font-size:11px">${esc(fmtTime(it.created_at))}</td>
+        </tr>`).join("");
+      box.innerHTML = `<table>
+        <thead><tr><th>ID</th><th>类型</th><th>权限</th><th>备注</th><th>创建时间</th></tr></thead>
+        <tbody>${rows}</tbody></table>`;
+      box.style.display = "";
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
 
   sw.addEventListener("change", async () => {
     sw.disabled = true;
@@ -1523,6 +1598,62 @@ $("#btnStarTagsRebuild").addEventListener("click", async () => {
 
 $("#btnStarReload").addEventListener("click", () => loadStarTerms());
 
+// ---------------- 标签索引（v1.14.0 / B-01） ----------------
+// 只读状态 + 手动重建。刻意不参与 5 秒轮询：回填是长任务，靠「索引状态」
+// 按钮按需刷新即可，否则每 5 秒查一次进度纯属浪费。
+function tagProgressBar(p) {
+  const n = Math.max(0, Math.min(100, Number(p) || 0));
+  return `<div style="height:6px;border-radius:3px;background:var(--line);overflow:hidden">
+    <div style="height:100%;width:${n}%;background:var(--accent,#2f6fed)"></div></div>`;
+}
+
+async function loadTagStatus(showTable) {
+  try {
+    const r = await api("/api/v1/tag/status");
+    const ready = !!r.ready;
+    $("#tagReady").textContent = ready ? "已就绪" : (r.building && r.building.length ? "回填中" : "未就绪");
+    $("#tagReady").className = "badge " + (ready ? "ok" : "mute");
+    $("#tagRows").textContent = `已建 ${fmtNum(r.rows)} 行`;
+    if (!showTable) return r;
+    const rows = (r.sources || []).map((s) => `
+      <tr>
+        <td>${esc(s.slug)}</td>
+        <td>${esc(s.status)}</td>
+        <td style="min-width:120px">${tagProgressBar(s.progress)}<span class="muted" style="font-size:11px">${s.progress}%</span></td>
+        <td>${fmtNum(s.cursor)} / ${fmtNum(s.total)}</td>
+        <td>${fmtNum(s.indexed)}</td>
+        <td class="muted" style="font-size:11px">${esc(s.error || "")}</td>
+      </tr>`).join("");
+    $("#tagStatusHint").textContent = ready
+      ? `索引已就绪：/healthz 已声明 tag_search（共 ${fmtNum(r.rows)} 行）`
+      : `索引未就绪：客户端继续用名称模糊检索（已建 ${fmtNum(r.rows)} 行，可点「重建索引」）`;
+    $("#tagStatusBody").innerHTML = `<table>
+      <thead><tr><th>源站</th><th>状态</th><th>进度</th><th>游标 / 总条数</th><th>已写行</th><th>备注</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="6" class="empty">暂无回填记录（点「重建索引」开始）</td></tr>`}</tbody>
+    </table>`;
+    $("#tagStatusBox").style.display = "";
+    return r;
+  } catch (e) {
+    $("#tagReady").textContent = "-";
+    $("#tagReady").className = "badge mute";
+    if (showTable) toast(e.message, true);
+    return null;
+  }
+}
+
+$("#btnTagStatus").addEventListener("click", () => loadTagStatus(true));
+$("#btnTagStatusClose").addEventListener("click", () => { $("#tagStatusBox").style.display = "none"; });
+$("#btnTagRebuild").addEventListener("click", async () => {
+  if (!confirm("对全部启用源站回填标签倒排索引？数据量大时后台要跑一段时间（可断点续跑，也可重复点）。")) return;
+  try {
+    const r = await _jsonPost("/api/v1/maintenance/tag-index", {});
+    toast(r.msg || "标签索引回填已受理");
+    loadTagStatus(true);
+  } catch (e) {
+    toast(e.message, true);
+  }
+});
+
 $("#btnSettings").addEventListener("click", openSettings);
 $("#btnLogout").addEventListener("click", async () => {
   try { await _jsonPost("/api/v1/auth/logout", {}); } catch (e) {}
@@ -1551,6 +1682,7 @@ async function boot() {
   await refreshAll();
   tbLoadTables();   // 数据表浏览：只加载一次，不进 5 秒轮询（翻页状态不能被覆盖）
   loadStarTerms();  // 明星词库：同样只加载一次（编辑中不能被轮询刷掉）
+  loadTagStatus();  // 标签索引：只取一次摘要（徽标/行数），详细进度按需展开
   schedule();
 }
 boot();

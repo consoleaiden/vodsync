@@ -116,7 +116,8 @@ def main():
     check("含空白字符被拒绝 400", r.status_code == 400, r.status_code)
 
     r = client.post("/api/v1/sources/custom", json={"name": "x", "api_url": ""})
-    check("空地址被 pydantic 拒绝 422", r.status_code == 422, r.status_code)
+    # v1.14.0 / B-11：422 -> 400（客户端能拿到 field 与可读原因）
+    check("空地址被 pydantic 拒绝 400", r.status_code == 400, r.status_code)
 
     # ------------------------------------------------------------------
     print("\n[B] 连通性探测")

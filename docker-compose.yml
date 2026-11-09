@@ -14,13 +14,13 @@
 services:
   vodsync:
     # 官方发布镜像（GitHub Actions 自动构建，双架构 amd64/arm64，公开可拉取）
-    # tag 说明（v1.9.3 起每次构建都带版本号；当前版本 1.13.0）：
-    #   latest         最新（生产默认）
-    #   1.13.0         版本号；同一版本多次构建时指向最新那次
-    #   1.13.0-2a5c29f 版本 + 提交，不可变 —— **回滚就用这个**
-    #   sha-2a5c29f    仅提交短 SHA，不可变
+    # tag 说明（v1.9.3 起每次构建都带版本号；当前版本 1.14.0）：
+    #   latest          最新（生产默认）
+    #   1.14.0          版本号；同一版本多次构建时指向最新那次
+    #   1.14.0-<sha7>   版本 + 提交，不可变 —— **回滚就用这个**
+    #   sha-<sha7>      仅提交短 SHA，不可变
     # 回滚示例：把下面这行改成旧版本 tag，然后 docker compose pull vodsync && docker compose up -d
-    #   例：image: ghcr.io/consoleaiden/vodsync:1.13.0-2a5c29f
+    #   例：image: ghcr.io/consoleaiden/vodsync:1.14.0-<sha7>
     # 回滚后 curl http://127.0.0.1:8181/healthz 核对 version / build 是否已是目标版本
     image: ghcr.io/consoleaiden/vodsync:latest
     # 本地构建模式：注释掉上面 image 行，改用下面 build
@@ -76,8 +76,24 @@ services:
       TRUST_PROXY: "false"                 # 部署在 Nginx/群晖反代之后才改 true（否则 XFF 可伪造，绕过登录锁定）
       # 兼容项：设置后作为一枚额外有效的 API Token
       # API_KEY: ""
-      # ---- API ----
-      API_PAGE_SIZE_DEFAULT: "30"          # 每页条数：App 三列 × 10 行 = 30（上限见 API_PAGE_SIZE_MAX）
+      # ---- API（v1.14.0）----
+      API_PAGE_SIZE_DEFAULT: "18"          # 每页条数默认值，与客户端固定传值一致（上限见 API_PAGE_SIZE_MAX）
+      # 成功响应的 code（契约值为 0；设成 1 可退回 v1.13 的 MacCMS 风格，灰度回滚用）
+      API_SUCCESS_CODE: "0"
+      # ---- 能力清单灰度（v1.14.0）----
+      # 单独关掉某项能力而不改代码：CAPABILITIES_DISABLE=tag_search
+      # CAPABILITIES_DISABLE: ""
+      # ---- 标签精确检索（v1.14.0）----
+      TAG_SEARCH_ENABLED: "true"           # 关掉 = 索引与 ?tag= 一并停用
+      TAG_INDEX_ON_SYNC: "true"            # 同步入库时增量维护倒排
+      TAG_INDEX_ON_STARTUP: "true"         # 启动时检查并后台补齐（可断点续跑）
+      TAG_INDEX_BATCH: "2000"              # 回填批大小
+      TAG_INDEX_SLEEP_MS: "50"             # 批间休眠，主动让路给同步任务（NAS 盘别设 0）
+      # ---- Token 权限粒度（v1.14.0，分阶段）----
+      # 默认 false = 所有 Token 等价 admin（升级零影响）。确认客户端已改用只读 Token 后再打开。
+      TOKEN_SCOPE_ENFORCE: "false"
+      # 打开强制校验后，低于该版本的客户端按 admin 放行（避免老 App 整站 401），例如 "1.6.0"
+      # TOKEN_SCOPE_LEGACY_BELOW: ""
       TZ: "Asia/Shanghai"
     depends_on:
       postgres:

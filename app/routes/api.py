@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from sqlalchemy import bindparam, func, select, text
 
-from .. import __version__, auth, config, database
+from .. import __version__, apiresp, auth, config, database
 from ..models import build_vod_table, sources, sync_logs
 from ..syncer import (
     delete_custom_source,
@@ -39,6 +39,13 @@ log = logging.getLogger("vodsync.api")
 # 鉴权统一由 main.py 的 _auth_guard 中间件处理（Token / 会话 cookie / 开关），
 # 这里不再挂路由级依赖；/api/v1/auth/* 中的 login 与 state 由中间件按白名单放行。
 router = APIRouter()
+
+# 成功响应的 code（v1.14.0 / B-11）：默认 0，可用 API_SUCCESS_CODE=1 回滚成
+# v1.13 的 MacCMS 风格。全文件统一引用这个常量，避免几十处字面量各自漂移。
+SUCCESS_CODE = apiresp.SUCCESS_CODE
+# MacCMS 兼容接口（/api/v1/{slug}）**恒为 1**：那是苹果 CMS 采集端的约定，
+# 改它会让第三方采集器/播放器直接失效，与上面的 REST 契约互不影响。
+MACCMS_CODE = 1
 
 
 # ---------------------------------------------------------------------------
@@ -162,17 +169,73 @@ def auth_settings(payload: dict):
 @router.get("/api/v1/auth/token", summary="查看 API Token（需登录）")
 def auth_get_token():
     return {
+        "code": SUCCESS_CODE,
         "token": auth.get_token(),
+        "scope": auth.token_scope(),
         "created_at": auth.token_created_at(),
     }
 
 
 @router.post("/api/v1/auth/token", summary="重置 API Token（旧 Token 立即失效）")
-def auth_rotate_token():
+def auth_rotate_token(
+    scope: str = Query("", description="read / admin；留空=admin（与 v1.13 行为一致）"),
+    payload: dict = None,
+):
+    """
+    重置存量单 Token（v1.14.0 起可指定权限）。
+
+    `scope` 既是查询参数也接受 body `{"scope": "read"}` —— 面板用前者，
+    App 控制台习惯用后者，两个都收不会造成歧义（body 优先）。
+    注意：**重置会立刻让旧 Token 失效**，正在用旧 Token 的客户端会 401。
+    想「新增一枚只读 Token 而不动现有的」，用 POST /api/v1/auth/tokens。
+    """
+    want = ((payload or {}).get("scope") or scope or "").strip().lower()
+    if want and want not in auth.SCOPES:
+        raise HTTPException(status_code=400, detail="scope 只能是 read 或 admin")
+    token = auth.rotate_token(want or "admin")
     return {
-        "token": auth.rotate_token(),
+        "code": SUCCESS_CODE,
+        "token": token,
+        "scope": auth.token_scope(),
         "created_at": auth.token_created_at(),
     }
+
+
+@router.get("/api/v1/auth/tokens", summary="已签发 Token 清单（不返回明文）")
+def auth_list_tokens():
+    """
+    列出所有可用 Token 的权限与签发时间。
+
+    第 0 项是存量单 Token（id=0，kind=legacy），其余是 v1.14.0 起的具名 Token。
+    任何一项都**不含明文**：清单接口不是凭据回显口。
+    """
+    return {"code": SUCCESS_CODE, "list": auth.list_tokens()}
+
+
+@router.post("/api/v1/auth/tokens", summary="新增具名 Token（可指定权限）")
+def auth_create_token(payload: dict = None):
+    """
+    新增一枚 Token，返回**一次性明文**。
+
+    与「重置」的区别：不影响现有 Token，适合给 App 发一枚 read Token，
+    同时把 admin Token 留给同步控制台（B-08 的目标模型）。
+    """
+    payload = payload or {}
+    scope = (payload.get("scope") or "read").strip().lower()
+    if scope not in auth.SCOPES:
+        raise HTTPException(status_code=400, detail="scope 只能是 read 或 admin")
+    info = auth.create_scoped_token(scope, payload.get("note") or "")
+    return {"code": SUCCESS_CODE, **info}
+
+
+@router.delete("/api/v1/auth/tokens/{token_id}", summary="吊销具名 Token")
+def auth_revoke_token(token_id: int):
+    if not auth.revoke_scoped_token(token_id):
+        raise HTTPException(
+            status_code=404,
+            detail="Token 不存在、已吊销，或是不可单独吊销的存量单 Token（id=0）",
+        )
+    return {"code": SUCCESS_CODE, "revoked": token_id}
 
 
 # ---------------------------------------------------------------------------
@@ -263,15 +326,7 @@ def _query_vods(
         if detail:
             items.append(_detail_item(slug, r, play_raw=play_raw, play_meta=play_meta))
             continue
-        items.append({
-            "vod_id": r["vod_id"],
-            "type_id": r["type_id"],
-            "type_name": r["type_name"],
-            "vod_name": r["name"],
-            "vod_pic": r["pic"],
-            "vod_remarks": r["remarks"],
-            "vod_time": r["vod_time"],
-        })
+        items.append(_list_item(r))
     return total, pagecount, items
 
 
@@ -311,6 +366,43 @@ def _pick(row, key):
         return m.get(key) or ""
     except Exception:
         return ""
+
+
+def _list_item(row, source: str = "", source_name: str = "") -> dict:
+    """
+    列表卡片（瘦字段）的**唯一**构造函数（v1.14.0）。
+
+    为什么集中：改版前有 5 处各手写一份同样的 dict，加字段时必然漏一两处，
+    于是「同一个 /api/v1/videos，走多源归并和走标签检索字段不一样」，客户端
+    某些路径下卡片缺字段。v1.12.2 的渲染 bug 就是这类分叉引起的。
+    集中后新增字段只改这里。
+
+    字段名同时给契约名与历史名（`remarks` / `vod_remarks`，见
+    BACKEND_UPGRADE_REQUIREMENTS_2026-11-09.md §2.1），客户端用哪个都行；
+    两个都给是为了不打断任何一版客户端。
+
+    source / source_name 按调用方需要加：MacCMS 兼容接口
+    （/api/v1/{slug}）的 list 里没有 source，保持原样。
+    """
+    vod_remarks = _pick(row, "remarks")
+    item = {
+        "vod_id": _pick(row, "vod_id"),
+        "type_id": _pick(row, "type_id"),
+        "type_name": _pick(row, "type_name"),
+        "vod_name": _pick(row, "name"),
+        "vod_pic": _pick(row, "pic"),
+        "vod_remarks": vod_remarks,
+        "remarks": vod_remarks,
+        # 客户端列表卡片要「地区·年份」（契约 §2.1）
+        "vod_area": _pick(row, "vod_area"),
+        "vod_year": _pick(row, "vod_year"),
+        "vod_time": _pick(row, "vod_time"),
+    }
+    if source:
+        item["source"] = source
+    if source_name:
+        item["source_name"] = source_name
+    return item
 
 
 def _play_lines(slug: str, row, play_raw: bool = False) -> tuple:
@@ -371,6 +463,16 @@ def _detail_item(source: str, row, *, play_raw: bool = False,
         # 的线路顺序一一对应。存量行为空串（未回填）。
         "play_from": _pick(row, "play_from"),
         "vod_play_list": lines,
+        # v1.14.0 / B-03：客户端契约里这个字段叫 `play_lines`（见
+        # BACKEND_UPGRADE_REQUIREMENTS_2026-11-09.md §2.2）。历史实现一直叫
+        # `vod_play_list`（MacCMS 风格，文档与面板都在用），两边都不能删：
+        #   - 改名 -> 现网 v1.5.x 客户端拿不到线路，详情页整块空白；
+        #   - 只留旧名 -> 按新契约写的客户端同样空白。
+        # 所以同值双发：**同一个 list 对象**，Python 侧不多占内存，JSON 里重复
+        # 的部分 gzip 会压掉（两份内容完全一样，压缩率接近 0 成本）。
+        "play_lines": lines,
+        # 同上：契约里详情标签字段叫 `tag`，库里与老接口叫 `vod_tag`
+        "tag": _pick(row, "vod_tag"),
     }
 
 
@@ -423,7 +525,7 @@ def categories(
         with _categories_lock:
             hit = _categories_cache.get(cache_key)
         if hit and hit[0] > time.time():
-            return {"code": 1, "total": len(hit[1]), "list": hit[1], "cached": True}
+            return {"code": SUCCESS_CODE, "total": len(hit[1]), "list": hit[1], "cached": True}
 
     merged: dict = defaultdict(lambda: {"type_id": None, "type_name": "", "count": 0, "sources": []})
     existing = database.list_tables("vod_")   # v1.10.0 / P6：一次取全，别逐表往返
@@ -460,26 +562,34 @@ def categories(
             if len(_categories_cache) > 32:
                 _categories_cache.clear()
             _categories_cache[cache_key] = (time.time() + ttl, items)
-    return {"code": 1, "total": len(items), "list": items, "cached": False}
+    return {"code": SUCCESS_CODE, "total": len(items), "list": items, "cached": False}
 
 
 # ---------------------------------------------------------------------------
 # 管理接口
 # ---------------------------------------------------------------------------
 @router.get("/healthz")
-def healthz():
+def healthz(detail: int = Query(0, ge=0, le=1,
+                                description="v1.14.0：1=capabilities 以对象形态返回（运维排障用）")):
     """
-    健康检查 / 存活探针。
+    健康检查 / 存活探针 / **能力清单**（v1.14.0 / B-10）。
 
-    关键点：数据库繁忙时**不返回 5xx**。容器健康检查只看 HTTP 状态码，
-    若这里因为连接池排队而报 500/超时，Docker 会把一个其实还在正常干活的容器判定为不健康
-    并反复重启（v1.4.0 在 NAS 上就表现为"容器崩溃"）。因此这里始终 200，
-    用 db 字段表达数据库是否可用。
+    关键点（三条都不能破）：
+    1. 数据库繁忙时**不返回 5xx**。容器健康检查只看 HTTP 状态码，若这里因为
+       连接池排队而 500/超时，Docker 会把一个其实还在正常干活的容器判定为不健康
+       并反复重启（v1.4.0 在 NAS 上就表现为"容器崩溃"）。所以恒 200，
+       用 status=degraded + db=false 表达数据库不可用。
+    2. 免鉴权（在 auth.PUBLIC_PATHS 里）：客户端连接测试用它测延迟，
+       不能因为没 Token 就打不进来。
+    3. `capabilities` 只声明**真正可用**的能力，且数据库不可用时收缩。
+       客户端据此决定「能不能用 ?tag= / mode=backfill_play_from」，
+       声明了但没实现等于骗客户端切过去。
 
-    v1.9.3 起额外返回 version / build：升级或回滚后 `curl /healthz` 就能确认
-    容器里跑的到底是哪个版本（build 是镜像构建时写入的提交短 SHA，源码直跑时为空）。
-    version 取自 app/__init__.py，与镜像 tag 同源。
+    返回：status / db / version / build / capabilities / time
+      version 取自 app/__init__.py（与镜像 tag 同源），能力变更时升 minor。
     """
+    from .. import caps
+
     now = datetime.now().isoformat()
     build = os.environ.get("VODSYNC_BUILD_SHA", "") or "dev"
     try:
@@ -490,6 +600,7 @@ def healthz():
             "db": True,
             "version": __version__,
             "build": build,
+            "capabilities": caps.snapshot(db_ok=True) if not detail else caps.detailed(True),
             "time": now,
         }
     except Exception as e:
@@ -499,6 +610,9 @@ def healthz():
             "db": False,
             "version": __version__,
             "build": build,
+            # 库挂了：依赖数据的能力一律不声明（tag_search 需要查 video_tags），
+            # 只剩「代码上线即成立」的静态项
+            "capabilities": caps.snapshot(db_ok=False) if not detail else caps.detailed(False),
             "detail": str(e)[:200],
             "time": now,
         }
@@ -565,7 +679,7 @@ def list_sources():
             ).order_by(sources.c.id)
         ).mappings().all()
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "list": [
             {
                 "slug": r["slug"],
@@ -662,7 +776,7 @@ def source_catalog(
         })
 
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "total": len(items),
         "alive": sum(1 for x in items if x["status"] == "ok"),
         "ready": sum(1 for x in items if x["video_count"] > 0),
@@ -671,9 +785,27 @@ def source_catalog(
     }
 
 
+def _tag_stats_brief() -> dict:
+    """
+    概览用的标签索引摘要（v1.14.0 / B-01）。
+
+    只取三项：是否就绪、已建行数、正在回填的源站。详细的逐站进度在
+    `GET /api/v1/tag/status` —— 概览接口每 5 秒被面板轮询一次，
+    不能把 50 多个源站的进度行都塞进来。
+    """
+    try:
+        from .. import tags
+
+        st = tags.status()
+        return {"ready": st["ready"], "rows": st["rows"], "building": st["building"]}
+    except Exception:  # noqa: BLE001 —— 概览不能因为附属信息挂掉
+        return {"ready": False, "rows": 0, "building": []}
+
+
 @router.get("/api/v1/stats")
 def stats():
     """管理面板概览数据：源站数、总条数、同步中数量、今日入库量、暂停状态、最近错误。"""
+
     from sqlalchemy import and_
 
     from .. import pause, playline, syncer
@@ -705,7 +837,7 @@ def stats():
             .order_by(sync_logs.c.id.desc()).limit(1)
         ).first()
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "sources_total": total_sources,
         "sources_enabled": enabled_sources,
         "sources_syncing": len(syncer.running_snapshot()),   # 此刻真正在跑的任务数
@@ -725,6 +857,9 @@ def stats():
         # 数据库连接池 + 同步负载（判断"是不是又堆任务了"最直接的两个指标）
         "db_pool": database.pool_status(),
         "sync_load": syncer.sync_load(),
+        # 标签倒排索引（v1.14.0 / B-01）：面板显示「已建 N 行 / 是否就绪」，
+        # 也就绪与否直接决定客户端能不能点标签胶囊精确检索
+        "tags": _tag_stats_brief(),
         "last_error": (
             {"slug": last_error[0], "error": last_error[1],
              "at": last_error[2].isoformat() if last_error[2] else None}
@@ -746,7 +881,7 @@ def source_detail(slug: str):
             .order_by(sync_logs.c.id.desc()).limit(10)
         ).mappings().all()
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "source": {
             "slug": src["slug"], "name": src["name"], "api_url": src["api_url"],
             "status": src["status"], "total_videos": src["total_videos"],
@@ -800,7 +935,7 @@ def bulk_auto_sync(
                 validate_slug(s)
     n = set_auto_sync_bulk(enabled, slug_list)
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "msg": f"已{'开启' if enabled else '暂停'} {n} 个源站的自动同步",
         "updated": n,
         "auto_sync": enabled,
@@ -818,7 +953,7 @@ def set_one_auto_sync(
     src, _ = _require_table(slug)
     set_source_auto_sync(slug, enabled)
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "msg": f"源站 {src['name']} 自动同步已{'开启' if enabled else '暂停'}",
         "slug": slug,
         "auto_sync": enabled,
@@ -850,7 +985,7 @@ def set_play_line_policy(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "msg": f"源站 {src['name']} 播放线路策略 = {value}",
         "slug": slug,
         "play_line_policy": value,
@@ -871,7 +1006,7 @@ def pause_one_source(slug: str):
     was_running = syncer.is_running(slug)
     set_source_paused(slug, True)
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "msg": (
             f"源站 {src['name']} 的同步已暂停，将在当前批次结束后停止并保留断点"
             if was_running
@@ -898,7 +1033,7 @@ def resume_one_source(slug: str):
         "incremental" if pause_ctl.is_paused("incremental") else ""
     )
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "msg": f"源站 {src['name']} 的同步已继续" + (
             f"（但当前存在{'全局' if pause_ctl.snapshot()['global'] else ''}暂停，任务将等待）" if blocked else ""
         ),
@@ -916,7 +1051,7 @@ def refresh_source_list(full_sync: bool = Query(default=False, description="发�
         threading.Thread(
             target=_bg_sync_new, args=(list(new_slugs),), daemon=True
         ).start()
-    return {"code": 1, "new_sources": new_slugs, "full_sync_started": full_sync}
+    return {"code": SUCCESS_CODE, "new_sources": new_slugs, "full_sync_started": full_sync}
 
 
 # ---------------------------------------------------------------------------
@@ -988,7 +1123,7 @@ def probe_source_api(body: ProbeIn):
     前端去 catch 异常。失败时 `error` 给出人能看懂的原因。
     """
     api_url = _clean_api_url(body.api_url)
-    return {"code": 1, **probe_source(api_url)}
+    return {"code": SUCCESS_CODE, **probe_source(api_url)}
 
 
 @router.post("/api/v1/sources/custom", summary="添加自定义源站")
@@ -1037,7 +1172,7 @@ def add_custom_source(body: CustomSourceIn):
             sync_started = True
 
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "slug": slug,
         "probe": probe_result,
         "sync_started": sync_started,
@@ -1069,7 +1204,7 @@ def patch_custom_source(slug: str, body: CustomSourcePatch):
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return {"code": 1, **res}
+    return {"code": SUCCESS_CODE, **res}
 
 
 @router.delete("/api/v1/sources/{slug}/custom", summary="删除自定义源站")
@@ -1098,7 +1233,7 @@ def remove_custom_source(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         **res,
         "msg": f"已删除源站 {slug}" + ("（数据表已删除）" if res["dropped"] else "（数据表保留）"),
     }
@@ -1137,17 +1272,37 @@ def trigger_sync(
         _require_table(slug)
     slug = validate_slug(slug) if slug != "*" else "*"
     if syncer.is_busy(slug):
-        return {"code": 1, "status": "already_running",
+        return {"code": SUCCESS_CODE, "status": "already_running",
                 "msg": f"{slug} 已有同步任务在排队或执行中，本次未重复提交"}
     threading.Thread(target=sync_source, args=(slug, mode), daemon=True).start()
-    return {"code": 1, "status": "accepted", "msg": f"同步任务已受理: {slug} mode={mode}"}
+    return {"code": SUCCESS_CODE, "status": "accepted", "msg": f"同步任务已受理: {slug} mode={mode}"}
 
 
 @router.post("/api/v1/sync-all")
-def trigger_sync_all(mode: str = Query(default="auto", pattern="^(auto|full|incremental)$")):
-    """手动触发全部源站同步（后台执行）。"""
+def trigger_sync_all(
+    mode: str = Query(
+        default="auto",
+        pattern="^(auto|full|incremental|backfill|backfill_play_from)$",
+        description="auto / full / incremental / backfill_play_from",
+    )
+):
+    """
+    手动触发全部源站同步（后台执行）。
+
+    v1.14.0 / B-07：新增 `mode=backfill_play_from` —— 对**全部启用源站**并行
+    回填上游 `vod_play_from`（只写 play_from 一列，不动其它字段、不推进水位线、
+    不动断点，可中断可重跑）。客户端控制台已预留该入口。
+    与 `/api/v1/sync/{slug}?mode=backfill_play_from` 语义完全一致，只是范围不同。
+    """
+    if mode in ("backfill", "backfill_play_from"):
+        threading.Thread(target=sync_all, args=("backfill",), daemon=True).start()
+        return {
+            "code": SUCCESS_CODE,
+            "msg": "播放线路来源回填任务已受理（全部启用源站，只写 play_from 一列）",
+            "mode": "backfill_play_from",
+        }
     threading.Thread(target=sync_all, args=(mode,), daemon=True).start()
-    return {"code": 1, "msg": f"全量同步任务已受理: mode={mode}"}
+    return {"code": SUCCESS_CODE, "msg": f"全量同步任务已受理: mode={mode}"}
 
 
 @router.post("/api/v1/maintenance/recount")
@@ -1156,7 +1311,7 @@ def recount():
     from ..syncer import refresh_counts
 
     threading.Thread(target=refresh_counts, daemon=True).start()
-    return {"code": 1, "msg": "条数校准任务已受理"}
+    return {"code": SUCCESS_CODE, "msg": "条数校准任务已受理"}
 
 
 @router.get("/api/v1/pause")
@@ -1164,7 +1319,7 @@ def pause_status():
     """同步暂停状态（三层级：global / full / incremental）。"""
     from .. import pause
 
-    return {"code": 1, **pause.snapshot()}
+    return {"code": SUCCESS_CODE, **pause.snapshot()}
 
 
 @router.post("/api/v1/pause")
@@ -1186,7 +1341,7 @@ def pause_sync(
         log.info("暂停同步 [%s]: %s", scope, reason)
     pause.set_paused(scope, True)
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "msg": f"同步暂停已生效: {scope}（进行中的批次将在下一个检查点停止）",
         "state": pause.snapshot(),
     }
@@ -1208,7 +1363,7 @@ def resume_sync(
     pause.set_paused(scope, False)
     slugs = syncer.trigger_resume(scope)
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "msg": f"同步已继续: {scope}",
         "resumed_sources": slugs,
         "state": pause.snapshot(),
@@ -1222,7 +1377,7 @@ def recent_logs(limit: int = Query(50, ge=1, le=200)):
             select(sync_logs).order_by(sync_logs.c.id.desc()).limit(limit)
         ).mappings().all()
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "list": [
             {
                 "id": r["id"], "slug": r["slug"], "mode": r["mode"], "status": r["status"],
@@ -1249,7 +1404,7 @@ def admin_list_tables():
     """
     from .. import tablebrowse
 
-    return {"code": 1, "tables": tablebrowse.list_browsable()}
+    return {"code": SUCCESS_CODE, "tables": tablebrowse.list_browsable()}
 
 
 @router.get("/api/v1/admin/tables/{name}/rows")
@@ -1282,6 +1437,10 @@ def video_list(
     type_name: str = Query("", description="按分类名称过滤"),
     type_id: int = Query(0, ge=0, description="按分类 ID 过滤（配合 /api/v1/categories 使用）"),
     wd: str = Query("", description="按名称模糊搜索"),
+    tag: str = Query(
+        "", max_length=64,
+        description="v1.14.0：按标签精确检索（与 wd 二选一，同时传以 tag 为准）",
+    ),
     ac: str = Query("", description="兼容 MacCMS：ac=detail 时列表返回含播放地址的完整字段"),
     ids: str = Query("", description="按 ID 批量取详情（逗号分隔），返回含播放地址"),
     play_raw: int = Query(0, ge=0, le=1,
@@ -1322,6 +1481,7 @@ def video_list(
     ids = _qp(request, "ids", ids)
     type_name = _qp(request, "type_name", type_name)
     wd = _qp(request, "wd", wd)
+    tag = _qp(request, "tag", tag)
     detail_mode = ac in ("detail", "videolist")
 
     slugs = [s.strip() for s in source.split(",") if s.strip()] if source else None
@@ -1377,7 +1537,7 @@ def video_list(
                     "/api/v1/videos?source=xxx&wd=关键词 搜索确认 vod_id"
                 ),
             )
-        resp = {"code": 1, "page": 1, "pagecount": 1, "total": len(items), "list": items}
+        resp = {"code": SUCCESS_CODE, "page": 1, "pagecount": 1, "total": len(items), "list": items}
         if play_meta.get("filtered"):
             resp["play_line_filtered"] = True
         return resp
@@ -1388,6 +1548,40 @@ def video_list(
     from .. import multiquery
 
     kw = dict(wd=wd, type_name=type_name, type_id=type_id, detail=detail_mode)
+    if tag:
+        # ---- 标签精确检索（v1.14.0 / B-01）：与 /api/v1/search?tag= 同一实现 ----
+        # 为什么在这里也开一个入口：客户端的「列表页」直接调 /videos，
+        # 详情页标签胶囊跳转后仍在本页滚动加载，走的是同一个方法。
+        from .. import tags as tags_mod
+
+        tresult = tags_mod.search_page(slugs, tag, page, page_size, type_name)
+        if detail_mode and tresult["rows"]:
+            multiquery.attach_detail(tresult["rows"])
+        play_meta: dict = {}
+        resp = {
+            "code": SUCCESS_CODE,
+            "page": page,
+            "pagecount": tresult["pagecount"],
+            "total": tresult["total"],
+            "total_approximate": False,   # 标签结果集由索引精确计数
+            "list": (
+                [_detail_item(r["source_slug"], r, play_raw=bool(play_raw),
+                              play_meta=play_meta)
+                 for r in tresult["rows"]]
+                if detail_mode
+                else [
+                    _list_item(r, source=r["source_slug"]) for r in tresult["rows"]
+                ]
+            ),
+            "query_ms": tresult["elapsed_ms"],
+        }
+        if tresult["partial"]:
+            resp["total_is_partial"] = True
+            resp["sources_failed"] = tresult["failed"]
+        if play_meta.get("filtered"):
+            resp["play_line_filtered"] = True
+        return resp
+
     if multiquery.can_merge(page, page_size):
         result = multiquery.merged_page(slugs, page, page_size, **kw)
     else:
@@ -1399,7 +1593,7 @@ def video_list(
 
     play_meta: dict = {}
     resp = {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "page": page,
         "pagecount": result["pagecount"],
         "total": result["total"],
@@ -1408,17 +1602,7 @@ def video_list(
              for r in result["rows"]]
             if detail_mode
             else [
-                {
-                    "source": r["source_slug"],
-                    "vod_id": r["vod_id"],
-                    "type_id": r["type_id"],
-                    "type_name": r["type_name"],
-                    "vod_name": r["name"],
-                    "vod_pic": r["pic"],
-                    "vod_remarks": r["remarks"],
-                    "vod_time": r["vod_time"],
-                }
-                for r in result["rows"]
+                _list_item(r, source=r["source_slug"]) for r in result["rows"]
             ]
         ),
     }
@@ -1428,8 +1612,9 @@ def video_list(
         resp["sources_failed"] = result["failed"]
     # v1.10.0：不带筛选条件时 total 取自 SUM(sources.total_videos)（近似值）。
     # 客户端据此决定分页依据：近似时请以「本页条数 == page_size 就继续翻」为准。
-    if result.get("total_approximate"):
-        resp["total_approximate"] = True
+    # v1.14.0 / B-04：**恒出现**（true/false）。原来只在近似时才带，客户端缺字段
+    # 与「精确」不可区分，只能猜；契约要求缺省按精确处理，那就显式给 false。
+    resp["total_approximate"] = bool(result.get("total_approximate"))
     # v1.11.0：本页有任意条目真的被过滤掉线路时标记（客户端/日志据此识别，
     # 不影响任何既有字段语义；`play_raw=1` 时永远不出现）
     if play_meta.get("filtered"):
@@ -1474,7 +1659,7 @@ def video_detail(
             detail["related_fallback"] = fallback
         except Exception as e:  # 推荐挂了不能连累详情
             log.warning("[%s] 详情附带推荐失败（忽略）: %s", slug, e)
-    resp = {"code": 1, "detail": detail}
+    resp = {"code": SUCCESS_CODE, "detail": detail}
     if play_meta.get("filtered"):
         resp["play_line_filtered"] = True
     return resp
@@ -1485,7 +1670,11 @@ def video_detail(
 # ---------------------------------------------------------------------------
 @router.get("/api/v1/search")
 def aggregate_search(
-    wd: str = Query(..., min_length=1, max_length=64, description="影视名称关键词（必填）"),
+    wd: str = Query("", max_length=64, description="影视名称关键词（与 tag 二选一）"),
+    tag: str = Query(
+        "", max_length=64,
+        description="v1.14.0：标签精确检索（分词后逐段精确匹配，不是模糊搜）",
+    ),
     source: str = Query("", description="限定源站 slug，逗号分隔；留空=搜索全部源站"),
     type_name: str = Query("", description="按分类名称过滤"),
     page: int = Query(1, ge=1),
@@ -1499,18 +1688,30 @@ def aggregate_search(
     ),
 ):
     """
-    跨源站聚合搜索。
+    聚合搜索：按名称模糊（`wd`）**或**按标签精确（`tag`）。
 
-    实现说明：
-    - 由于名称模糊匹配无法走索引，采用「每源站各查一次 + 并行执行 + 内存归并」策略，
-      避免一次性 UNION 全部表导致单条 SQL 扫描上千万行而超时；
-    - 单个源站查询失败/超时不影响整体结果（返回 partial 标记与失败源站列表）；
+    `wd` 与 `tag` 同时传时**以 `tag` 为准**（B-01 约定，已写入 API_SPEC）：
+    客户端只会传其一，后端取确定性行为，避免「两个条件 AND 后结果为空」的歧义。
+
+    实现说明（wd 路径）：
+    - 名称模糊匹配无法走索引，采用「每源站各查一次 + 并行执行 + 内存归并」，
+      避免一次性 UNION 全部表导致单条 SQL 扫上千万行而超时；
+    - 单个源站查询失败/超时不影响整体结果（partial 标记 + 失败源站列表）；
     - 结果按 vod_time 倒序（新更新在前），可按 source 限定范围提升速度。
+
+    实现说明（tag 路径，v1.14.0）：
+    - 走 video_tags 倒排表 + (tag_norm, source) 索引，`total` 是**精确值**
+      （`total_approximate` 恒为 false），空结果返回 200 + list=[]，不是 404；
+    - 只有 `/healthz.capabilities` 含 `tag_search` 时客户端才会走这条路，
+      索引没建完时后端仍能响应（只是结果不全），不会 500。
     """
     started = time.time()
-    kw = wd.strip()
-    if not kw:
-        raise HTTPException(status_code=400, detail="搜索关键词不能为空")
+    kw = (wd or "").strip()
+    tag = (tag or "").strip()
+    if not kw and not tag:
+        raise HTTPException(
+            status_code=400, detail="必须提供 wd（名称关键词）或 tag（标签）之一"
+        )
 
     # 1) 确定待搜索的源站
     with database.engine.connect() as conn:
@@ -1532,6 +1733,40 @@ def aggregate_search(
             ).all()
             name_map = {r[0]: r[1] for r in rows}
             slugs = list(name_map.keys())
+
+    # ---- tag 路径（v1.14.0 / B-01）----
+    # 空源站也返回空结果而不是 404：标签检索的语义是「没有就是没有」，
+    # 404 会让客户端弹错误提示（B-01 第 5 条）。
+    if tag:
+        if not slugs:
+            return {
+                "code": SUCCESS_CODE, "tag": tag, "page": page, "page_size": page_size,
+                "pagecount": 0, "total": 0, "total_approximate": False,
+                "query_ms": int((time.time() - started) * 1000), "list": [],
+            }
+        from .. import tags as tags_mod
+
+        result = tags_mod.search_page(slugs, tag, page, page_size, type_name)
+        items = [
+            _list_item(r, source=r["source_slug"],
+                       source_name=name_map.get(r["source_slug"], ""))
+            for r in result["rows"]
+        ]
+        return {
+            "code": SUCCESS_CODE,
+            "tag": tag,
+            "page": page,
+            "page_size": page_size,
+            "pagecount": result["pagecount"],
+            # 标签结果集可由索引精确计数，不是估值
+            "total": result["total"],
+            "total_approximate": False,
+            "total_is_partial": bool(result["partial"]),
+            "sources_failed": result["failed"],
+            "query_ms": result["elapsed_ms"],
+            "elapsed_ms": result["elapsed_ms"],
+            "list": items,
+        }
 
     if not slugs:
         raise HTTPException(status_code=404, detail="没有可搜索的源站，请先同步数据")
@@ -1580,17 +1815,8 @@ def aggregate_search(
             if truncated:
                 truncated_sources.append(slug)
             for r in rows:
-                collected.append({
-                    "source": slug,
-                    "source_name": name_map.get(slug, slug),
-                    "vod_id": r["vod_id"],
-                    "type_id": r["type_id"],
-                    "type_name": r["type_name"],
-                    "vod_name": r["name"],
-                    "vod_pic": r["pic"],
-                    "vod_remarks": r["remarks"],
-                    "vod_time": r["vod_time"],
-                })
+                collected.append(_list_item(
+                    r, source=slug, source_name=name_map.get(slug, "")))
 
     # 3) 归并排序 + 分页（按更新时间倒序，同时间按 id 倒序）
     collected.sort(key=lambda x: (x["vod_time"] or "", x["vod_id"]), reverse=True)
@@ -1600,17 +1826,21 @@ def aggregate_search(
     items = collected[start : start + page_size]
 
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "wd": kw,
         "page": page,
         "page_size": page_size,
         "pagecount": pagecount,
         # 注意：total 为「各源站候选集上限内的命中数」，非全库精确总数（模糊搜索不做全量计数以保证响应速度）
         "total": total_found,
+        # 模糊搜索的 total 是候选集内计数，属于近似值（B-04）
+        "total_approximate": True,
         "total_is_partial": bool(truncated_sources),
         "truncated_sources": truncated_sources,
         "sources_searched": len(slugs) - len(failed),
         "sources_failed": failed,
+        # v1.14.0：与 /api/v1/videos 对齐的耗时字段名（elapsed_ms 保留给老客户端）
+        "query_ms": int((time.time() - started) * 1000),
         "elapsed_ms": int((time.time() - started) * 1000),
         "list": items,
     }
@@ -1678,7 +1908,7 @@ def related_videos(
             ).first()
             computed_at = row[0].isoformat() if row and row[0] else None
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "slug": slug,
         "vod_id": id,
         "limit": limit,
@@ -1769,7 +1999,7 @@ def star_terms_list():
     # v1.10.0 / P11：读接口不再重新加载+编译词库正则（万级词库约 10ms 且抖动内存），
     # 直接返回进程内已生效的条数；写接口（增删改）才 reload。
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "infer_mode": config.RELATED_STAR_INFER_MODE,
         "factor": config.RELATED_STAR_SIM_FACTOR,
         "active": related.star_stats()["count"],
@@ -1823,7 +2053,7 @@ def star_terms_add(payload: dict):
     # 写操作后只重载一次（旧实现这里 reload 了两遍，等于把万级词库编译两次正则）
     active = related.reload_star_terms()
     return {
-        "code": 1,
+        "code": SUCCESS_CODE,
         "added": added,
         "skipped": skipped,
         "active": active,
@@ -1867,7 +2097,7 @@ def star_terms_update(term_id: int, payload: dict):
         )
         if not (res.rowcount or 0):
             raise HTTPException(status_code=404, detail=f"词条不存在: {term_id}")
-    return {"code": 1, "updated": sorted(changes), "active": related.reload_star_terms()}
+    return {"code": SUCCESS_CODE, "updated": sorted(changes), "active": related.reload_star_terms()}
 
 
 @router.delete("/api/v1/star-terms/{term_id}")
@@ -1881,7 +2111,7 @@ def star_terms_delete(term_id: int):
         res = conn.execute(star_terms.delete().where(star_terms.c.id == term_id))
         if not (res.rowcount or 0):
             raise HTTPException(status_code=404, detail=f"词条不存在: {term_id}")
-    return {"code": 1, "deleted": term_id, "active": related.reload_star_terms()}
+    return {"code": SUCCESS_CODE, "deleted": term_id, "active": related.reload_star_terms()}
 
 
 @router.post("/api/v1/star-terms/recompute")
@@ -1904,7 +2134,7 @@ def star_terms_recompute():
             related.recompute_source_safe(s, reason="star_terms_changed")
 
     threading.Thread(target=_worker, daemon=True).start()
-    return {"code": 1, "targets": targets,
+    return {"code": SUCCESS_CODE, "targets": targets,
             "msg": f"词库变更重算已受理: {len(targets)} 个源站（明星 Tag + 相关推荐）"}
 
 
@@ -1935,7 +2165,7 @@ def star_related_api(
     result = star_tags.star_related(slug, vod_id=vod_id, name=name, limit=limit)
     if result is None:
         raise HTTPException(status_code=404, detail="视频不存在")
-    return {"code": 1, **result}
+    return {"code": SUCCESS_CODE, **result}
 
 
 @router.get("/api/v1/star/works")
@@ -1957,7 +2187,7 @@ def star_works_api(
     slug = validate_slug(slug)
     _src, _table = _require_table(slug)
     result = star_tags.star_works(slug, term, limit=limit, exclude_id=exclude_id)
-    return {"code": 1, **result}
+    return {"code": SUCCESS_CODE, **result}
 
 
 @router.get("/api/v1/star/tags/untracked")
@@ -1975,7 +2205,7 @@ def star_tags_untracked(
     if slug:
         slug = validate_slug(slug)
         _require_table(slug)
-    return {"code": 1, **star_tags.untracked_terms(slug=slug, limit=limit, sample=sample)}
+    return {"code": SUCCESS_CODE, **star_tags.untracked_terms(slug=slug, limit=limit, sample=sample)}
 
 
 @router.post("/api/v1/maintenance/star-tags")
@@ -2002,7 +2232,7 @@ def star_tags_rebuild(
             star_tags.rebuild_source_safe(s, reason="manual_rebuild")
 
     threading.Thread(target=_worker, daemon=True).start()
-    return {"code": 1, "targets": targets, "msg": f"明星 Tag 重建已受理: {len(targets)} 个源站"}
+    return {"code": SUCCESS_CODE, "targets": targets, "msg": f"明星 Tag 重建已受理: {len(targets)} 个源站"}
 
 
 @router.get("/api/v1/star/tags/status")
@@ -2010,7 +2240,7 @@ def star_tags_status():
     """各源站明星 Tag 覆盖情况：总视频数 / 缺演员视频数 / 已映射明星条数。"""
     from .. import star_tags
 
-    return {"code": 1, "list": star_tags.status_all()}
+    return {"code": SUCCESS_CODE, "list": star_tags.status_all()}
 
 
 @router.get("/api/v1/related/status")
@@ -2018,7 +2248,61 @@ def related_status():
     """各源站相关推荐覆盖率（管理/验收核对：videos / computed / coverage%）。"""
     from .. import related
 
-    return {"code": 1, "algo_version": config.RELATED_ALGO_VERSION, "list": related.coverage_all()}
+    return {"code": SUCCESS_CODE, "algo_version": config.RELATED_ALGO_VERSION, "list": related.coverage_all()}
+
+
+# ---------------------------------------------------------------------------
+# 标签索引（v1.14.0 / B-01）
+#
+# 与 star_tags 的重建入口同一套调度思路：后台串行、幂等、可断点续跑。
+# 区别是这里的进度显式落库（tag_index_state），因为百万级回填要能观测、
+# 能中途重启接着跑 —— 而明星 Tag 重建是分批小任务，跑完即完。
+# ---------------------------------------------------------------------------
+@router.get("/api/v1/tag/status")
+def tag_index_status():
+    """
+    标签倒排索引状态：是否就绪（决定 /healthz 是否声明 tag_search）、
+    各源站回填进度（cursor / total / indexed）、总行数。
+
+    排查「标签检索没结果」时先看这里：`ready=false` 说明还没建完，
+    客户端此时本来就该继续用 wd 全文检索。
+    """
+    from .. import tags
+
+    return {"code": SUCCESS_CODE, **tags.status()}
+
+
+@router.post("/api/v1/maintenance/tag-index")
+def tag_index_rebuild(
+    slug: str = Query("", description="源站 slug；留空=全部启用源站"),
+    force: bool = Query(False, description="true=清空该源站标签行后从头重建"),
+):
+    """
+    手动触发标签倒排索引回填（后台，串行，可断点续跑）。
+
+    日常不需要调：同步入库时会增量维护；升级后启动时也会自动补齐。
+    用途：① 手工修复（怀疑索引与 vod_tag 不一致）；② 首次全量建完后
+    想核对 `indexed` 行数；③ 改了 TAG_INDEX_* 参数后重跑。
+    """
+    from .. import tags
+
+    if slug and slug != "all":
+        slug = validate_slug(slug)
+        _require_table(slug)
+        slug = slug
+    else:
+        slug = ""   # 空串 = 全部
+    accepted = tags.start_backfill(slug=slug, force=bool(force))
+    return {
+        "code": SUCCESS_CODE,
+        "accepted": accepted,
+        "force": bool(force),
+        "targets": slug or "all",
+        "msg": (
+            "标签索引回填任务已受理（后台串行执行，可断点续跑）"
+            if accepted else "已有同类回填任务在执行中，本次未重复提交"
+        ),
+    }
 
 
 @router.post("/api/v1/maintenance/related-recompute")
@@ -2045,7 +2329,7 @@ def related_recompute(
             related.recompute_source_safe(s, reason="manual_recompute")
 
     threading.Thread(target=_worker, daemon=True).start()
-    return {"code": 1, "targets": targets, "msg": f"相关推荐重算已受理: {len(targets)} 个源站"}
+    return {"code": SUCCESS_CODE, "targets": targets, "msg": f"相关推荐重算已受理: {len(targets)} 个源站"}
 
 
 # ---------------------------------------------------------------------------
@@ -2085,7 +2369,7 @@ def maccms_compat(
                 except ValueError:
                     continue
             if not id_list:
-                return {"code": 1, "page": 1, "pagecount": 1, "limit": page_size, "total": 0, "class": class_list, "list": []}
+                return {"code": MACCMS_CODE, "page": 1, "pagecount": 1, "limit": page_size, "total": 0, "class": class_list, "list": []}
             rows = conn.execute(
                 select(table).where(table.c.vod_id.in_(id_list))
             ).mappings().all()
@@ -2104,7 +2388,7 @@ def maccms_compat(
                         log.warning("[%s] ac=detail 附带推荐失败（忽略）: %s", slug, e)
                 items.append(item)
             resp = {
-                "code": 1, "page": 1, "pagecount": 1, "limit": page_size,
+                "code": MACCMS_CODE, "page": 1, "pagecount": 1, "limit": page_size,
                 "total": len(items), "class": class_list,
                 "list": items,
             }
@@ -2118,7 +2402,7 @@ def maccms_compat(
             play_raw=bool(play_raw), play_meta=play_meta,
         )
     resp = {
-        "code": 1,
+        "code": MACCMS_CODE,
         "msg": "数据列表",
         "page": page,
         "pagecount": pagecount,

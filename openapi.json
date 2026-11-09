@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.13.0"
+    "version": "1.14.0"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -170,13 +170,139 @@
       },
       "post": {
         "summary": "重置 API Token（旧 Token 立即失效）",
+        "description": "重置存量单 Token（v1.14.0 起可指定权限）。\n\n`scope` 既是查询参数也接受 body `{\"scope\": \"read\"}` —— 面板用前者，\nApp 控制台习惯用后者，两个都收不会造成歧义（body 优先）。\n注意：**重置会立刻让旧 Token 失效**，正在用旧 Token 的客户端会 401。\n想「新增一枚只读 Token 而不动现有的」，用 POST /api/v1/auth/tokens。",
         "operationId": "auth_rotate_token_api_v1_auth_token_post",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "read / admin；留空=admin（与 v1.13 行为一致）",
+              "default": "",
+              "title": "Scope"
+            },
+            "description": "read / admin；留空=admin（与 v1.13 行为一致）"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "title": "Payload"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/tokens": {
+      "get": {
+        "summary": "已签发 Token 清单（不返回明文）",
+        "description": "列出所有可用 Token 的权限与签发时间。\n\n第 0 项是存量单 Token（id=0，kind=legacy），其余是 v1.14.0 起的具名 Token。\n任何一项都**不含明文**：清单接口不是凭据回显口。",
+        "operationId": "auth_list_tokens_api_v1_auth_tokens_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "新增具名 Token（可指定权限）",
+        "description": "新增一枚 Token，返回**一次性明文**。\n\n与「重置」的区别：不影响现有 Token，适合给 App 发一枚 read Token，\n同时把 admin Token 留给同步控制台（B-08 的目标模型）。",
+        "operationId": "auth_create_token_api_v1_auth_tokens_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/tokens/{token_id}": {
+      "delete": {
+        "summary": "吊销具名 Token",
+        "operationId": "auth_revoke_token_api_v1_auth_tokens__token_id__delete",
+        "parameters": [
+          {
+            "name": "token_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Token Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
               }
             }
           }
@@ -227,14 +353,40 @@
     "/healthz": {
       "get": {
         "summary": "Healthz",
-        "description": "健康检查 / 存活探针。\n\n关键点：数据库繁忙时**不返回 5xx**。容器健康检查只看 HTTP 状态码，\n若这里因为连接池排队而报 500/超时，Docker 会把一个其实还在正常干活的容器判定为不健康\n并反复重启（v1.4.0 在 NAS 上就表现为\"容器崩溃\"）。因此这里始终 200，\n用 db 字段表达数据库是否可用。\n\nv1.9.3 起额外返回 version / build：升级或回滚后 `curl /healthz` 就能确认\n容器里跑的到底是哪个版本（build 是镜像构建时写入的提交短 SHA，源码直跑时为空）。\nversion 取自 app/__init__.py，与镜像 tag 同源。",
+        "description": "健康检查 / 存活探针 / **能力清单**（v1.14.0 / B-10）。\n\n关键点（三条都不能破）：\n1. 数据库繁忙时**不返回 5xx**。容器健康检查只看 HTTP 状态码，若这里因为\n   连接池排队而 500/超时，Docker 会把一个其实还在正常干活的容器判定为不健康\n   并反复重启（v1.4.0 在 NAS 上就表现为\"容器崩溃\"）。所以恒 200，\n   用 status=degraded + db=false 表达数据库不可用。\n2. 免鉴权（在 auth.PUBLIC_PATHS 里）：客户端连接测试用它测延迟，\n   不能因为没 Token 就打不进来。\n3. `capabilities` 只声明**真正可用**的能力，且数据库不可用时收缩。\n   客户端据此决定「能不能用 ?tag= / mode=backfill_play_from」，\n   声明了但没实现等于骗客户端切过去。\n\n返回：status / db / version / build / capabilities / time\n  version 取自 app/__init__.py（与镜像 tag 同源），能力变更时升 minor。",
         "operationId": "healthz_healthz_get",
+        "parameters": [
+          {
+            "name": "detail",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1,
+              "minimum": 0,
+              "description": "v1.14.0：1=capabilities 以对象形态返回（运维排障用）",
+              "default": 0,
+              "title": "Detail"
+            },
+            "description": "v1.14.0：1=capabilities 以对象形态返回（运维排障用）"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
               }
             }
           }
@@ -868,7 +1020,7 @@
     "/api/v1/sync-all": {
       "post": {
         "summary": "Trigger Sync All",
-        "description": "手动触发全部源站同步（后台执行）。",
+        "description": "手动触发全部源站同步（后台执行）。\n\nv1.14.0 / B-07：新增 `mode=backfill_play_from` —— 对**全部启用源站**并行\n回填上游 `vod_play_from`（只写 play_from 一列，不动其它字段、不推进水位线、\n不动断点，可中断可重跑）。客户端控制台已预留该入口。\n与 `/api/v1/sync/{slug}?mode=backfill_play_from` 语义完全一致，只是范围不同。",
         "operationId": "trigger_sync_all_api_v1_sync_all_post",
         "parameters": [
           {
@@ -877,10 +1029,12 @@
             "required": false,
             "schema": {
               "type": "string",
-              "pattern": "^(auto|full|incremental)$",
+              "pattern": "^(auto|full|incremental|backfill|backfill_play_from)$",
+              "description": "auto / full / incremental / backfill_play_from",
               "default": "auto",
               "title": "Mode"
-            }
+            },
+            "description": "auto / full / incremental / backfill_play_from"
           }
         ],
         "responses": {
@@ -1235,6 +1389,19 @@
             "description": "按名称模糊搜索"
           },
           {
+            "name": "tag",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "v1.14.0：按标签精确检索（与 wd 二选一，同时传以 tag 为准）",
+              "default": "",
+              "title": "Tag"
+            },
+            "description": "v1.14.0：按标签精确检索（与 wd 二选一，同时传以 tag 为准）"
+          },
+          {
             "name": "ac",
             "in": "query",
             "required": false,
@@ -1294,7 +1461,7 @@
               "maximum": 100,
               "minimum": 1,
               "description": "每页条数",
-              "default": 30,
+              "default": 18,
               "title": "Page Size"
             },
             "description": "每页条数"
@@ -1386,21 +1553,34 @@
     "/api/v1/search": {
       "get": {
         "summary": "Aggregate Search",
-        "description": "跨源站聚合搜索。\n\n实现说明：\n- 由于名称模糊匹配无法走索引，采用「每源站各查一次 + 并行执行 + 内存归并」策略，\n  避免一次性 UNION 全部表导致单条 SQL 扫描上千万行而超时；\n- 单个源站查询失败/超时不影响整体结果（返回 partial 标记与失败源站列表）；\n- 结果按 vod_time 倒序（新更新在前），可按 source 限定范围提升速度。",
+        "description": "聚合搜索：按名称模糊（`wd`）**或**按标签精确（`tag`）。\n\n`wd` 与 `tag` 同时传时**以 `tag` 为准**（B-01 约定，已写入 API_SPEC）：\n客户端只会传其一，后端取确定性行为，避免「两个条件 AND 后结果为空」的歧义。\n\n实现说明（wd 路径）：\n- 名称模糊匹配无法走索引，采用「每源站各查一次 + 并行执行 + 内存归并」，\n  避免一次性 UNION 全部表导致单条 SQL 扫上千万行而超时；\n- 单个源站查询失败/超时不影响整体结果（partial 标记 + 失败源站列表）；\n- 结果按 vod_time 倒序（新更新在前），可按 source 限定范围提升速度。\n\n实现说明（tag 路径，v1.14.0）：\n- 走 video_tags 倒排表 + (tag_norm, source) 索引，`total` 是**精确值**\n  （`total_approximate` 恒为 false），空结果返回 200 + list=[]，不是 404；\n- 只有 `/healthz.capabilities` 含 `tag_search` 时客户端才会走这条路，\n  索引没建完时后端仍能响应（只是结果不全），不会 500。",
         "operationId": "aggregate_search_api_v1_search_get",
         "parameters": [
           {
             "name": "wd",
             "in": "query",
-            "required": true,
+            "required": false,
             "schema": {
               "type": "string",
-              "minLength": 1,
               "maxLength": 64,
-              "description": "影视名称关键词（必填）",
+              "description": "影视名称关键词（与 tag 二选一）",
+              "default": "",
               "title": "Wd"
             },
-            "description": "影视名称关键词（必填）"
+            "description": "影视名称关键词（与 tag 二选一）"
+          },
+          {
+            "name": "tag",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "v1.14.0：标签精确检索（分词后逐段精确匹配，不是模糊搜）",
+              "default": "",
+              "title": "Tag"
+            },
+            "description": "v1.14.0：标签精确检索（分词后逐段精确匹配，不是模糊搜）"
           },
           {
             "name": "source",
@@ -1446,7 +1626,7 @@
               "maximum": 100,
               "minimum": 1,
               "description": "每页条数（默认取 API_PAGE_SIZE_DEFAULT，上限取 API_PAGE_SIZE_MAX）",
-              "default": 30,
+              "default": 18,
               "title": "Page Size"
             },
             "description": "每页条数（默认取 API_PAGE_SIZE_DEFAULT，上限取 API_PAGE_SIZE_MAX）"
@@ -2009,6 +2189,76 @@
         }
       }
     },
+    "/api/v1/tag/status": {
+      "get": {
+        "summary": "Tag Index Status",
+        "description": "标签倒排索引状态：是否就绪（决定 /healthz 是否声明 tag_search）、\n各源站回填进度（cursor / total / indexed）、总行数。\n\n排查「标签检索没结果」时先看这里：`ready=false` 说明还没建完，\n客户端此时本来就该继续用 wd 全文检索。",
+        "operationId": "tag_index_status_api_v1_tag_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/maintenance/tag-index": {
+      "post": {
+        "summary": "Tag Index Rebuild",
+        "description": "手动触发标签倒排索引回填（后台，串行，可断点续跑）。\n\n日常不需要调：同步入库时会增量维护；升级后启动时也会自动补齐。\n用途：① 手工修复（怀疑索引与 vod_tag 不一致）；② 首次全量建完后\n想核对 `indexed` 行数；③ 改了 TAG_INDEX_* 参数后重跑。",
+        "operationId": "tag_index_rebuild_api_v1_maintenance_tag_index_post",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "源站 slug；留空=全部启用源站",
+              "default": "",
+              "title": "Slug"
+            },
+            "description": "源站 slug；留空=全部启用源站"
+          },
+          {
+            "name": "force",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "true=清空该源站标签行后从头重建",
+              "default": false,
+              "title": "Force"
+            },
+            "description": "true=清空该源站标签行后从头重建"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/maintenance/related-recompute": {
       "post": {
         "summary": "Related Recompute",
@@ -2145,7 +2395,7 @@
               "maximum": 100,
               "minimum": 1,
               "description": "每页条数",
-              "default": 30,
+              "default": 18,
               "title": "Page Size"
             },
             "description": "每页条数"

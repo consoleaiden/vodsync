@@ -42,7 +42,10 @@ from .utils import DETAIL_EXTRA_COLS
 log = logging.getLogger("vodsync.multiquery")
 
 # 列表页需要的「瘦列」。content / play_url 是 TEXT 大字段，只在 detail 模式补当前页。
-THIN_COLS = ("vod_id", "type_id", "type_name", "name", "pic", "remarks", "vod_time")
+# v1.14.0：加 vod_area / vod_year —— 客户端列表卡片要显示「地区·年份」，
+# 之前列表模式不带，卡片上这两项恒为空。两列合计不到 20 字节，代价可忽略。
+THIN_COLS = ("vod_id", "type_id", "type_name", "name", "pic", "remarks",
+             "vod_time", "vod_area", "vod_year")
 # 详情模式额外带出的列（v1.10.1 演职员/标签；v1.11.0 加 play_from）。
 # 列表模式下不带（体积敏感）；detail=True 时和 content/play_url 同一条 SQL 取回，
 # 不增加往返 —— 否则 /videos?ac=detail 的响应里 vod_actor/vod_tag 会是空串，
@@ -225,6 +228,11 @@ def _attach_detail(items: list) -> None:
             d = found.get(r["vod_id"])
             for c in DETAIL_COLS:
                 r[c] = (d[c] if d else "") or ""
+
+
+# 公开别名：标签检索（app/tags.py）与 detail 模式共用同一段补齐逻辑，
+# 避免第二份「按源站分组 IN 查询」的实现各自漂移。
+attach_detail = _attach_detail
 
 
 # ---------------------------------------------------------------------------

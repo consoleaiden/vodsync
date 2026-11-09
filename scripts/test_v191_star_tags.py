@@ -27,6 +27,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from app.apiresp import SUCCESS_CODE  # v1.14.0：成功码统一走常量
+
 os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="vodsync-startag-")
 os.environ["DATABASE_URL"] = "sqlite:///" + os.path.join(os.environ["DATA_DIR"], "startag.db")
 os.environ["AUTH_ENABLED"] = "false"
@@ -216,7 +218,7 @@ def main():
     check("E3 未知 slug 404", r.status_code == 404, r.status_code)
 
     r = client.post(f"/api/v1/maintenance/star-tags?slug={SLUG}")
-    check("E4 手动重建受理", r.status_code == 200 and r.json()["code"] == 1, r.text[:150])
+    check("E4 手动重建受理", r.status_code == 200 and r.json()["code"] == SUCCESS_CODE, r.text[:150])
     # 后台线程异步重建：轮询等待完成（映射数恢复到 >=6）
     import time
     for _ in range(20):

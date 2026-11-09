@@ -24,10 +24,14 @@ os.environ.setdefault(
     "sqlite:///" + os.path.join(os.environ["DATA_DIR"], "vodsync.db").replace(os.sep, "/"),
 )
 os.environ["FULL_SYNC_ON_DISCOVER"] = "false"
+# v1.5.0 起默认开启访问控制（config.AUTH_ENABLED 默认 true），本用例只验证暂停
+# 语义、不带凭据，必须关掉鉴权才不会被 401 挡在门外。
+os.environ.setdefault("AUTH_ENABLED", "false")
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 from app import database, pause, syncer  # noqa: E402
+from app.apiresp import SUCCESS_CODE  # v1.14.0：成功码从常量取，别写死 1
 from app.main import app  # noqa: E402
 
 PASS = []
@@ -52,7 +56,7 @@ def main():
 
     # ---- [1] 初始状态 ----
     r = client.get("/api/v1/pause").json()
-    ok("pause 初始状态", r["code"] == 1 and not r["global"] and not r["full"] and not r["incremental"], str(r))
+    ok("pause 初始状态", r["code"] == SUCCESS_CODE and not r["global"] and not r["full"] and not r["incremental"], str(r))
 
     # ---- [2] 三层级独立暂停 + 持久化 ----
     client.post("/api/v1/pause?scope=full&reason=test")
@@ -159,14 +163,14 @@ def main():
     pause.set_paused("full", False)
     pause.set_paused("incremental", False)
     r = client.post("/api/v1/resume?scope=global").json()
-    ok("resume 返回续跑源站清单", r["code"] == 1 and isinstance(r.get("resumed_sources"), list))
+    ok("resume 返回续跑源站清单", r["code"] == SUCCESS_CODE and isinstance(r.get("resumed_sources"), list))
     r = client.get("/api/v1/stats").json()
     ok("stats 含 pause 字段", "pause" in r and r["pause"]["full"] is False, str(r.get("pause")))
 
     # ---- [8] 单源站暂停 / 继续 ----
     other = slugs[1] if len(slugs) > 1 else target
     r = client.post(f"/api/v1/sources/{big}/pause").json()
-    ok("单源站暂停 API 受理", r["code"] == 1 and r["paused"] is True, str(r)[:80])
+    ok("单源站暂停 API 受理", r["code"] == SUCCESS_CODE and r["paused"] is True, str(r)[:80])
     lst = client.get("/api/v1/sources").json()["list"]
     row = next((x for x in lst if x["slug"] == big), None)
     ok("源站列表返回 paused 标记", row is not None and row["paused"] is True and row["paused_at"])
@@ -228,7 +232,7 @@ def main():
 
     # 继续单个源站
     r = client.post(f"/api/v1/sources/{big}/resume").json()
-    ok("单源站继续 API", r["code"] == 1 and r["paused"] is False and r.get("blocked_by") == "", str(r)[:90])
+    ok("单源站继续 API", r["code"] == SUCCESS_CODE and r["paused"] is False and r.get("blocked_by") == "", str(r)[:90])
     lst = client.get("/api/v1/sources").json()["list"]
     row = next((x for x in lst if x["slug"] == big), None)
     ok("继续后 paused 标记清除", row is not None and row["paused"] is False)

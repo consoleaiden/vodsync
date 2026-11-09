@@ -389,6 +389,7 @@ def update_custom_source(slug: str, **fields) -> dict:
                 conn.execute(table.delete())
         delete_related_rows(slug)
         delete_star_map_rows(slug)
+        _delete_tag_rows(slug)
         log.info("源站 %s 的 API 地址已变更，历史数据已清空", slug)
 
     return {"slug": slug, "updated": sorted(changes), "data_reset": reset_data}
@@ -418,6 +419,7 @@ def delete_custom_source(slug: str, drop_table: bool = True) -> dict:
         forget_vod_table(slug)
     delete_related_rows(slug)
     delete_star_map_rows(slug)
+    _delete_tag_rows(slug)
     log.info("自定义源站已删除: %s（数据表%s）", slug, "已删除" if drop_table else "保留")
     return {"slug": slug, "dropped": bool(drop_table)}
 
@@ -563,6 +565,19 @@ def upsert_batch(slug: str, rows: list) -> tuple:
         )
         stmt = stmt.on_conflict_do_update(index_elements=["vod_id"], set_=update_cols)
         conn.execute(stmt, rows)
+
+        # 标签倒排（v1.14.0 / B-01）：与主表写入同一事务，保证「有这行视频就有它的
+        # 标签行」。用 savepoint 包一层 —— 标签索引是**附加能力**，它失败绝不能让
+        # 整批同步回滚（宁可标签缺失、稍后靠 /maintenance/tag-index 补回，
+        # 也不能把已经抓下来的数据丢回去重抓）。
+        if config.TAG_SEARCH_ENABLED and config.TAG_INDEX_ON_SYNC:
+            try:
+                from . import tags
+
+                with conn.begin_nested():
+                    tags.index_rows(slug, rows, conn=conn)
+            except Exception as e:  # noqa: BLE001
+                log.warning("[%s] 标签索引写入失败（不影响同步，可稍后回填）: %s", slug, e)
     inserted = sum(1 for i in ids if i not in existing)
     return inserted, len(ids) - inserted
 
@@ -589,6 +604,18 @@ def delete_related_rows(slug: str):
             conn.execute(vod_related.delete().where(vod_related.c.slug == slug))
     except Exception as e:
         log.warning("[%s] 清理推荐结果失败（忽略）: %s", slug, e)
+
+
+def _delete_tag_rows(slug: str):
+    """
+    删除某源站的标签倒排行（v1.14.0 / B-01）。
+
+    清数据/删源站时必须一起清：否则 video_tags 里留着指向已消失 vod_id 的行，
+    标签检索的 count 会虚高（join 后拿不到行），出现「说有 5 条、实际 3 条」。
+    """
+    from . import tags
+
+    tags.delete_source_rows(slug)
 
 
 def delete_star_map_rows(slug: str):

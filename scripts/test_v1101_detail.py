@@ -63,6 +63,9 @@ def check(name, cond, detail=""):
 
 SLUG = "t1101"
 FIELDS = ("vod_actor", "vod_director", "vod_area", "vod_year", "vod_tag")
+# v1.14.0：vod_area / vod_year 进列表了（客户端卡片要显示「地区·年份」，契约 §2.1），
+# 所以「列表模式应当排除」的只剩演员、导演、标签串这三项重字段。
+LIST_EXCLUDED = ("vod_actor", "vod_director", "vod_tag")
 
 # vod_id, name, type_name, area, year, actor, director, tag, time
 SAMPLES = [
@@ -169,9 +172,13 @@ def main():
 
     r = client.get(f"/api/v1/videos?source={SLUG}&page=1&page_size=10")
     items = r.json().get("list") or []
-    check("B4 列表模式不带这 5 个键（体积控制）",
-          bool(items) and not any(f in items[0] for f in FIELDS),
+    check("B4 列表模式不带重字段（体积控制）",
+          bool(items) and not any(f in items[0] for f in LIST_EXCLUDED),
           items[0] if items else None)
+    # 反过来的断言：地区/年份**必须**在列表里（v1.14.0 契约 §2.1）
+    check("B5 列表模式带 vod_area / vod_year",
+          bool(items) and items[0].get("vod_area") == "美国"
+          and items[0].get("vod_year") == "2014", items[0] if items else None)
 
     # ==================================================================
     print("\n[C] 容错：行里没有这些列时不能炸")

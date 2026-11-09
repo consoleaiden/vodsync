@@ -10,11 +10,13 @@ import threading
 from urllib.parse import quote
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from sqlalchemy.exc import OperationalError, TimeoutError as SADBTimeoutError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__, config, database
+from . import __version__, apiresp, config, database
 from .routes.api import router
 
 logging.basicConfig(
@@ -58,19 +60,35 @@ async def _auth_guard(request: Request, call_next):
         return await call_next(request)
 
     if auth.is_api_path(path):
-        if auth.request_authorized(request):
-            return await call_next(request)
-        return JSONResponse(
-            status_code=401,
-            content={
-                "detail": (
+        if not auth.request_authorized(request):
+            # v1.14.0 / B-11：401 同时给出 code=40101 与 error=invalid_token，
+            # detail 保留中文（老客户端与面板读的就是它）
+            return JSONResponse(
+                status_code=401,
+                content=apiresp.error_body(
+                    401,
                     "未授权：请求头需携带 Authorization: Bearer <token>"
-                    "（也支持 X-API-Key 头或 ?token= 参数）；浏览器需先登录管理面板"
+                    "（也支持 X-API-Key 头或 ?token= 参数）；浏览器需先登录管理面板",
+                    error="invalid_token",
                 ),
-                "code": 401,
-            },
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        # v1.14.0 / B-08：权限粒度。默认 TOKEN_SCOPE_ENFORCE=false —— 全部放行，
+        # 等价「所有 Token 都是 admin」，保证升级当天现网零影响。
+        if config.TOKEN_SCOPE_ENFORCE and auth.requires_admin(request.method, path):
+            scope = auth.request_scope(request)
+            if scope != "admin" and not auth.legacy_client_exempt(request):
+                log.info("权限不足: %s %s scope=%s", request.method, path, scope or "-")
+                return JSONResponse(
+                    status_code=403,
+                    content=apiresp.error_body(
+                        403,
+                        "该接口需要 admin 权限的 Token（当前 Token 为只读）",
+                        error="insufficient_scope",
+                        required="admin",
+                    ),
+                )
+        return await call_next(request)
 
     if auth.has_session(request):
         return await call_next(request)
@@ -78,7 +96,64 @@ async def _auth_guard(request: Request, call_next):
     if request.method in ("GET", "HEAD") and "text/html" in request.headers.get("accept", ""):
         target = path + (("?" + request.url.query) if request.url.query else "")
         return RedirectResponse(f"/login?next={quote(target, safe='')}", status_code=303)
-    return JSONResponse(status_code=401, content={"detail": "请先登录管理面板", "code": 401})
+    return JSONResponse(status_code=401, content=apiresp.error_body(401, "请先登录管理面板"))
+
+
+# ---------------------------------------------------------------------------
+# 统一错误包络（v1.14.0 / B-11）
+#
+# 目标：客户端能可靠区分「成功 / 业务失败 / 鉴权失败」，而不是靠中文字符串猜。
+# 关键取舍：
+#   - 业务失败一律非 2xx（不再出现 HTTP 200 + code:1 表示失败）；
+#   - body 同时给 code（程序判据）、error（稳定语义串）、detail（中文，老客户端
+#     与面板一直读它，删了就白屏），另加 message 同值供新客户端使用；
+#   - 500 不回显堆栈/异常原文，只给一句可读提示 + 服务端日志。
+#
+# 这三个 handler 只影响**异常路径**，正常响应的字段一个都没动。
+# ---------------------------------------------------------------------------
+@app.exception_handler(StarletteHTTPException)
+async def _http_error_handler(request: Request, exc: StarletteHTTPException):
+    status = exc.status_code or 500
+    detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail or "")
+    body = apiresp.error_body(status, detail)
+    # 429 等场景 HTTPException 自带 headers（Retry-After），必须原样带出去，
+    # 否则客户端就不知道要等多久
+    headers = getattr(exc, "headers", None) or None
+    return JSONResponse(status_code=status, content=body, headers=headers)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(request: Request, exc: RequestValidationError):
+    """
+    参数校验失败：FasAPI 默认返回 422 + 结构复杂的 detail 数组，
+    客户端拿不到「哪个字段错了」。统一成 400 + 40001 + field。
+    """
+    field = ""
+    try:
+        errs = exc.errors()
+        if errs:
+            loc = [str(x) for x in errs[0].get("loc", []) if x not in ("query", "path", "body")]
+            field = ".".join(loc)
+            msg = errs[0].get("msg", "")
+        else:
+            msg = ""
+    except Exception:  # noqa: BLE001
+        msg = ""
+    text = f"参数错误{f'：{field} {msg}' if field else ''}".strip()
+    return JSONResponse(
+        status_code=400,
+        content=apiresp.error_body(400, text, field=field or None),
+    )
+
+
+@app.exception_handler(Exception)
+async def _unhandled_error_handler(request: Request, exc: Exception):
+    """未捕获异常：日志留全量堆栈，响应只给一句人话（不回显内部细节）。"""
+    log.exception("未处理异常: %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content=apiresp.error_body(500, "服务内部错误，请稍后重试（详情见服务端日志）"),
+    )
 
 
 
@@ -94,10 +169,14 @@ def _db_pool_timeout_handler(request: Request, exc: SADBTimeoutError):  # noqa: 
     log.error("数据库连接池等待超时: %s %s", request.url.path, exc)
     return JSONResponse(
         status_code=503,
-        content={
-            "detail": "服务繁忙：数据库连接池已满，请稍后重试（可减少同时运行的全量同步数量）",
-            "code": 0,
-        },
+        # 注意 code 必须是失败码：v1.13 这里写的是 code:0，客户端按「code==0 即成功」
+        # 会把它当成功响应去解析 data，直接空列表 —— 属于 B-11 要消灭的形态。
+        content=apiresp.error_body(
+            503,
+            "服务繁忙：数据库连接池已满，请稍后重试（可减少同时运行的全量同步数量）",
+            error="service_unavailable",
+            retry_after=5,
+        ),
         headers={"Retry-After": "5"},
     )
 
@@ -107,7 +186,10 @@ def _db_operational_handler(request: Request, exc: OperationalError):  # noqa: A
     log.error("数据库操作失败: %s %s", request.url.path, exc)
     return JSONResponse(
         status_code=503,
-        content={"detail": "数据库繁忙或暂不可用，请稍后重试", "code": 0},
+        content=apiresp.error_body(
+            503, "数据库繁忙或暂不可用，请稍后重试",
+            error="service_unavailable", retry_after=5,
+        ),
         headers={"Retry-After": "5"},
     )
 
@@ -235,6 +317,20 @@ def _bootstrap():
             threading.Thread(
                 target=_ensure_search_indexes_bg, daemon=True, name="pg-trgm"
             ).start()
+
+        # 标签倒排索引（v1.14.0 / B-01）：没建完的后台补齐。
+        # 可断点续跑（游标在 tag_index_state），建完的源站不会重扫；
+        # 单独线程 + 串行写 + 批间休眠，绝不和同步任务抢 IO。
+        # 建完之前 /healthz 不声明 tag_search，客户端继续用 wd 检索。
+        if config.TAG_SEARCH_ENABLED and config.TAG_INDEX_ON_STARTUP:
+            try:
+                from . import tags
+
+                if not tags.ready():
+                    log.info("标签索引未就绪，后台开始回填（可断点续跑）")
+                    tags.start_backfill()
+            except Exception:
+                log.exception("标签索引回填启动失败（检索能力暂不声明）")
     except Exception:
         log.exception("启动引导失败（服务仍可用，可稍后通过 API 手动触发）")
 

@@ -163,7 +163,9 @@ def main():
     r = client.get("/api/v1/star/works?slug=nosuch&term=吴京")
     check("B5 未知 slug → 404", r.status_code == 404, r.status_code)
     r = client.get(f"/api/v1/star/works?slug={SLUG}&term=吴京&limit=999")
-    check("B5 limit 超上限 → 422 参数校验", r.status_code == 422, r.status_code)
+    # v1.14.0 / B-11：参数校验 422 -> 400（带 code=40001 与 field）
+    check("B5 limit 超上限 → 400 参数校验",
+          r.status_code == 400 and r.json().get("code") == 40001, r.status_code)
 
     print("\n== C. star/related 增强 ==")
     r = client.get(f"/api/v1/star/related?slug={SLUG}&vod_id=201")

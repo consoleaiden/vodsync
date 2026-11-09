@@ -4,7 +4,9 @@ v1.5.1 分页行为测试（为 App 三列宫格布局校准每页条数）。
 覆盖项：
  1. /api/v1/videos 默认 page_size 取 API_PAGE_SIZE_DEFAULT
  2. 显式 page_size=30 生效，list 长度与 pagecount 一致
- 3. page_size 超过 API_PAGE_SIZE_MAX 时返回 422（不是静默截断）
+ 3. page_size 超过 API_PAGE_SIZE_MAX 时返回 4xx（不是静默截断）
+   v1.14.0 / B-11 起统一为 400 + code=40001（原先是 FastAPI 默认的 422，
+   客户端拿不到「哪个字段错了」；40001 同时带 field 字段）
  4. /api/v1/search 默认 page_size 同样跟随配置（v1.5.1 由写死的 20 改为读配置）
  5. 最后一页不足一页时按实际条数返回，pagecount 向上取整
  6. /api/v1/{slug}（MacCMS 兼容）的 limit 字段与请求一致
@@ -85,9 +87,10 @@ def main():
 
     print("[3] 越界与非法值")
     r = client.get(f"/api/v1/videos?source={slug}&page_size=101")
-    check("超过 MAX 返回 422", r.status_code == 422, r.status_code)
+    check("超过 MAX 返回 400（v1.14.0 统一错误码）", r.status_code == 400, r.status_code)
+    check("参数错误带业务码 40001", r.json().get("code") == 40001, r.json().get("code"))
     r = client.get(f"/api/v1/videos?source={slug}&page_size=0")
-    check("page_size=0 返回 422", r.status_code == 422, r.status_code)
+    check("page_size=0 返回 400（v1.14.0 统一错误码）", r.status_code == 400, r.status_code)
 
     print("[4] 聚合搜索默认分页（v1.5.1 修复点）")
     r = client.get("/api/v1/search?wd=测试")
