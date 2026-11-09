@@ -436,14 +436,14 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
 | tag | 示例 | 是否可变 | 用途 |
 |---|---|---|---|
 | `latest` | `…/vodsync:latest` | 可变 | 生产默认跟随最新（只在 main 分支构建时更新） |
-| 版本号 | `…/vodsync:1.12.0` | 可变 | 同一版本多次构建时指向最新一次 |
+| 版本号 | `…/vodsync:1.12.2` | 可变 | 同一版本多次构建时指向最新一次 |
 | 次版本号 | `…/vodsync:1.12` | 可变 | 小版本内快速定位 |
-| 版本 + 提交 | `…/vodsync:1.12.0-e4953c9` | **不可变** | **回滚用这个** —— 一个提交一个镜像，永不被覆盖 |
-| 提交短 SHA | `…/vodsync:sha-e4953c9` | **不可变** | 按提交回滚 / 溯源 |
+| 版本 + 提交 | `…/vodsync:1.12.2-1c09f48` | **不可变** | **回滚用这个** —— 一个提交一个镜像，永不被覆盖 |
+| 提交短 SHA | `…/vodsync:sha-1c09f48` | **不可变** | 按提交回滚 / 溯源 |
 
 版本号唯一来源是 `app/__init__.py` 里的 `__version__`：CI 从这里读出来生成 tag，
 `/docs` 与 `/healthz` 也读同一个值。推 `vX.Y.Z` git tag 时 CI 会校验 tag 与代码里的版本号一致，
-不一致直接构建失败（防止「镜像说 1.12.0、代码其实是 1.11.0」这种回滚事故）。
+不一致直接构建失败（防止「镜像说 1.12.2、代码其实是 1.12.1」这种回滚事故）。
 每次构建的日志开头会打印「构建版本：…」，Actions 页面即可查到某一版打了哪些 tag。
 
 ### 升级（跟随最新）
@@ -455,20 +455,20 @@ sudo docker compose pull vodsync && sudo docker compose up -d
 
 ### 回滚到指定版本
 
-> 下例以「回到 v1.12.0 这次构建」为样本，把 tag 换成你要回到的那一版即可。
+> 下例以「回到 v1.12.2 这次构建」为样本，把 tag 换成你要回到的那一版即可。
 
 ```bash
 # 1) 看有哪些版本：GitHub → 仓库右侧 Packages → vodsync（或 Actions 里某次构建的 tag 列表）
 #    也可以直接试拉，404 就是没有这个版本
-sudo docker pull ghcr.io/consoleaiden/vodsync:1.12.0-e4953c9
+sudo docker pull ghcr.io/consoleaiden/vodsync:1.12.2-1c09f48
 
 # 2) 改 compose 里的镜像 tag（推荐用不可变的「版本 + 提交」tag）
-#    image: ghcr.io/consoleaiden/vodsync:1.12.0-e4953c9
+#    image: ghcr.io/consoleaiden/vodsync:1.12.2-1c09f48
 sudo docker compose up -d
 
 # 3) 核对真的回滚成功了（version/build 对不上说明 tag 或缓存不对）
 curl -s http://127.0.0.1:8181/healthz
-# {"status":"ok","db":true,"version":"1.12.0","build":"e4953c9b9cfa003e2eacdda877d2901fb64f3d19",...}
+# {"status":"ok","db":true,"version":"1.12.2","build":"1c09f48aa81414992108c8a5ee2c717abfd62fbd",...}
 ```
 
 要点：
@@ -477,7 +477,7 @@ curl -s http://127.0.0.1:8181/healthz
   旧版本忽略它们即可 —— 本项目迁移均为「加列/加表」，不删不改，因此前后兼容。
   唯一的例外是算法类升级（如相关推荐算法版本）：旧镜像启动后会把 `algo_version` 视为不匹配并重算，
   属预期行为。
-- **生产环境建议把 `latest` 钉成具体版本**（`1.12.0-e4953c9`），否则下次 `docker compose pull`
+- **生产环境建议把 `latest` 钉成具体版本**（`1.12.2-1c09f48`），否则下次 `docker compose pull`
   又会回到最新；想「只升指定版本」就永远别用 `latest`。
 - `docker compose pull` 发现有同名 tag 被覆盖时才会更新，所以**用不可变 tag 时拉取是幂等的**。
 - `build` 字段取自镜像构建时的提交 SHA（本地 `build: .` 时为 `unknown`），是区分「同名版本不同构建」的唯一凭据。
