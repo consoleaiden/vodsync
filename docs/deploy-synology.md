@@ -97,7 +97,7 @@ services:
 - `curl -s http://群晖IP:8181/healthz` → 返回 `status` / `db` / `version` / `build`，**`"version"` 必须与你要部署的版本一致**
 
   ```json
-  {"status":"ok","db":true,"version":"1.12.2","build":"<commit sha>","time":"..."}
+  {"status":"ok","db":true,"version":"1.13.0","build":"<commit sha>","time":"..."}
   ```
 - 打开 `http://群晖IP:8181/docs` 查看交互式 API 文档
 
