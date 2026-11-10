@@ -90,7 +90,12 @@ def main():
 
     # ---------------- D. JS 接线 ----------------
     check("D1 loadStarTerms 在顶层定义", re.search(r"\nasync function loadStarTerms\(", js) is not None, "")
-    check("D2 boot 里调用了 loadStarTerms", re.search(r"boot\(\)[\s\S]{0,400}loadStarTerms\(\);", js) is not None, "")
+    # v1.14.1：词库改为折叠区块「首次展开才加载」，boot 里不再直接调 loadStarTerms，
+    # 改由 SEC_DEFS.stars.load 挂钩 + boot 的 secLoadOpen() 统一补载
+    check("D2 折叠表把词库挂在 stars.load 上",
+          re.search(r"stars:\s*\{[^}]*load:\s*\(\)\s*=>\s*loadStarTerms\(\)", js) is not None, "")
+    check("D2b boot 调用 secLoadOpen 补载已展开区块",
+          re.search(r"boot\(\)[\s\S]{0,600}secLoadOpen\(\);", js) is not None, "")
     check("D3 词库不进 5 秒轮询", "loadStarTerms" not in
           re.search(r"async function refreshAll\(\)[^}]*\}", js).group(0), "")
     for btn in ("btnStarAdd", "btnStarRecompute", "btnStarReload", "btnStarPaste"):
@@ -99,6 +104,27 @@ def main():
     check("D6 删除前有确认", 'confirm(`确认删除词条' in js, "")
     check("D7 starRowHtml 输出别名/备注/按钮",
           all(k in js for k in ("data-star-alias", "data-star-edit", "data-star-del", "data-star-toggle")), "")
+
+    # ---------------- G. 可折叠区块（v1.14.1：首展才加载，缩短首屏） ----------------
+    for key, btn, wrap in (("tables", "tablesToggle", "tablesWrap"),
+                           ("stars", "starsToggle", "starsWrap"),
+                           ("sources", "sourcesToggle", "sourcesWrap"),
+                           ("logs", "logsToggle", "logsWrap")):
+        check(f"G1 {btn} 在面板头部", f'id="{btn}"' in html, "")
+        check(f"G2 {wrap} 默认隐藏", f'id="{wrap}" style="display:none"' in html, "")
+    check("G3 SEC_DEFS 覆盖 4 个区块",
+          all(k in js for k in ("tables:", "stars:", "sources:", "logs:")) and "SEC_DEFS" in js, "")
+    check("G4 展开状态持久化到 localStorage", "localStorage.setItem(SEC_KEY" in js, "")
+    check("G5 首展才加载（_loaded 标记防重复）", "_loaded" in js, "")
+    check("G6 轮询只刷展开中的区块",
+          "if (secOpen.sources) jobs.push(loadSources())" in js
+          and "if (secOpen.logs) jobs.push(loadLogs())" in js, "")
+    check("G7 收起文案与展开文案齐全",
+          '"收起 \u25b4"' in js or "收起 ▴" in js, "")
+    check("G8 加载失败允许重试（_loaded 回滚）",
+          "def._loaded = false" in js, "")
+    check("G9 boot 不再无条件加载 tables/stars",
+          "tbLoadTables();   //" not in js and "loadStarTerms();  //" not in js, "")
 
     # ---------------- E. 结构健康 ----------------
     ids = re.findall(r'\bid="([^"]+)"', html)

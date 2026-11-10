@@ -181,24 +181,34 @@ def rebuild_source(slug: str, force: bool = False) -> dict:
     table = build_vod_table(slug)
     if not database.table_exists(table.name):
         with database.write_txn() as conn:
-            _state_upsert(conn, slug, cursor=0, indexed=0, total=0, status="done",
-                          error="", started_at=None, finished_at=datetime.now())
+            _state_upsert(conn, slug, cursor=0, processed=0, indexed=0, total=0,
+                          status="done", error="", started_at=None,
+                          finished_at=datetime.now())
         return {"slug": slug, "status": "done", "indexed": 0, "total": 0, "note": "no_table"}
 
     with database.write_txn() as conn:
         total = conn.execute(select(func.count()).select_from(table)).scalar() or 0
         if force:
             conn.execute(video_tags.delete().where(video_tags.c.source == slug))
-            _state_upsert(conn, slug, cursor=0, indexed=0, total=int(total),
+            _state_upsert(conn, slug, cursor=0, processed=0, indexed=0, total=int(total),
                           status="running", error="",
                           started_at=datetime.now(), finished_at=None)
-            cursor, indexed = 0, 0
+            cursor, processed, indexed = 0, 0, 0
         else:
             st = _get_state(conn, slug)
             cursor = int(st["cursor"] or 0) if st else 0
             indexed = int(st["indexed"] or 0) if st else 0
+            processed = int(st["processed"] or 0) if st else 0
+            # 存量库刚补上 processed 列时是 0，但 cursor 已经推进过 —— 用一次
+            # COUNT(vod_id <= cursor) 把「已处理条数」补回来，否则续跑的第一屏
+            # 会从 0% 跳变（主键范围计数，走 PK 索引，代价可接受且只做一次）。
+            if processed == 0 and cursor > 0:
+                processed = conn.execute(
+                    select(func.count()).select_from(table).where(table.c.vod_id <= cursor)
+                ).scalar() or 0
             started_at = (st["started_at"] if st and st["started_at"] else None)
-            _state_upsert(conn, slug, cursor=cursor, indexed=indexed, total=int(total),
+            _state_upsert(conn, slug, cursor=cursor, processed=int(processed),
+                          indexed=indexed, total=int(total),
                           status="running", error="",
                           started_at=started_at or datetime.now(),
                           finished_at=None)
@@ -218,8 +228,10 @@ def rebuild_source(slug: str, force: bool = False) -> dict:
         with database.write_txn() as conn:
             n = index_rows(slug, [dict(r) for r in rows], conn=conn)
             cursor = int(rows[-1]["vod_id"])
+            processed += len(rows)      # 与 total 同量纲：条数，不是 ID
             indexed += n
-            _state_upsert(conn, slug, cursor=cursor, indexed=indexed)
+            _state_upsert(conn, slug, cursor=cursor, processed=int(processed),
+                          indexed=indexed)
         written += n
         if config.TAG_INDEX_SLEEP_MS > 0:
             time.sleep(config.TAG_INDEX_SLEEP_MS / 1000.0)
@@ -228,6 +240,7 @@ def rebuild_source(slug: str, force: bool = False) -> dict:
 
     with database.write_txn() as conn:
         _state_upsert(conn, slug, status="done",
+                      processed=int(min(processed, int(total) or int(processed))),
                       finished_at=datetime.now())
     invalidate_ready_cache()
     log.info("[%s] 标签索引回填完成: 新增 %d 行 / 共 %d 条视频", slug, written, total)
@@ -332,6 +345,26 @@ def ready() -> bool:
     return val
 
 
+def _progress(status: str, processed, total) -> float:
+    """
+    回填进度（0–100）。
+
+    **只认 processed / total**：两者都是「条数」。绝不拿 cursor（vod_id 水位）当分子
+    —— 上游 vod_id 稀疏且可能从几万起，`cursor/total` 会算出 147%、172% 这种
+    不存在的进度（v1.14.1 修的就是这个）。
+
+    三重保险：完成态恒 100；无分母给 0；最后再夹到 [0,100]（并发同步一边跑一边
+    插新片时 total 是开跑时的快照，processed 可能短暂超过它）。
+    """
+    t = int(total or 0)
+    if status == "done":
+        return 100.0 if t else 0.0
+    if t <= 0:
+        return 0.0
+    p = int(processed or 0) * 100.0 / t
+    return round(max(0.0, min(100.0, p)), 1)
+
+
 def status() -> dict:
     """索引状态（面板/维护接口展示：进度、游标、就绪与否）。"""
     with database.engine.connect() as conn:
@@ -350,9 +383,11 @@ def status() -> dict:
                 "slug": r["slug"],
                 "status": r["status"],
                 "cursor": r["cursor"],
+                # 已处理条数（与 total 同量纲）；存量库迁移后由续跑逻辑补算
+                "processed": r["processed"],
                 "total": r["total"],
                 "indexed": r["indexed"],
-                "progress": round((r["cursor"] * 100.0 / r["total"]), 1) if r["total"] else 0.0,
+                "progress": _progress(r["status"], r["processed"], r["total"]),
                 "error": r["error"] or "",
                 "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
             }

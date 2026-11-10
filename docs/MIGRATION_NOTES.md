@@ -37,7 +37,8 @@ CREATE INDEX IF NOT EXISTS idx_video_tags_tag ON video_tags (tag_norm, source);
 -- 回填进度：游标 + 计数，支持断点续跑
 CREATE TABLE IF NOT EXISTS tag_index_state (
     slug        VARCHAR(64) PRIMARY KEY,
-    cursor      INTEGER      DEFAULT 0,     -- 已处理到的最大 vod_id（水位）
+    cursor      INTEGER      DEFAULT 0,     -- 已处理到的最大 vod_id（水位，仅断点续跑用）
+    processed   INTEGER      DEFAULT 0,     -- 已处理**条数**（v1.14.1；进度分子，与 total 同量纲）
     indexed     INTEGER      DEFAULT 0,     -- 已写入行数
     total       INTEGER      DEFAULT 0,     -- 该源站总条数（进度分母）
     status      VARCHAR(16)  DEFAULT 'pending',  -- pending/running/done/failed
@@ -58,6 +59,25 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     revoked      INTEGER      DEFAULT 0
 );
 ```
+
+## 2.1 v1.14.1 追加列（2026-11-10）
+
+`tag_index_state` 增加 `processed`（已处理条数）。**自动迁移**，无需手工执行：
+
+```sql
+ALTER TABLE tag_index_state ADD COLUMN processed INTEGER DEFAULT 0;
+```
+
+为什么加它：v1.14.0 的面板进度是 `cursor / total`，但 `cursor` 是上游 `vod_id` 水位、
+`total` 是行数，两个量纲相除，ID 稀疏的源站会显示 147%、172%。升级后：
+
+- 已完成（`status=done`）的行：`processed` 补 0 也不影响 —— 完成态进度恒 100；
+- 正在回填的行：续跑时会用 `COUNT(vod_id <= cursor)` 把 `processed` 一次性补准，
+  面板不会从 0% 跳变；
+- 想立刻让历史行显示正确：`docker compose exec vodsync python scripts/backfill_tags.py --status`
+  查看，或直接点面板「重建索引」（幂等，已完成站也会重扫一遍，耗时按数据量）。
+
+回滚到 v1.14.0 不需要删列（旧代码不读 `processed`，多一列无害）。
 
 ## 3. 回填（把存量数据灌进 `video_tags`）
 

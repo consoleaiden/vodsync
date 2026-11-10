@@ -1412,7 +1412,8 @@ GET /api/v1/related?slug=jkun&id=134369&limit=8
     "slug": "ffzy",
     "status": "done",
     "cursor": 138942,
-    "total": 138942,
+    "processed": 74467,
+    "total": 74467,
     "indexed": 375104,
     "progress": 100.0,
     "error": "",
@@ -1423,7 +1424,12 @@ GET /api/v1/related?slug=jkun&id=134369&limit=8
 
 - `ready`：**唯一**决定 `/healthz` 是否声明 `tag_search` 的判据。判定条件 = 所有「启用且已有
   数据表」的源站都 `status=done`，且 `video_tags` 至少有一行。
-- `progress` 以 `cursor / total` 计算，`cursor` 是已处理到的最大 `vod_id`（不是条数）。
+- `progress` = **`processed / total`**，两者都是「条数」，取值恒在 `0–100`
+  （完成态恒 100；`total=0` 时为 0）。**v1.14.1 修正**：早期版本用 `cursor / total`，
+  但 `cursor` 是上游 `vod_id` 水位、不是条数，ID 稀疏的源站会算出 147%、172% 这种
+  不存在的进度。
+- `processed`：已处理条数（与 `total` 同量纲）；`cursor` 仅作断点续跑水位
+  （`WHERE vod_id > cursor`）与排障用，**不要拿它算比例**。
 - `building` 是正在回填的 slug 列表（空数组表示没有任务在跑）。
 
 #### `POST /api/v1/maintenance/tag-index` — 手动回填
@@ -1831,7 +1837,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.14.0（当前） | **后端契约升级（B-01/B-02/B-03/B-04/B-05/B-06/B-08/B-09/B-10/B-11）**：`/healthz` 新增 `capabilities` 能力清单（`tag_search` / `error_codes` / `token_scope` …，DB 降级时自动收缩）；错误码统一为「非 2xx + `{code, error, detail, message}`」（`40001`/`40101`/`40301`/`40401`，参数校验由 422 改 400 并带 `field`）；**成功码默认 0**（`API_SUCCESS_CODE` 可退回 1，MacCMS 兼容接口恒 1）；`/api/v1/search` 与 `/api/v1/videos` 新增 `?tag=` 标签精确检索（倒排表 `video_tags`，索引就绪才声明能力）；列表新增 `remarks` / `vod_area` / `vod_year`，详情新增 `play_lines` / `tag` 同值别名，剧集新增 `from`/`type`/`playable`；`total_approximate` 恒出现；`page_size` 缺省改 18；新增 `GET /api/v1/tag/status`、`POST /api/v1/maintenance/tag-index`、`GET\|POST /api/v1/auth/tokens`、`DELETE /api/v1/auth/tokens/{id}`（read/admin 两档权限，默认宽权限放行）。详见 `MIGRATION_NOTES.md` |
+| v1.14.1（当前） | **修复**：`/api/v1/tag/status` 的 `progress` 由 `cursor/total` 改为 `processed/total`（两者同量纲），修复上游 `vod_id` 稀疏导致进度显示 147%、172% 的 bug；新增 `processed` 字段；管理面板列名改为「已处理 / 总条数」，`cursor` 降为 tooltip。**纯展示层修复，接口字段只增不改，客户端无感** |
+| v1.14.0 | **后端契约升级（B-01/B-02/B-03/B-04/B-05/B-06/B-08/B-09/B-10/B-11）**：`/healthz` 新增 `capabilities` 能力清单（`tag_search` / `error_codes` / `token_scope` …，DB 降级时自动收缩）；错误码统一为「非 2xx + `{code, error, detail, message}`」（`40001`/`40101`/`40301`/`40401`，参数校验由 422 改 400 并带 `field`）；**成功码默认 0**（`API_SUCCESS_CODE` 可退回 1，MacCMS 兼容接口恒 1）；`/api/v1/search` 与 `/api/v1/videos` 新增 `?tag=` 标签精确检索（倒排表 `video_tags`，索引就绪才声明能力）；列表新增 `remarks` / `vod_area` / `vod_year`，详情新增 `play_lines` / `tag` 同值别名，剧集新增 `from`/`type`/`playable`；`total_approximate` 恒出现；`page_size` 缺省改 18；新增 `GET /api/v1/tag/status`、`POST /api/v1/maintenance/tag-index`、`GET\|POST /api/v1/auth/tokens`、`DELETE /api/v1/auth/tokens/{id}`（read/admin 两档权限，默认宽权限放行）。详见 `MIGRATION_NOTES.md` |
 | v1.13.0 | **面板布局调整 + 管理能力补齐（无接口变更）**：「明星词库」从设置弹层移到主面板独立区块；`main` 去掉 1280px 限宽改为全屏自适应；面板新增此前只有 API 的 5 个维护能力入口 —— 明星 Tag 覆盖统计（`/star/tags/status`）、高频词建议（`/star/tags/untracked`，支持一键加入词库）、重建明星 Tag（`/maintenance/star-tags`）、推荐覆盖率（`/related/status`）、按源站重算推荐（`/maintenance/related-recompute`），以及源站行的「回填线路」（`/sync/{slug}?mode=backfill_play_from`） |
 | v1.12.2 | **修复数据表浏览「查询没有数据」**：面板把 `/rows` 返回的列名（字符串数组）当对象取 `.name`，导致表头空白、每格渲染成 `-`；改由 `tbCols()` 归一化后再渲染。接口无变化，纯前端修复 |
 | v1.12.1 | **数据表浏览显示源站名称**：清单接口每项新增 `label`（`vod_*` 取 `sources.name`，如「新极品资源站」）；`name` 仍为表名，请求路径不变。孤儿表标「无对应源站」、同名源站追加表名去歧义。纯展示层变更，无接口破坏 |

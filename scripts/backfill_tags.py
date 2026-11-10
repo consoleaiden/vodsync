@@ -53,10 +53,13 @@ def main() -> int:
     if args.status:
         st = tags.status()
         print(f"就绪: {st['ready']}   总行数: {st['rows']}   正在回填: {st['building'] or '-'}")
-        print(f"{'源站':<20}{'状态':<10}{'游标':>12}{'总数':>12}{'已写行':>12}  进度")
+        # 进度按「已处理条数 / 总条数」算（v1.14.1）；cursor 是 vod_id 水位，
+        # 上游 ID 稀疏，拿它当分子会算出 147% 这种不存在的进度，只作断点参考列。
+        print(f"{'源站':<20}{'状态':<10}{'已处理':>10}{'总数':>10}{'已写行':>12}{'游标':>12}  进度")
         for s in st["sources"]:
-            print(f"{s['slug']:<20}{s['status']:<10}{s['cursor']:>12}{s['total']:>12}"
-                  f"{s['indexed']:>12}  {s['progress']}%{('  ' + s['error']) if s['error'] else ''}")
+            print(f"{s['slug']:<20}{s['status']:<10}{s['processed']:>10}{s['total']:>10}"
+                  f"{s['indexed']:>12}{s['cursor']:>12}  {s['progress']}%"
+                  f"{('  ' + s['error']) if s['error'] else ''}")
         return 0
 
     started = time.time()

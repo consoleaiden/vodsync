@@ -211,7 +211,12 @@ tag_index_state = Table(
     "tag_index_state",
     META,
     Column("slug", String(64), primary_key=True),
-    Column("cursor", Integer, default=0),                 # 已处理的 vod_id 水位
+    # cursor 是**上游 vod_id 水位**，供断点续跑用（WHERE vod_id > cursor）。
+    # 注意：它绝对不能拿来算进度 —— 上游 vod_id 稀疏且可能从几万开始
+    # （实测 109567 号只对应 7.4 万条数据），cursor/total 会算出 147%。
+    Column("cursor", Integer, default=0),
+    # processed 是**已处理条数**，与 total 同量纲，进度只能用这个算（v1.14.1 修）
+    Column("processed", Integer, default=0, server_default="0"),
     Column("indexed", Integer, default=0),                # 已写入的 (视频,标签) 行数
     Column("total", Integer, default=0),                  # 该源站总行数（进度分母）
     Column("status", String(16), default="pending"),      # pending/running/done/failed

@@ -283,7 +283,9 @@
       <button class="sm" id="btnUntracked" title="抽样缺演员标题，统计未入词库的高频词（扩词库候选）">高频词建议</button>
       <button class="sm warn" id="btnStarTagsRebuild" title="对全部启用源站回填明星 Tag + 重建 star_map（后台执行，全量幂等）">重建明星 Tag</button>
       <button class="sm" id="btnStarReload" title="重新读取词库（其他设备改过词库时用）">↻ 刷新词库</button>
+      <button class="sm" id="starsToggle" title="折叠 / 展开本区块（首次展开才加载数据）">展开 ▾</button>
     </div>
+    <div id="starsWrap" style="display:none">
     <div class="body pad">
       <div class="muted" style="font-size:12px;line-height:1.75;margin-bottom:8px">
         词库中的主演名会用来扫描<b>缺失演员信息</b>视频的标题与简介：标题命中且字段稀少 → 强信号（不打折）；
@@ -298,13 +300,14 @@
         <span class="muted" id="starHint" style="font-size:12px"></span>
       </div>
     </div>
-    <div class="body" id="starList"><div class="empty">加载中…</div></div>
+    <div class="body" id="starList"><div class="empty">展开时加载词库…</div></div>
     <div class="body pad" id="starStats" style="display:none">
       <div class="row" style="margin-bottom:8px">
         <span class="muted" id="starStatsHint" style="font-size:12px;flex:1"></span>
         <button class="sm" id="btnStarStatsClose">收起</button>
       </div>
       <div style="border:1px solid var(--line);border-radius:8px;overflow:auto" id="starStatsBody"></div>
+    </div>
     </div>
   </section>
 
@@ -315,7 +318,9 @@
       <span class="hint">只读查看数据库内容 · 表行数为缓存值（点「条数校准」后更新）· 全字段搜索在大表上较慢</span>
       <span style="flex:1"></span>
       <button class="sm" id="tbReloadTables" title="重新读取表清单（新添加源站后用）">↻ 表清单</button>
+      <button class="sm" id="tablesToggle" title="折叠 / 展开本区块（首次展开才加载数据）">展开 ▾</button>
     </div>
+    <div id="tablesWrap" style="display:none">
     <div class="body pad">
       <form class="row" id="tbForm">
         <select class="tbSel" id="tbTable" title="选择数据表"><option value="">加载中…</option></select>
@@ -333,7 +338,7 @@
         </label>
       </form>
     </div>
-    <div class="body" id="tbBody"><div class="empty">选择一张表开始浏览</div></div>
+    <div class="body" id="tbBody"><div class="empty">展开时加载表清单…</div></div>
     <div class="body pad tb-pager" id="tbPager" style="display:none">
       <button class="sm" id="tbFirst">首页</button>
       <button class="sm" id="tbPrev">上一页</button>
@@ -345,6 +350,7 @@
       <input type="number" id="tbJump" min="1" value="1">
       <button class="sm" id="tbGo">跳转</button>
     </div>
+    </div>
   </section>
 
   <!-- 标签索引（v1.14.0）：详情页标签胶囊精确检索依赖它 -->
@@ -355,7 +361,7 @@
       <span style="flex:1"></span>
       <span class="badge" id="tagReady">-</span>
       <span class="muted" id="tagRows" style="font-size:12px"></span>
-      <button class="sm" id="btnTagStatus" title="查看各源站回填进度（游标 / 总数 / 已写行数）">索引状态</button>
+      <button class="sm" id="btnTagStatus" title="查看各源站回填进度（已处理条数 / 总条数 / 已写行数）">索引状态</button>
       <button class="sm warn" id="btnTagRebuild" title="对全部启用源站回填标签倒排（后台串行，可断点续跑）">重建索引</button>
     </div>
     <div class="body pad">
@@ -384,8 +390,11 @@
       <button class="sm warn" id="btnAutoAllOff" title="所有源站退出定时自动同步（手动同步不受影响）">全部暂停自动同步</button>
       <button class="sm" id="btnAutoSelOn" disabled title="仅对勾选的源站开启自动同步">开启所选</button>
       <button class="sm warn" id="btnAutoSelOff" disabled title="仅对勾选的源站暂停自动同步">暂停所选</button>
+      <button class="sm" id="sourcesToggle" title="折叠 / 展开本区块（折叠时不参与 5 秒轮询，降低后端压力）">展开 ▾</button>
     </div>
-    <div class="body" id="sourcesBody"><div class="empty">加载中…</div></div>
+    <div id="sourcesWrap" style="display:none">
+    <div class="body" id="sourcesBody"><div class="empty">展开时加载源站列表…</div></div>
+    </div>
   </section>
 
   <!-- 同步日志 -->
@@ -393,8 +402,12 @@
     <div class="head">
       <h2>最近同步日志</h2>
       <span class="hint">最多显示 20 条</span>
+      <span style="flex:1"></span>
+      <button class="sm" id="logsToggle" title="折叠 / 展开本区块（折叠时不参与 5 秒轮询，降低后端压力）">展开 ▾</button>
     </div>
-    <div class="body" id="logsBody"><div class="empty">加载中…</div></div>
+    <div id="logsWrap" style="display:none">
+    <div class="body" id="logsBody"><div class="empty">展开时加载同步日志…</div></div>
+    </div>
   </section>
 </main>
 
@@ -1601,8 +1614,13 @@ $("#btnStarReload").addEventListener("click", () => loadStarTerms());
 // ---------------- 标签索引（v1.14.0 / B-01） ----------------
 // 只读状态 + 手动重建。刻意不参与 5 秒轮询：回填是长任务，靠「索引状态」
 // 按钮按需刷新即可，否则每 5 秒查一次进度纯属浪费。
+// 进度只认后端给的 processed/total（都是「条数」）。这里再夹一次 0–100：
+// v1.14.1 之前后端拿 vod_id 水位当分子算过 147%，前端不该把这种值显示出去。
+function tagPct(p) {
+  return Math.max(0, Math.min(100, Number(p) || 0));
+}
 function tagProgressBar(p) {
-  const n = Math.max(0, Math.min(100, Number(p) || 0));
+  const n = tagPct(p);
   return `<div style="height:6px;border-radius:3px;background:var(--line);overflow:hidden">
     <div style="height:100%;width:${n}%;background:var(--accent,#2f6fed)"></div></div>`;
 }
@@ -1619,8 +1637,8 @@ async function loadTagStatus(showTable) {
       <tr>
         <td>${esc(s.slug)}</td>
         <td>${esc(s.status)}</td>
-        <td style="min-width:120px">${tagProgressBar(s.progress)}<span class="muted" style="font-size:11px">${s.progress}%</span></td>
-        <td>${fmtNum(s.cursor)} / ${fmtNum(s.total)}</td>
+        <td style="min-width:120px">${tagProgressBar(s.progress)}<span class="muted" style="font-size:11px">${tagPct(s.progress)}%</span></td>
+        <td title="断点游标 vod_id=${fmtNum(s.cursor)}（下次从这里继续；上游 ID 稀疏，不等于条数）">${fmtNum(s.processed)} / ${fmtNum(s.total)}</td>
         <td>${fmtNum(s.indexed)}</td>
         <td class="muted" style="font-size:11px">${esc(s.error || "")}</td>
       </tr>`).join("");
@@ -1628,7 +1646,7 @@ async function loadTagStatus(showTable) {
       ? `索引已就绪：/healthz 已声明 tag_search（共 ${fmtNum(r.rows)} 行）`
       : `索引未就绪：客户端继续用名称模糊检索（已建 ${fmtNum(r.rows)} 行，可点「重建索引」）`;
     $("#tagStatusBody").innerHTML = `<table>
-      <thead><tr><th>源站</th><th>状态</th><th>进度</th><th>游标 / 总条数</th><th>已写行</th><th>备注</th></tr></thead>
+      <thead><tr><th>源站</th><th>状态</th><th>进度</th><th>已处理 / 总条数</th><th>已写行</th><th>备注</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="6" class="empty">暂无回填记录（点「重建索引」开始）</td></tr>`}</tbody>
     </table>`;
     $("#tagStatusBox").style.display = "";
@@ -1661,9 +1679,63 @@ $("#btnLogout").addEventListener("click", async () => {
 });
 
 // ---------------- 刷新循环 ----------------
+// 可折叠区块（v1.14.1）：默认收起、首次展开才加载数据，缩短管理面板首屏时间。
+// - tables / stars：加载一次，不进轮询（编辑/翻页状态不能被覆盖，与之前行为一致）
+// - sources / logs：展开期间跟随 5 秒轮询；收起时不请求（这就是省流的关键）
+// - 展开状态记在 localStorage，下次进来保持习惯；收起的区块仍然零请求
+const SEC_KEY = "vodsync.secOpen";
+let secOpen = {};
+try { secOpen = JSON.parse(localStorage.getItem(SEC_KEY) || "{}") || {}; } catch (e) { secOpen = {}; }
+
+const SEC_DEFS = {
+  tables:  { btn: "#tablesToggle",  wrap: "#tablesWrap",  load: () => tbLoadTables() },
+  stars:   { btn: "#starsToggle",   wrap: "#starsWrap",   load: () => loadStarTerms() },
+  sources: { btn: "#sourcesToggle", wrap: "#sourcesWrap", load: () => loadSources() },
+  logs:    { btn: "#logsToggle",    wrap: "#logsWrap",    load: () => loadLogs() },
+};
+
+function secPaint(key) {
+  const def = SEC_DEFS[key];
+  if (!def) return;
+  const btn = $(def.btn), wrap = $(def.wrap);
+  if (!btn || !wrap) return;
+  const open = !!secOpen[key];
+  wrap.style.display = open ? "" : "none";
+  btn.textContent = open ? "收起 ▴" : "展开 ▾";
+}
+
+function secSet(key, open) {
+  secOpen[key] = !!open;
+  try { localStorage.setItem(SEC_KEY, JSON.stringify(secOpen)); } catch (e) { /* 隐私模式忽略 */ }
+  secPaint(key);
+  const def = SEC_DEFS[key];
+  if (open && def && def.load && !def._loaded) {
+    def._loaded = true;
+    Promise.resolve(def.load()).catch(() => { def._loaded = false; });  // 失败允许再次展开重试
+  }
+}
+
+Object.keys(SEC_DEFS).forEach((key) => {
+  const btn = $(SEC_DEFS[key].btn);
+  if (!btn) return;
+  btn.addEventListener("click", () => secSet(key, !secOpen[key]));
+  secPaint(key);   // 恢复上次的展开状态（数据由 boot 里的 secLoadOpen 在鉴权确认后补载）
+});
+
+function secLoadOpen() {
+  Object.keys(SEC_DEFS).forEach((key) => {
+    if (secOpen[key] && !SEC_DEFS[key]._loaded) secSet(key, true);
+  });
+}
+
 let timer = null;
 async function refreshAll() {
-  await Promise.allSettled([loadStats(), loadSources(), loadLogs(), loadPause()]);
+  // 概览与暂停开关是全页面共用的轻接口，恒刷新；
+  // 源站/日志两个重组件只在「展开期间」跟随轮询，收起时完全不请求。
+  const jobs = [loadStats(), loadPause()];
+  if (secOpen.sources) jobs.push(loadSources());
+  if (secOpen.logs) jobs.push(loadLogs());
+  await Promise.allSettled(jobs);
 }
 function schedule() {
   if (timer) clearInterval(timer);
@@ -1680,9 +1752,8 @@ async function boot() {
     return;
   }
   await refreshAll();
-  tbLoadTables();   // 数据表浏览：只加载一次，不进 5 秒轮询（翻页状态不能被覆盖）
-  loadStarTerms();  // 明星词库：同样只加载一次（编辑中不能被轮询刷掉）
   loadTagStatus();  // 标签索引：只取一次摘要（徽标/行数），详细进度按需展开
+  secLoadOpen();    // 上次展开的区块此时补载（鉴权已确认，不浪费未登录的请求）
   schedule();
 }
 boot();
