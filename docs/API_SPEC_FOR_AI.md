@@ -381,7 +381,7 @@ type PlayLine = {
 {
   "status": "ok",
   "db": true,
-  "version": "1.14.0",
+  "version": "1.14.1",
   "build": "<commit sha>",
   "capabilities": ["backfill_play_from", "play_line_filter", "error_codes",
                    "token_scope", "star_tags", "related", "paging_v2", "tag_search"],

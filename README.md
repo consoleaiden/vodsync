@@ -479,7 +479,7 @@ sudo docker compose up -d
 
 # 3) 核对真的回滚成功了（version/build 对不上说明 tag 或缓存不对）
 curl -s http://127.0.0.1:8181/healthz
-# {"status":"ok","db":true,"version":"1.14.0","build":"<完整 40 位 sha>",...}
+# {"status":"ok","db":true,"version":"1.14.1","build":"<完整 40 位 sha>",...}
 ```
 
 要点：
