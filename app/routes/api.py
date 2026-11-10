@@ -618,6 +618,37 @@ def healthz(detail: int = Query(0, ge=0, le=1,
         }
 
 
+@router.get("/healthz.capabilities", summary="能力清单独立端点（免鉴权，客户端能力门控用）")
+def healthz_capabilities():
+    """
+    `/healthz.capabilities` 作为**真实 URL**存在（v1.14.1 修）。
+
+    背景：v1.14.0 文档里 `/healthz.capabilities` 本意是「/healthz 响应中的
+    capabilities 字段」的字段路径写法，但客户端（和文档自己的行文）会把它当
+    独立 URL 调 —— 而这个路径不在路由表里，鉴权中间件对非 /api/ 路径又只认
+    会话 cookie，于是 App 拿着合法 Token 也吃 401。
+
+    修复：把端点做出来（与 /healthz 同级的免鉴权路径，已在 auth.PUBLIC_PATHS），
+    响应与 /healthz 的能力部分完全一致。已用 /healthz.capabilities 字段的老
+    客户端不受影响；两个入口读的是同一份 caps.snapshot()。
+    """
+    from .. import caps
+
+    try:
+        with database.engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception:  # noqa: BLE001
+        db_ok = False
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "db": db_ok,
+        "version": __version__,
+        "capabilities": caps.snapshot(db_ok=db_ok),
+        "time": datetime.now().isoformat(),
+    }
+
+
 def _is_synced(row) -> bool:
     """
     该源站是否"同步过"：有水位线 / 已入库 / 有断点，任一成立即视为同步过。
@@ -1564,6 +1595,8 @@ def video_list(
             "pagecount": tresult["pagecount"],
             "total": tresult["total"],
             "total_approximate": False,   # 标签结果集由索引精确计数
+            # v1.14.1：标签词是否存在于倒排表；false 时客户端应回退 wd 检索
+            "tag_found": tresult["tag_found"],
             "list": (
                 [_detail_item(r["source_slug"], r, play_raw=bool(play_raw),
                               play_meta=play_meta)
@@ -1762,6 +1795,9 @@ def aggregate_search(
             "total": result["total"],
             "total_approximate": False,
             "total_is_partial": bool(result["partial"]),
+            # v1.14.1：该标签词是否存在于标签倒排表。false = 精确段匹配下没有
+            # 任何源站用它做标签（但标题全文检索可能命中）→ 客户端应回退 wd
+            "tag_found": result["tag_found"],
             "sources_failed": result["failed"],
             "query_ms": result["elapsed_ms"],
             "elapsed_ms": result["elapsed_ms"],

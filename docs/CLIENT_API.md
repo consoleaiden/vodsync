@@ -340,7 +340,13 @@ GET /api/v1/search?tag=悬疑&source=ffzy&page=1&page_size=18
   `tag=悬疑` 命中 `"悬疑,犯罪"`，**不命中** `"悬疑喜剧"` / `"反悬疑"`。
 - `total` / `pagecount` 精确，`total_approximate` 恒为 `false`。
 - 空结果是 **200 + 空 list**（不是 404）。
-- **能力门控**：`/healthz.capabilities` 含 `tag_search` 才用；没有就退回 `wd=`（索引没建完会漏数据）。
+- **能力门控**：`GET /healthz.capabilities`（v1.14.1 起是真实免鉴权端点，也可读
+  `/healthz` 响应里的 `capabilities` 字段）含 `tag_search` 才用；没有就退回 `wd=`
+  （索引没建完会漏数据）。
+- **`tag_found`（v1.14.1）**：tag 检索是标签词精确匹配，与 `wd` 标题全文检索命中集
+  天然不同 —— 片名里的词可能没人把它写成标签。响应带 `tag_found`：
+  `false` = 这个词不在任何源站的标签表里（`total` 必为 0），**客户端应回退 `wd=` 再试**，
+  不要把空结果直接展示给用户。
 
 **响应**：
 

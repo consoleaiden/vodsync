@@ -180,11 +180,19 @@ def rebuild_source(slug: str, force: bool = False) -> dict:
     """
     table = build_vod_table(slug)
     if not database.table_exists(table.name):
+        # 表还不存在：记 no_table 而不是 done。
+        # 曾写 done —— 若回填先于源站建表跑（新源站刚登记、表还没建出来），
+        # 该站会被永久标成「已完成」；之后表建出来、数据同步进来，一旦增量
+        # 维护失败（savepoint 吞掉，可稍后补回），state 仍是 done，
+        # ready() 恒 true → /healthz 声明 tag_search 但这个站实际搜不到。
+        # 改记 no_table：面板可见，且不满足就绪判定；表建出来后启动检查/
+        # 手动回填会真正处理它。
         with database.write_txn() as conn:
             _state_upsert(conn, slug, cursor=0, processed=0, indexed=0, total=0,
-                          status="done", error="", started_at=None,
-                          finished_at=datetime.now())
-        return {"slug": slug, "status": "done", "indexed": 0, "total": 0, "note": "no_table"}
+                          status="no_table", error="",
+                          started_at=None, finished_at=datetime.now())
+        return {"slug": slug, "status": "no_table", "indexed": 0, "total": 0,
+                "note": "no_table"}
 
     with database.write_txn() as conn:
         total = conn.execute(select(func.count()).select_from(table)).scalar() or 0
@@ -207,6 +215,18 @@ def rebuild_source(slug: str, force: bool = False) -> dict:
                     select(func.count()).select_from(table).where(table.c.vod_id <= cursor)
                 ).scalar() or 0
             started_at = (st["started_at"] if st and st["started_at"] else None)
+            # 存量自愈（v1.14.1）：v1.14.0 曾把「表还不存在」的源站直接标 done
+            # （no_table），这类行 total=0 / processed=0 / cursor=0。表建出来后
+            # 它们会被误判为「已完成」。续跑遇到「done 且一条都没处理过且表里有
+            # 数据」时，从头重扫一遍 —— 真正回填完成的站 processed>=total>0，
+            # 不会误伤。
+            force_redo = (
+                st is not None and st["status"] == "done"
+                and processed == 0 and cursor == 0 and int(total) > 0
+            )
+            if force_redo:
+                cursor, processed, indexed = 0, 0, 0
+                started_at = None
             _state_upsert(conn, slug, cursor=cursor, processed=int(processed),
                           indexed=indexed, total=int(total),
                           status="running", error="",
@@ -488,6 +508,11 @@ def search_page(slugs: list, tag: str, page: int = 1, page_size: int = 18,
     if total == 0:
         return {"total": 0, "pagecount": 0, "rows": [], "partial": bool(failed),
                 "failed": failed, "strategy": "tag",
+                # v1.14.1：明确告诉客户端「这个标签词不在任何源站的标签倒排表里」。
+                # tag 检索是 vod_tag 的**精确段匹配**，与 wd 的标题全文匹配命中集
+                # 天然不同 —— 某些词（如片名里的「夜店」）可能只出现在标题里。
+                # tag_found=false 时客户端应回退 wd 检索，别把空结果直接怼给用户。
+                "tag_found": False,
                 "elapsed_ms": int((time.time() - started) * 1000)}
 
     k = offset + page_size
@@ -520,6 +545,7 @@ def search_page(slugs: list, tag: str, page: int = 1, page_size: int = 18,
         "partial": bool(failed),
         "failed": failed,
         "strategy": strategy,
+        "tag_found": True,
         "elapsed_ms": int((time.time() - started) * 1000),
     }
 

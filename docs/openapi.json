@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.8.1"
+    "version": "1.14.1"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -170,7 +170,60 @@
       },
       "post": {
         "summary": "重置 API Token（旧 Token 立即失效）",
+        "description": "重置存量单 Token（v1.14.0 起可指定权限）。\n\n`scope` 既是查询参数也接受 body `{\"scope\": \"read\"}` —— 面板用前者，\nApp 控制台习惯用后者，两个都收不会造成歧义（body 优先）。\n注意：**重置会立刻让旧 Token 失效**，正在用旧 Token 的客户端会 401。\n想「新增一枚只读 Token 而不动现有的」，用 POST /api/v1/auth/tokens。",
         "operationId": "auth_rotate_token_api_v1_auth_token_post",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "read / admin；留空=admin（与 v1.13 行为一致）",
+              "default": "",
+              "title": "Scope"
+            },
+            "description": "read / admin；留空=admin（与 v1.13 行为一致）"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/tokens": {
+      "get": {
+        "summary": "已签发 Token 清单（不返回明文）",
+        "description": "列出所有可用 Token 的权限与签发时间。\n\n第 0 项是存量单 Token（id=0，kind=legacy），其余是 v1.14.0 起的具名 Token。\n任何一项都**不含明文**：清单接口不是凭据回显口。",
+        "operationId": "auth_list_tokens_api_v1_auth_tokens_get",
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -181,12 +234,85 @@
             }
           }
         }
+      },
+      "post": {
+        "summary": "新增具名 Token（可指定权限）",
+        "description": "新增一枚 Token，返回**一次性明文**。\n\n与「重置」的区别：不影响现有 Token，适合给 App 发一枚 read Token，\n同时把 admin Token 留给同步控制台（B-08 的目标模型）。",
+        "operationId": "auth_create_token_api_v1_auth_tokens_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/tokens/{token_id}": {
+      "delete": {
+        "summary": "吊销具名 Token",
+        "operationId": "auth_revoke_token_api_v1_auth_tokens__token_id__delete",
+        "parameters": [
+          {
+            "name": "token_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Token Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/categories": {
       "get": {
         "summary": "Categories",
-        "description": "分类清单（type_id / type_name 去重 + 各分类条数）。\n\n用法：\n  /api/v1/categories?source=jkun          单源站分类\n  /api/v1/categories?source=jkun,t1       多源合并（同名分类会合并计数）\n  /api/v1/categories                      全部源站合并\n拿到 type_id 后即可用 GET /api/v1/videos?source=..&type_id=.. 按分类翻页。",
+        "description": "分类清单（type_id / type_name 去重 + 各分类条数）。\n\n用法：\n  /api/v1/categories?source=jkun          单源站分类\n  /api/v1/categories?source=jkun,t1       多源合并（同名分类会合并计数）\n  /api/v1/categories                      全部源站合并\n拿到 type_id 后即可用 GET /api/v1/videos?source=..&type_id=.. 按分类翻页。\n\nv1.10.0（纯新增）：响应带 `cached`（true = 命中本地缓存，分类几乎不变，\n默认缓存 CATEGORIES_CACHE_SECONDS=300 秒）。客户端无需处理，仅供排查。",
         "operationId": "categories_api_v1_categories_get",
         "parameters": [
           {
@@ -227,8 +353,51 @@
     "/healthz": {
       "get": {
         "summary": "Healthz",
-        "description": "健康检查 / 存活探针。\n\n关键点：数据库繁忙时**不返回 5xx**。容器健康检查只看 HTTP 状态码，\n若这里因为连接池排队而报 500/超时，Docker 会把一个其实还在正常干活的容器判定为不健康\n并反复重启（v1.4.0 在 NAS 上就表现为\"容器崩溃\"）。因此这里始终 200，\n用 db 字段表达数据库是否可用。",
+        "description": "健康检查 / 存活探针 / **能力清单**（v1.14.0 / B-10）。\n\n关键点（三条都不能破）：\n1. 数据库繁忙时**不返回 5xx**。容器健康检查只看 HTTP 状态码，若这里因为\n   连接池排队而 500/超时，Docker 会把一个其实还在正常干活的容器判定为不健康\n   并反复重启（v1.4.0 在 NAS 上就表现为\"容器崩溃\"）。所以恒 200，\n   用 status=degraded + db=false 表达数据库不可用。\n2. 免鉴权（在 auth.PUBLIC_PATHS 里）：客户端连接测试用它测延迟，\n   不能因为没 Token 就打不进来。\n3. `capabilities` 只声明**真正可用**的能力，且数据库不可用时收缩。\n   客户端据此决定「能不能用 ?tag= / mode=backfill_play_from」，\n   声明了但没实现等于骗客户端切过去。\n\n返回：status / db / version / build / capabilities / time\n  version 取自 app/__init__.py（与镜像 tag 同源），能力变更时升 minor。",
         "operationId": "healthz_healthz_get",
+        "parameters": [
+          {
+            "name": "detail",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1,
+              "minimum": 0,
+              "description": "v1.14.0：1=capabilities 以对象形态返回（运维排障用）",
+              "default": 0,
+              "title": "Detail"
+            },
+            "description": "v1.14.0：1=capabilities 以对象形态返回（运维排障用）"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/healthz.capabilities": {
+      "get": {
+        "summary": "能力清单独立端点（免鉴权，客户端能力门控用）",
+        "description": "`/healthz.capabilities` 作为**真实 URL**存在（v1.14.1 修）。\n\n背景：v1.14.0 文档里 `/healthz.capabilities` 本意是「/healthz 响应中的\ncapabilities 字段」的字段路径写法，但客户端（和文档自己的行文）会把它当\n独立 URL 调 —— 而这个路径不在路由表里，鉴权中间件对非 /api/ 路径又只认\n会话 cookie，于是 App 拿着合法 Token 也吃 401。\n\n修复：把端点做出来（与 /healthz 同级的免鉴权路径，已在 auth.PUBLIC_PATHS），\n响应与 /healthz 的能力部分完全一致。已用 /healthz.capabilities 字段的老\n客户端不受影响；两个入口读的是同一份 caps.snapshot()。",
+        "operationId": "healthz_capabilities_healthz_capabilities_get",
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -442,6 +611,55 @@
               "title": "Enabled"
             },
             "description": "true=开启自动同步, false=暂停自动同步"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sources/{slug}/play-line-policy": {
+      "post": {
+        "summary": "Set Play Line Policy",
+        "description": "设置单个源站的播放线路策略（v1.11.0，持久化，立即生效）。\n\n为什么按源站配：只有「第 1 条线路恒为 /share/ 分享页」这类站点需要过滤\n（如非凡资源站，100% 记录如此），一刀切的全局策略会误伤本来正常的站。\n默认 `inherit` 跟随 `PLAY_LINE_POLICY`，其余站点不必动。\n\n只影响读接口的 `vod_play_list`，不重写 `vod_play_url`，也不需要重新同步。",
+        "operationId": "set_play_line_policy_api_v1_sources__slug__play_line_policy_post",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Slug"
+            }
+          },
+          {
+            "name": "policy",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "inherit=跟随全局 / off=不过滤 / filter=剔除分享页线路 / whitelist=只保留媒体直链",
+              "title": "Policy"
+            },
+            "description": "inherit=跟随全局 / off=不过滤 / filter=剔除分享页线路 / whitelist=只保留媒体直链"
           }
         ],
         "responses": {
@@ -768,7 +986,7 @@
     "/api/v1/sync/{slug}": {
       "post": {
         "summary": "Trigger Sync",
-        "description": "手动触发单源站同步（后台执行，立即返回受理结果）。\n\n并发受全局闸门（SOURCE_SYNC_CONCURRENCY）限制：名额已满时任务进入排队，\n同一源站已在排队/运行时不会重复提交（返回 status=already_running）。",
+        "description": "手动触发单源站同步（后台执行，立即返回受理结果）。\n\n并发受全局闸门（SOURCE_SYNC_CONCURRENCY）限制：名额已满时任务进入排队，\n同一源站已在排队/运行时不会重复提交（返回 status=already_running）。\n\n`mode=backfill_play_from`（v1.11.0）：只翻 ac=detail 把上游 `vod_play_from`\n回填进库（只写这一列），不动其它字段、不推进水位线、不动断点，可中断可重跑。\n存量库刚升级时用它补齐 provider 信息；不回填也能正常工作（只按 URL 形态判断）。",
         "operationId": "trigger_sync_api_v1_sync__slug__post",
         "parameters": [
           {
@@ -786,10 +1004,12 @@
             "required": false,
             "schema": {
               "type": "string",
-              "pattern": "^(auto|full|incremental)$",
+              "pattern": "^(auto|full|incremental|backfill|backfill_play_from)$",
+              "description": "auto / full / incremental / backfill_play_from（只回填播放线路来源）",
               "default": "auto",
               "title": "Mode"
-            }
+            },
+            "description": "auto / full / incremental / backfill_play_from（只回填播放线路来源）"
           }
         ],
         "responses": {
@@ -817,7 +1037,7 @@
     "/api/v1/sync-all": {
       "post": {
         "summary": "Trigger Sync All",
-        "description": "手动触发全部源站同步（后台执行）。",
+        "description": "手动触发全部源站同步（后台执行）。\n\nv1.14.0 / B-07：新增 `mode=backfill_play_from` —— 对**全部启用源站**并行\n回填上游 `vod_play_from`（只写 play_from 一列，不动其它字段、不推进水位线、\n不动断点，可中断可重跑）。客户端控制台已预留该入口。\n与 `/api/v1/sync/{slug}?mode=backfill_play_from` 语义完全一致，只是范围不同。",
         "operationId": "trigger_sync_all_api_v1_sync_all_post",
         "parameters": [
           {
@@ -826,10 +1046,12 @@
             "required": false,
             "schema": {
               "type": "string",
-              "pattern": "^(auto|full|incremental)$",
+              "pattern": "^(auto|full|incremental|backfill|backfill_play_from)$",
+              "description": "auto / full / incremental / backfill_play_from",
               "default": "auto",
               "title": "Mode"
-            }
+            },
+            "description": "auto / full / incremental / backfill_play_from"
           }
         ],
         "responses": {
@@ -1020,10 +1242,118 @@
         }
       }
     },
+    "/api/v1/admin/tables": {
+      "get": {
+        "summary": "Admin List Tables",
+        "description": "可浏览的表清单（含列元信息与行数）。settings 表有意不在列表里 ——\n它存密码哈希 / 会话密钥，只读浏览不该把它们端出来。",
+        "operationId": "admin_list_tables_api_v1_admin_tables_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/tables/{name}/rows": {
+      "get": {
+        "summary": "Admin Browse Table",
+        "description": "分页浏览一张表的数据。表不存在 404；字段不存在 400。",
+        "operationId": "admin_browse_table_api_v1_admin_tables__name__rows_get",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "页码，超出范围自动夹回边界",
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "页码，超出范围自动夹回边界"
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "description": "每页条数，最大 100",
+              "default": 20,
+              "title": "Page Size"
+            },
+            "description": "每页条数，最大 100"
+          },
+          {
+            "name": "field",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "按该字段搜索；留空=全表搜索（所有列 OR）",
+              "default": "",
+              "title": "Field"
+            },
+            "description": "按该字段搜索；留空=全表搜索（所有列 OR）"
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "关键词（部分匹配，大小写不敏感）；留空=不过滤",
+              "default": "",
+              "title": "Q"
+            },
+            "description": "关键词（部分匹配，大小写不敏感）；留空=不过滤"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/videos": {
       "get": {
         "summary": "Video List",
-        "description": "视频列表 / 批量详情。\n\n四种用法：\n  1. 列表：      /api/v1/videos?source=jkun&page=1&page_size=20\n  2. 批量详情：  /api/v1/videos?source=jkun&ids=134369       （含 vod_play_url）\n  3. 完整列表：  /api/v1/videos?source=jkun&ac=detail         （列表带播放地址）\n  4. 分类浏览：  /api/v1/videos?source=jkun&type_id=6         （配合 /api/v1/categories）",
+        "description": "视频列表 / 批量详情。\n\n四种用法：\n  1. 列表：      /api/v1/videos?source=jkun&page=1&page_size=20\n  2. 批量详情：  /api/v1/videos?source=jkun&ids=134369       （含 vod_play_url）\n  3. 完整列表：  /api/v1/videos?source=jkun&ac=detail         （列表带播放地址）\n  4. 分类浏览：  /api/v1/videos?source=jkun&type_id=6         （配合 /api/v1/categories）\n\nv1.11.0（播放线路）：默认按 `PLAY_LINE_POLICY`（源站可覆盖）过滤掉\n`/share/`、`/play/`、`.html` 这类「H5 分享页」线路 —— 它们返回 text/html，\n真实流地址由页面 JS 生成且带会过期的 sign，客户端直接播必然失败。\n`vod_play_url` 原始串不变；过滤只作用于结构化的 `vod_play_list`\n（每条线路新增 `from` / `type` / `playable` / `original_index`）。\n默认响应若真的过滤掉了线路，顶层带 `play_line_filtered: true`；\n`play_raw=1` 可拿到未过滤的原始列表（排障用，同时关闭排序）。\n\nv1.10.1（纯新增）：详情模式（`ids=` 批量 / `ac=detail` 列表）额外返回\n`vod_actor` / `vod_director` / `vod_area` / `vod_year` / `vod_tag` 五个字段，\n恒为字符串（库里 NULL 也返回 \"\"），普通列表模式不带（控制体积）。\n\nv1.10.0（纯新增）：不带筛选条件的全站列表（无 wd / type_id / type_name / ids）\n的 `total` 改为估值，并在响应里带 `total_approximate: true`。\n出处是 sources.total_videos（后台同步一直维护），省掉 52 张表各跑一次 count(*)。\n`pagecount` 随之由估值算出，翻到末页可能有 1~2 页偏差；带筛选时仍是精确值。\n客户端若做「共 N 条 / 最后一页」的强展示，请判断该字段后自行降级为「约 N 条」。",
         "operationId": "video_list_api_v1_videos_get",
         "parameters": [
           {
@@ -1076,6 +1406,19 @@
             "description": "按名称模糊搜索"
           },
           {
+            "name": "tag",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "v1.14.0：按标签精确检索（与 wd 二选一，同时传以 tag 为准）",
+              "default": "",
+              "title": "Tag"
+            },
+            "description": "v1.14.0：按标签精确检索（与 wd 二选一，同时传以 tag 为准）"
+          },
+          {
             "name": "ac",
             "in": "query",
             "required": false,
@@ -1100,6 +1443,20 @@
             "description": "按 ID 批量取详情（逗号分隔），返回含播放地址"
           },
           {
+            "name": "play_raw",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1,
+              "minimum": 0,
+              "description": "v1.11.0：1=不做线路过滤/排序，返回原始 vod_play_list（排障用）",
+              "default": 0,
+              "title": "Play Raw"
+            },
+            "description": "v1.11.0：1=不做线路过滤/排序，返回原始 vod_play_list（排障用）"
+          },
+          {
             "name": "page",
             "in": "query",
             "required": false,
@@ -1121,7 +1478,7 @@
               "maximum": 100,
               "minimum": 1,
               "description": "每页条数",
-              "default": 30,
+              "default": 18,
               "title": "Page Size"
             },
             "description": "每页条数"
@@ -1152,7 +1509,7 @@
     "/api/v1/videos/{slug}/{vod_id}": {
       "get": {
         "summary": "Video Detail",
-        "description": "视频详情（含结构化播放地址列表）。",
+        "description": "视频详情（含结构化播放地址列表）。RELATED_IN_DETAIL=true 时附带 related 推荐数组。\n\nv1.11.0（播放线路）：`vod_play_list` 默认已过滤掉 `/share/`、`/play/`、`.html`\n这类「H5 分享页」线路（返回 text/html，真实流地址由 JS 生成且带过期 sign）。\n每条线路带 `from`（上游 provider）/`type`/`playable`/`original_index`；\n`vod_play_url` 原始串不变。真的过滤掉线路时响应顶层带 `play_line_filtered: true`。\n\nv1.10.1（纯新增）：返回 `vod_actor` / `vod_director` / `vod_area` / `vod_year` /\n`vod_tag` 五个字段 —— 列 v1.9.0 起就在库里，之前没透出，NAS 模式的客户端拿不到\n演员与明星标签。字段恒为字符串（缺失/NULL 为 \"\"），客户端不必判 null。",
         "operationId": "video_detail_api_v1_videos__slug___vod_id__get",
         "parameters": [
           {
@@ -1172,6 +1529,20 @@
               "type": "integer",
               "title": "Vod Id"
             }
+          },
+          {
+            "name": "play_raw",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1,
+              "minimum": 0,
+              "description": "v1.11.0：1=不做线路过滤/排序，返回原始 vod_play_list（排障用）",
+              "default": 0,
+              "title": "Play Raw"
+            },
+            "description": "v1.11.0：1=不做线路过滤/排序，返回原始 vod_play_list（排障用）"
           }
         ],
         "responses": {
@@ -1199,21 +1570,34 @@
     "/api/v1/search": {
       "get": {
         "summary": "Aggregate Search",
-        "description": "跨源站聚合搜索。\n\n实现说明：\n- 由于名称模糊匹配无法走索引，采用「每源站各查一次 + 并行执行 + 内存归并」策略，\n  避免一次性 UNION 全部表导致单条 SQL 扫描上千万行而超时；\n- 单个源站查询失败/超时不影响整体结果（返回 partial 标记与失败源站列表）；\n- 结果按 vod_time 倒序（新更新在前），可按 source 限定范围提升速度。",
+        "description": "聚合搜索：按名称模糊（`wd`）**或**按标签精确（`tag`）。\n\n`wd` 与 `tag` 同时传时**以 `tag` 为准**（B-01 约定，已写入 API_SPEC）：\n客户端只会传其一，后端取确定性行为，避免「两个条件 AND 后结果为空」的歧义。\n\n实现说明（wd 路径）：\n- 名称模糊匹配无法走索引，采用「每源站各查一次 + 并行执行 + 内存归并」，\n  避免一次性 UNION 全部表导致单条 SQL 扫上千万行而超时；\n- 单个源站查询失败/超时不影响整体结果（partial 标记 + 失败源站列表）；\n- 结果按 vod_time 倒序（新更新在前），可按 source 限定范围提升速度。\n\n实现说明（tag 路径，v1.14.0）：\n- 走 video_tags 倒排表 + (tag_norm, source) 索引，`total` 是**精确值**\n  （`total_approximate` 恒为 false），空结果返回 200 + list=[]，不是 404；\n- 只有 `/healthz.capabilities` 含 `tag_search` 时客户端才会走这条路，\n  索引没建完时后端仍能响应（只是结果不全），不会 500。",
         "operationId": "aggregate_search_api_v1_search_get",
         "parameters": [
           {
             "name": "wd",
             "in": "query",
-            "required": true,
+            "required": false,
             "schema": {
               "type": "string",
-              "minLength": 1,
               "maxLength": 64,
-              "description": "影视名称关键词（必填）",
+              "description": "影视名称关键词（与 tag 二选一）",
+              "default": "",
               "title": "Wd"
             },
-            "description": "影视名称关键词（必填）"
+            "description": "影视名称关键词（与 tag 二选一）"
+          },
+          {
+            "name": "tag",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "v1.14.0：标签精确检索（分词后逐段精确匹配，不是模糊搜）",
+              "default": "",
+              "title": "Tag"
+            },
+            "description": "v1.14.0：标签精确检索（分词后逐段精确匹配，不是模糊搜）"
           },
           {
             "name": "source",
@@ -1259,7 +1643,7 @@
               "maximum": 100,
               "minimum": 1,
               "description": "每页条数（默认取 API_PAGE_SIZE_DEFAULT，上限取 API_PAGE_SIZE_MAX）",
-              "default": 30,
+              "default": 18,
               "title": "Page Size"
             },
             "description": "每页条数（默认取 API_PAGE_SIZE_DEFAULT，上限取 API_PAGE_SIZE_MAX）"
@@ -1301,10 +1685,642 @@
         }
       }
     },
+    "/api/v1/related": {
+      "get": {
+        "summary": "Related Videos",
+        "description": "视频相关推荐（预计算结果直读，P95 < 50ms）。\n\n返回 {code, slug, vod_id, limit, fallback, computed_at, algo_version, list}：\n  - list 为对齐视频卡片结构的数组（含 source/source_name/score），\n    source 用于客户端跨站点击跳转\n  - fallback=true 表示**整条列表**都来自兜底链（同分类/同地区年代/最新收录），\n    客户端可按需弱化展示或改成「猜你想看」；列表永远非空（只要该视频本身存在）\n  - 视频不存在返回 404 标准错误结构\n\nv1.10.0 变更（对接需注意，均为纯新增或语义收紧）：\n  - 新增 `algo_version`：当前算法版本。与旧值不同的缓存建议直接丢弃。\n  - 卡片新增 `reason`：命中原因，逗号分隔，如 \"title,actor\" / \"director\"。\n    兜底条目为空串。可按它做「因为你也看过…」这类展示，也可忽略。\n  - 语义收紧：**仅同分类+同地区+同年代的配对不再进推荐位**（旧版会给这类\n    配对 0.667 的高分，属于 Bug 级误判）。同一部片不会出现在自己的推荐里。\n  - 零命中时的兜底条数从 12 条降到 6 条（RELATED_FALLBACK_LIMIT），\n    不与真命中混排；`fallback=true` 时 `score` 恒为 0、`mode` 为 \"fallback\"。",
+        "operationId": "related_videos_api_v1_related_get",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "源站 slug",
+              "title": "Slug"
+            },
+            "description": "源站 slug"
+          },
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "视频 vod_id",
+              "title": "Id"
+            },
+            "description": "视频 vod_id"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 20,
+              "minimum": 1,
+              "description": "推荐条数（1~20）",
+              "default": 12,
+              "title": "Limit"
+            },
+            "description": "推荐条数（1~20）"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/star-terms": {
+      "get": {
+        "summary": "Star Terms List",
+        "description": "词库清单（含停用条目，便于面板管理）。\n\nv1.10.0：`active` 改为返回**进程内当前生效的启用条数**（不再每次请求都\n重新编译词库正则）。刚写完词库时增删改接口会立即 reload，因此 `active`\n在一次写请求之后就是新值；多副本部署时其他实例最迟在下次重启/定时任务后一致。",
+        "operationId": "star_terms_list_api_v1_star_terms_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Star Terms Add",
+        "description": "批量添加词条。输入格式自动识别：\n  JSON 数组 / 带引号的 JSON 片段（\"名字\", 一行一个）/\n  逗号、全角逗号、顿号、竖线、换行分隔的纯文本 —— 一次粘贴大量名字即可。\n已存在的名字自动跳过（幂等）。返回 (added, skipped)。",
+        "operationId": "star_terms_add_api_v1_star_terms_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/star-terms/{term_id}": {
+      "patch": {
+        "summary": "Star Terms Update",
+        "description": "修改词条（名字/备注/别名/启停）。别名变更后需重算才生效。",
+        "operationId": "star_terms_update_api_v1_star_terms__term_id__patch",
+        "parameters": [
+          {
+            "name": "term_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Term Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Star Terms Delete",
+        "description": "删除词条。",
+        "operationId": "star_terms_delete_api_v1_star_terms__term_id__delete",
+        "parameters": [
+          {
+            "name": "term_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Term Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/star-terms/recompute": {
+      "post": {
+        "summary": "Star Terms Recompute",
+        "description": "词库变更后重算全部源站：① 明星 Tag 回填 + star_map 重建（v1.9.1）；\n② 相关推荐重算（推断演员信号变化影响打分）。后台串行执行。",
+        "operationId": "star_terms_recompute_api_v1_star_terms_recompute_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/star/related": {
+      "get": {
+        "summary": "Star Related Api",
+        "description": "返回与目标视频共享明星（词库 tag 交集）的其他视频。\n目标视频的明星 = star_map 里的映射（真实演员 ∩ 词库 + 标题命中推断）。\n\nv1.10.0：`truncated` 改成精确判定 —— 老实现用 `count(distinct vod_id)` 判\n「是否还有更多」，代价是多扫一遍；现在多取 1 条来判断，`truncated` 因此\n可以是 false（旧版在命中不足限制条数时也恒为 true，客户端「加载更多」按钮\n会一直亮着却点不出新内容）。",
+        "operationId": "star_related_api_api_v1_star_related_get",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "源站 slug",
+              "title": "Slug"
+            },
+            "description": "源站 slug"
+          },
+          {
+            "name": "vod_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "视频 ID（与 name 二选一，id 优先）",
+              "default": 0,
+              "title": "Vod Id"
+            },
+            "description": "视频 ID（与 name 二选一，id 优先）"
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 255,
+              "description": "视频名称（先精确后模糊）",
+              "default": "",
+              "title": "Name"
+            },
+            "description": "视频名称（先精确后模糊）"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 50,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/star/works": {
+      "get": {
+        "summary": "Star Works Api",
+        "description": "按明星查作品（v1.9.2，明星为中心）：直接取该明星的全部映射再按时间排序，\n不受「重叠明星数」影响 —— 客户端按明星切 Tab 时不会漏作品。\n\nterm 无映射 / 视频已下架 → 200 + total:0 + list:[]（不是 404）。",
+        "operationId": "star_works_api_api_v1_star_works_get",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "源站 slug",
+              "title": "Slug"
+            },
+            "description": "源站 slug"
+          },
+          {
+            "name": "term",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "description": "明星名（主名或别名）",
+              "title": "Term"
+            },
+            "description": "明星名（主名或别名）"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 30,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "exclude_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "排除的视频 ID（通常是当前详情页视频）",
+              "default": 0,
+              "title": "Exclude Id"
+            },
+            "description": "排除的视频 ID（通常是当前详情页视频）"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/star/tags/untracked": {
+      "get": {
+        "summary": "Star Tags Untracked",
+        "description": "未入词库的高频标题词 Top N（扩词库用，启发式候选）。\n抽样缺演员视频标题 → 屏蔽已命中词库片段 → 剩余文本 2~4 元 n-gram 频次统计。",
+        "operationId": "star_tags_untracked_api_v1_star_tags_untracked_get",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "源站 slug；留空=全部启用源站抽样",
+              "default": "",
+              "title": "Slug"
+            },
+            "description": "源站 slug；留空=全部启用源站抽样"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "sample",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200000,
+              "minimum": 0,
+              "description": "抽样标题数（0=用配置默认）",
+              "default": 0,
+              "title": "Sample"
+            },
+            "description": "抽样标题数（0=用配置默认）"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/maintenance/star-tags": {
+      "post": {
+        "summary": "Star Tags Rebuild",
+        "description": "手动触发明星 Tag 回填 + star_map 重建（后台串行执行，全量幂等）。",
+        "operationId": "star_tags_rebuild_api_v1_maintenance_star_tags_post",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "源站 slug；all=全部启用源站",
+              "default": "all",
+              "title": "Slug"
+            },
+            "description": "源站 slug；all=全部启用源站"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/star/tags/status": {
+      "get": {
+        "summary": "Star Tags Status",
+        "description": "各源站明星 Tag 覆盖情况：总视频数 / 缺演员视频数 / 已映射明星条数。",
+        "operationId": "star_tags_status_api_v1_star_tags_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/related/status": {
+      "get": {
+        "summary": "Related Status",
+        "description": "各源站相关推荐覆盖率（管理/验收核对：videos / computed / coverage%）。",
+        "operationId": "related_status_api_v1_related_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tag/status": {
+      "get": {
+        "summary": "Tag Index Status",
+        "description": "标签倒排索引状态：是否就绪（决定 /healthz 是否声明 tag_search）、\n各源站回填进度（cursor / total / indexed）、总行数。\n\n排查「标签检索没结果」时先看这里：`ready=false` 说明还没建完，\n客户端此时本来就该继续用 wd 全文检索。",
+        "operationId": "tag_index_status_api_v1_tag_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/maintenance/tag-index": {
+      "post": {
+        "summary": "Tag Index Rebuild",
+        "description": "手动触发标签倒排索引回填（后台，串行，可断点续跑）。\n\n日常不需要调：同步入库时会增量维护；升级后启动时也会自动补齐。\n用途：① 手工修复（怀疑索引与 vod_tag 不一致）；② 首次全量建完后\n想核对 `indexed` 行数；③ 改了 TAG_INDEX_* 参数后重跑。",
+        "operationId": "tag_index_rebuild_api_v1_maintenance_tag_index_post",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "源站 slug；留空=全部启用源站",
+              "default": "",
+              "title": "Slug"
+            },
+            "description": "源站 slug；留空=全部启用源站"
+          },
+          {
+            "name": "force",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "true=清空该源站标签行后从头重建",
+              "default": false,
+              "title": "Force"
+            },
+            "description": "true=清空该源站标签行后从头重建"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/maintenance/related-recompute": {
+      "post": {
+        "summary": "Related Recompute",
+        "description": "手动触发相关推荐重算（后台执行）。算法调参后先用它验证，再考虑改 RELATED_ALGO_VERSION。",
+        "operationId": "related_recompute_api_v1_maintenance_related_recompute_post",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "源站 slug；all=全部启用源站",
+              "default": "all",
+              "title": "Slug"
+            },
+            "description": "源站 slug；all=全部启用源站"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/{slug}": {
       "get": {
         "summary": "Maccms Compat",
-        "description": "与苹果 CMS 采集接口输出结构一致：\n  ?ac=list   -> {code,page,pagecount,limit,total,class,list:[轻量字段]}\n  ?ac=detail -> {code,page,pagecount,limit,total,class,list:[全字段含播放地址]}",
+        "description": "与苹果 CMS 采集接口输出结构一致：\n  ?ac=list   -> {code,page,pagecount,limit,total,class,list:[轻量字段]}\n  ?ac=detail -> {code,page,pagecount,limit,total,class,list:[全字段含播放地址]}\n\nv1.11.0：`vod_play_list` 已按策略过滤（默认剔除 /share/、/play/、.html 这类\n分享页线路），`vod_play_url` 原始串保持不变 —— 采集端若自己解析原始串，\n行为与旧版完全一致；用 vod_play_list 的客户端自动拿到可播线路。",
         "operationId": "maccms_compat_api_v1__slug__get",
         "parameters": [
           {
@@ -1361,6 +2377,20 @@
             }
           },
           {
+            "name": "play_raw",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1,
+              "minimum": 0,
+              "description": "v1.11.0：1=不做线路过滤/排序（排障用）",
+              "default": 0,
+              "title": "Play Raw"
+            },
+            "description": "v1.11.0：1=不做线路过滤/排序（排障用）"
+          },
+          {
             "name": "page",
             "in": "query",
             "required": false,
@@ -1382,7 +2412,7 @@
               "maximum": 100,
               "minimum": 1,
               "description": "每页条数",
-              "default": 30,
+              "default": 18,
               "title": "Page Size"
             },
             "description": "每页条数"

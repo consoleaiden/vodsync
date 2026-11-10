@@ -462,6 +462,10 @@ def request_authorized(request: Request) -> bool:
 
 PUBLIC_PATHS = {
     "/healthz",              # 存活探针必须放行，否则容器永远不健康
+    "/healthz.capabilities", # 能力清单与 /healthz 同级：客户端用它决定要不要切
+                             # 新参数（如 ?tag=）。带 Token 也访问不了它 —— 它不是
+                             # /api/ 路径，中间件对非 API 路径只认会话 cookie，
+                             # 漏在这里 App 拿着合法 Token 也吃 401（v1.14.1 修）。
     "/login",
     "/api/v1/auth/login",
     "/api/v1/auth/state",

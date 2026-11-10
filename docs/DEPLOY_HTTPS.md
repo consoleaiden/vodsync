@@ -88,3 +88,37 @@ time curl -s -H "Authorization: Bearer $TOKEN" \
 
 服务端本身没有任何「只有 HTTPS 才能工作」的改动，`/healthz`、Token 校验、限流在两种
 协议下行为完全一致。
+
+## 7. 排障：502 upstream connect failed（os error 11004）
+
+**典型现场**：公网入口全线 502，反代日志报 `connect() failed (os error 11004)`；
+直连 `http://<host>:8181` 却一切正常。
+
+**根因**：反代的 `proxy_pass`/`upstream` 写成了**公网域名**（如 `mosang.asia`），
+而该域名**只有 AAAA（IPv6）记录、没有 A 记录**。Windows 下的 Nginx 解析 upstream
+域名时只拿 A 记录，拿不到就报 11004（"the requested name is valid, but no data of
+the requested type was found"）；即使解析成功，反代再绕公网回自己也是浪费。
+
+**修复**：
+
+1. **upstream 一律写本地地址，不写公网域名**：
+
+   ```nginx
+   upstream vodsync_backend {
+       server 127.0.0.1:8181;    # 反代与后端同机时（本项目样例即如此）
+       keepalive 16;
+   }
+   ```
+
+   反代跑在容器里时写容器名（`vodsync:8000`）或宿主机内网 IP。
+   改完 `nginx -t && nginx -s reload`，`curl -sI https://<域名>/healthz` 期望 200。
+
+2. **给域名补一条 A 记录**（DNS 服务商控制台操作）：类型 `A`、主机记录 `@`、
+   值为服务器的公网 IPv4。只补 AAAA 的话，纯 IPv4 网络（大量手机蜂窝网络）
+   根本解析不到，表现为「部分手机连不上，Wi-Fi 正常」。
+   验证：`nslookup -type=A mosang.asia` 应返回 IPv4 地址。
+
+3. **过渡期让 App 直连 IP**：A 记录生效前，客户端默认地址改用
+   `http://<服务器IP>:8181`（本项目现网过渡地址：`http://100.84.176.119:8181`）。
+   直连 8181 走的是明文 HTTP + Token，双栈并行期本来就是设计内的可用路径，
+   HTTPS 修好后切回域名即可。
