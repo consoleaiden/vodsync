@@ -1579,12 +1579,11 @@
             "required": false,
             "schema": {
               "type": "string",
-              "maxLength": 64,
-              "description": "影视名称关键词（与 tag 二选一）",
+              "description": "影视名称关键词（与 tag 二选一；超 64 字符自动截断）",
               "default": "",
               "title": "Wd"
             },
-            "description": "影视名称关键词（与 tag 二选一）"
+            "description": "影视名称关键词（与 tag 二选一；超 64 字符自动截断）"
           },
           {
             "name": "tag",
@@ -1592,12 +1591,11 @@
             "required": false,
             "schema": {
               "type": "string",
-              "maxLength": 64,
-              "description": "v1.14.0：标签精确检索（分词后逐段精确匹配，不是模糊搜）",
+              "description": "v1.14.0：标签精确检索（分词后逐段精确匹配，不是模糊搜；超 64 字符自动截断）",
               "default": "",
               "title": "Tag"
             },
-            "description": "v1.14.0：标签精确检索（分词后逐段精确匹配，不是模糊搜）"
+            "description": "v1.14.0：标签精确检索（分词后逐段精确匹配，不是模糊搜；超 64 字符自动截断）"
           },
           {
             "name": "source",

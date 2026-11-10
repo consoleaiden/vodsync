@@ -215,14 +215,15 @@ def rebuild_source(slug: str, force: bool = False) -> dict:
                     select(func.count()).select_from(table).where(table.c.vod_id <= cursor)
                 ).scalar() or 0
             started_at = (st["started_at"] if st and st["started_at"] else None)
-            # 存量自愈（v1.14.1）：v1.14.0 曾把「表还不存在」的源站直接标 done
-            # （no_table），这类行 total=0 / processed=0 / cursor=0。表建出来后
-            # 它们会被误判为「已完成」。续跑遇到「done 且一条都没处理过且表里有
-            # 数据」时，从头重扫一遍 —— 真正回填完成的站 processed>=total>0，
-            # 不会误伤。
+            # 存量自愈（v1.14.1）：done 且 processed==0 且表里有数据 =「没真正跑过」
+            # 的铁证 —— 真回填完成的行 processed 必然 == total > 0（processed 是
+            # v1.14.1 才加的列，v1.14.0 的 done 行一律 0；no_table 误标的行也是 0）。
+            # 这类行在旧版启动时被 ready() 的「全 done」判定挡住，永远不会被
+            # 重新处理 —— 线上实况：41 个站全部 done 但 processed=0，索引仅
+            # 3.3% 覆盖。满足条件就从头重扫（幂等，先删后插按 vod_id 覆盖）。
             force_redo = (
                 st is not None and st["status"] == "done"
-                and processed == 0 and cursor == 0 and int(total) > 0
+                and int(processed) == 0 and int(total) > 0
             )
             if force_redo:
                 cursor, processed, indexed = 0, 0, 0
@@ -319,12 +320,44 @@ def building() -> list:
         return sorted(_building)
 
 
+def needs_repair() -> bool:
+    """
+    是否存在「假 done」行：status=done 但 processed==0 且表里有数据。
+
+    v1.14.0 的 done 行没有 processed 列（迁移补列后恒 0），no_table 误标的行
+    也是 0 —— 真正回填完成的行 processed == total > 0。这个判定让启动引导
+    在 ready()==True 时也能触发一次自愈回填（rebuild_source 见 force_redo）。
+    结果缓存 30 秒，与 ready() 同频。
+    """
+    now = time.time()
+    with _ready_lock:
+        key = "__repair__"
+        if _ready_cache.get(key) and _ready_cache[key]["at"] > now:
+            return _ready_cache[key]["val"]
+    try:
+        with database.engine.connect() as conn:
+            rows = conn.execute(
+                select(tag_index_state.c.slug).where(
+                    tag_index_state.c.status == "done",
+                    tag_index_state.c.processed == 0,
+                    tag_index_state.c.total > 0,
+                ).limit(1)
+            ).all()
+        val = bool(rows)
+    except Exception:  # noqa: BLE001
+        val = False
+    with _ready_lock:
+        _ready_cache[key] = {"at": now + 30, "val": val}
+    return val
+
+
 # ---------------------------------------------------------------------------
 # 就绪判定（能力声明用）
 # ---------------------------------------------------------------------------
 def invalidate_ready_cache() -> None:
     with _ready_lock:
         _ready_cache["at"] = 0.0
+        _ready_cache.pop("__repair__", None)   # needs_repair 的缓存一并失效
 
 
 def ready() -> bool:

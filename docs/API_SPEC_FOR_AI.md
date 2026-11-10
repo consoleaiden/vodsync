@@ -345,7 +345,7 @@ type PlayLine = {
 | 28 | POST | `/api/v1/auth/logout` | 鉴权 | 退出登录 |
 | 29 | GET | `/api/v1/auth/state` | 鉴权 | 鉴权状态（免鉴权，未登录只回 `enabled`/`logged_in`） |
 | 30 | POST | `/api/v1/auth/password` | 鉴权 | 修改面板密码 |
-| 31 | POST | `/api/v1/auth/settings` | 鉴权 | 开关访问控制（开启时自动换 Token） |
+| 31 | POST | `/api/v1/auth/settings` | 鉴权 | 开关访问控制（开启时自动换 Token）；**v1.14.1 起响应带 `code`**：`{"code":0,"ok":true,"enabled":...,"token":...}`（`ok` 保留兼容旧面板） |
 | 32 | GET | `/api/v1/auth/token` | 鉴权 | 读取当前 Token（需登录） |
 | 33 | POST | `/api/v1/auth/token` | 鉴权 | 重置 Token（旧 Token 立即失效） |
 | 34 | GET | `/api/v1/related` | 数据 | **相关推荐**（预计算直读，P95<50ms） |
@@ -701,8 +701,8 @@ GET /api/v1/search?tag=%E6%82%AC%E7%96%91&source=ffzy&page=1&page_size=18
 
 | 参数 | 类型 | 默认 | 范围 | 说明 |
 |---|---|---|---|---|
-| `wd` | string | 空 | 1–64 字 | 影视名称关键词（`wd` 与 `tag` **至少给一个**） |
-| `tag` | string | 空 | 1–64 字 | **v1.14.0**：标签精确检索。与 `wd` 同时传时**以 `tag` 为准** |
+| `wd` | string | 空 | 1–64 字 | 影视名称关键词（`wd` 与 `tag` **至少给一个**）。**v1.14.1**：超过 64 字**自动截断**（不再 422） |
+| `tag` | string | 空 | 1–64 字 | **v1.14.0**：标签精确检索。与 `wd` 同时传时**以 `tag` 为准**。**v1.14.1**：超过 64 字**自动截断**（不再 422） |
 | `source` | string | 空 | — | 限定源站（更快）；空=全部 |
 | `type_name` | string | 空 | — | 按分类名过滤 |
 | `page` | int | 1 | ≥1 | 页码 |
@@ -1856,7 +1856,7 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.14.1（当前） | **修复**：`/api/v1/tag/status` 的 `progress` 由 `cursor/total` 改为 `processed/total`（两者同量纲），修复上游 `vod_id` 稀疏导致进度显示 147%、172% 的 bug；新增 `processed` 字段；管理面板列名改为「已处理 / 总条数」，`cursor` 降为 tooltip。**纯展示层修复，接口字段只增不改，客户端无感**。**热修（2026-11-10，线上三问题）**：① `GET /healthz.capabilities` 成为**真实端点**（免鉴权；此前只是文档里的字段路径写法，App 真调会 401）；② tag 检索响应新增 `tag_found`（标签词不在倒排表时 false，客户端应回退 `wd=`）；③ 标签回填时序修复：「表还不存在」的源站不再标 `done`（改 `no_table`），存量错误行续跑自愈重扫。**审查修订**：`POST /api/v1/auth/tokens` 非法 `scope` 的行为文档勘误——实际返回 `400/40001`（原文档误写「按 read 处理」，实现一直是 400，接口行为无变化）；面板 Token 清单补「吊销」操作列；补充 `TOKEN_SCOPE_ENFORCE=false` 期间 read Token 可读取 admin 明文的安全提示 |
+| v1.14.1（当前） | **修复**：`/api/v1/tag/status` 的 `progress` 由 `cursor/total` 改为 `processed/total`（两者同量纲），修复上游 `vod_id` 稀疏导致进度显示 147%、172% 的 bug；新增 `processed` 字段；管理面板列名改为「已处理 / 总条数」，`cursor` 降为 tooltip。**纯展示层修复，接口字段只增不改，客户端无感**。**热修（2026-11-10，线上三问题）**：① `GET /healthz.capabilities` 成为**真实端点**（免鉴权；此前只是文档里的字段路径写法，App 真调会 401）；② tag 检索响应新增 `tag_found`（标签词不在倒排表时 false，客户端应回退 `wd=`）；③ 标签回填时序修复：「表还不存在」的源站不再标 `done`（改 `no_table`），存量错误行续跑自愈重扫。**审计配合（2026-11-10，API_SYNC_AUDIT）**：④ `POST /api/v1/auth/settings` 响应补 `code` 字段（M3）；⑤ `wd`/`tag` 超 64 字符**自动截断**、不再 422（M2 后端配合，前端可不发版）；⑥ 标签索引「假 done」自愈放宽为 `done 且 processed=0 且 total>0`，启动引导在 `ready()` 之外也检查 `needs_repair()`（M5：线上 41 站全 done 但 processed=0、索引仅 3.3% 覆盖的历史行，升级后启动自动重扫补齐）；⑦ openapi.json 两份统一重新导出，55 条方法+路径含 `/healthz.capabilities`（M4/D3）。**审查修订**：`POST /api/v1/auth/tokens` 非法 `scope` 的行为文档勘误——实际返回 `400/40001`（原文档误写「按 read 处理」，实现一直是 400，接口行为无变化）；面板 Token 清单补「吊销」操作列；补充 `TOKEN_SCOPE_ENFORCE=false` 期间 read Token 可读取 admin 明文的安全提示 |
 | v1.14.0 | **后端契约升级（B-01/B-02/B-03/B-04/B-05/B-06/B-08/B-09/B-10/B-11）**：`/healthz` 新增 `capabilities` 能力清单（`tag_search` / `error_codes` / `token_scope` …，DB 降级时自动收缩）；错误码统一为「非 2xx + `{code, error, detail, message}`」（`40001`/`40101`/`40301`/`40401`，参数校验由 422 改 400 并带 `field`）；**成功码默认 0**（`API_SUCCESS_CODE` 可退回 1，MacCMS 兼容接口恒 1）；`/api/v1/search` 与 `/api/v1/videos` 新增 `?tag=` 标签精确检索（倒排表 `video_tags`，索引就绪才声明能力）；列表新增 `remarks` / `vod_area` / `vod_year`，详情新增 `play_lines` / `tag` 同值别名，剧集新增 `from`/`type`/`playable`；`total_approximate` 恒出现；`page_size` 缺省改 18；新增 `GET /api/v1/tag/status`、`POST /api/v1/maintenance/tag-index`、`GET\|POST /api/v1/auth/tokens`、`DELETE /api/v1/auth/tokens/{id}`（read/admin 两档权限，默认宽权限放行）。详见 `MIGRATION_NOTES.md` |
 | v1.13.0 | **面板布局调整 + 管理能力补齐（无接口变更）**：「明星词库」从设置弹层移到主面板独立区块；`main` 去掉 1280px 限宽改为全屏自适应；面板新增此前只有 API 的 5 个维护能力入口 —— 明星 Tag 覆盖统计（`/star/tags/status`）、高频词建议（`/star/tags/untracked`，支持一键加入词库）、重建明星 Tag（`/maintenance/star-tags`）、推荐覆盖率（`/related/status`）、按源站重算推荐（`/maintenance/related-recompute`），以及源站行的「回填线路」（`/sync/{slug}?mode=backfill_play_from`） |
 | v1.12.2 | **修复数据表浏览「查询没有数据」**：面板把 `/rows` 返回的列名（字符串数组）当对象取 `.name`，导致表头空白、每格渲染成 `-`；改由 `tbCols()` 归一化后再渲染。接口无变化，纯前端修复 |

@@ -326,8 +326,11 @@ def _bootstrap():
             try:
                 from . import tags
 
-                if not tags.ready():
-                    log.info("标签索引未就绪，后台开始回填（可断点续跑）")
+                # v1.14.1：ready()==True 也要看有没有「假 done」行（processed=0
+                # 的历史行）—— 线上实况是 41 个站全 done 但索引只覆盖 3.3%，
+                # 旧条件让自愈永远不触发。
+                if not tags.ready() or tags.needs_repair():
+                    log.info("标签索引未就绪或存在待自愈的历史行，后台开始回填（可断点续跑）")
                     tags.start_backfill()
             except Exception:
                 log.exception("标签索引回填启动失败（检索能力暂不声明）")

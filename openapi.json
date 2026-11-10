@@ -393,6 +393,23 @@
         }
       }
     },
+    "/healthz.capabilities": {
+      "get": {
+        "summary": "能力清单独立端点（免鉴权，客户端能力门控用）",
+        "description": "`/healthz.capabilities` 作为**真实 URL**存在（v1.14.1 修）。\n\n背景：v1.14.0 文档里 `/healthz.capabilities` 本意是「/healthz 响应中的\ncapabilities 字段」的字段路径写法，但客户端（和文档自己的行文）会把它当\n独立 URL 调 —— 而这个路径不在路由表里，鉴权中间件对非 /api/ 路径又只认\n会话 cookie，于是 App 拿着合法 Token 也吃 401。\n\n修复：把端点做出来（与 /healthz 同级的免鉴权路径，已在 auth.PUBLIC_PATHS），\n响应与 /healthz 的能力部分完全一致。已用 /healthz.capabilities 字段的老\n客户端不受影响；两个入口读的是同一份 caps.snapshot()。",
+        "operationId": "healthz_capabilities_healthz_capabilities_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/sources": {
       "get": {
         "summary": "List Sources",
@@ -1562,12 +1579,11 @@
             "required": false,
             "schema": {
               "type": "string",
-              "maxLength": 64,
-              "description": "影视名称关键词（与 tag 二选一）",
+              "description": "影视名称关键词（与 tag 二选一；超 64 字符自动截断）",
               "default": "",
               "title": "Wd"
             },
-            "description": "影视名称关键词（与 tag 二选一）"
+            "description": "影视名称关键词（与 tag 二选一；超 64 字符自动截断）"
           },
           {
             "name": "tag",
@@ -1575,12 +1591,11 @@
             "required": false,
             "schema": {
               "type": "string",
-              "maxLength": 64,
-              "description": "v1.14.0：标签精确检索（分词后逐段精确匹配，不是模糊搜）",
+              "description": "v1.14.0：标签精确检索（分词后逐段精确匹配，不是模糊搜；超 64 字符自动截断）",
               "default": "",
               "title": "Tag"
             },
-            "description": "v1.14.0：标签精确检索（分词后逐段精确匹配，不是模糊搜）"
+            "description": "v1.14.0：标签精确检索（分词后逐段精确匹配，不是模糊搜；超 64 字符自动截断）"
           },
           {
             "name": "source",

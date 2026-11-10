@@ -103,7 +103,7 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| GET | `/source` | 资源站清单（含上游/本地 API 地址，App 初始化用） |
+| GET | `/source` | 资源站清单（**v1.3 起为兼容接口**，新客户端请用 `/api/v1/sources`） |
 | GET | `/api/v1/categories` | 分类清单（分类浏览入口） |
 | GET | `/api/v1/videos` | 视频列表 / 批量详情 / 分类浏览（REST 风格，多源合并） |
 | GET | `/api/v1/videos/{slug}/{vod_id}` | 单条视频详情（含播放地址） |
@@ -136,9 +136,10 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 | GET | `/api/v1/admin/tables` | **v1.12.0** 数据表浏览：可浏览表清单（含列元信息与行数；`settings` 有意排除）。**v1.12.1** 每项新增 `label`（`vod_*` 表显示源站名，如「新极品资源站」），请求仍用 `name`（表名） |
 | GET | `/api/v1/admin/tables/{name}/rows` | **v1.12.0** 数据表浏览：分页查看数据（`page` / `page_size`≤100 / `field` / `q`，页码越界自动夹回） |
 
-> 管理接口全部为**异步受理**模式：POST 立即返回 `{"code":1,"msg":"...已受理"}`，实际进度通过轮询 `/api/v1/sources`（看 `syncing`/`progress` 字段）与 `/api/v1/logs` 获取。
+> 管理接口全部为**异步受理**模式：POST 立即返回 `{"code":0,"msg":"...已受理"}`
+> （v1.14.1 纠偏：v1.14.0 起成功码统一为 0，原文档示例仍是旧的 1，已过时），实际进度通过轮询 `/api/v1/sources`（看 `syncing`/`progress` 字段）与 `/api/v1/logs` 获取。
 >
-> 上表只列客户端最常用的管理接口。**完整清单（共 47 个）见
+> 上表只列客户端最常用的管理接口。**完整清单（共 55 个，方法+路径）见
 > [`API_SPEC_FOR_AI.md` 4.0 接口总表](./API_SPEC_FOR_AI.md)** —— 其中鉴权（`/api/v1/auth/*`）、
 > 自定义源站（`/api/v1/sources/custom` 等）、明星词库维护（`/api/v1/star-terms*`）、
 > 明星 Tag 重建（`/api/v1/maintenance/star-tags`）本文未展开。
@@ -615,10 +616,10 @@ POST /api/v1/sources/auto-sync?enabled=true&slugs=jkun,t1  # 只开启指定站
 > - 展示建议：`running` → 显示进度条+暂停；`syncing && !running` → 显示"断点 N/M 页 · 未在同步"；`paused` → 显示「继续」
 
 #### GET `/api/v1/sources/{slug}`
-`{"code":1,"source":{...},"recent_logs":[最近10条同步日志]}`，日志字段同 `/api/v1/logs`。
+`{"code":0,"source":{...},"recent_logs":[最近10条同步日志]}`，日志字段同 `/api/v1/logs`。
 
 #### POST `/api/v1/sources/refresh`（可选 `?full_sync=true`）
-`{"code":1,"new_sources":["新站slug",...],"full_sync_started":false}`
+`{"code":0,"new_sources":["新站slug",...],"full_sync_started":false}`
 
 #### POST `/api/v1/sync/{slug}?mode=auto|full|incremental|backfill_play_from`
 - `auto`：有数据走增量，无数据走全量（**推荐默认**）
@@ -640,7 +641,7 @@ POST /api/v1/sources/auto-sync?enabled=true&slugs=jkun,t1  # 只开启指定站
 ```
 
 #### POST `/api/v1/maintenance/recount`
-异步重算各源站本地条数，`{"code":1,"msg":"条数校准任务已受理"}`。
+异步重算各源站本地条数，`{"code":0,"msg":"条数校准任务已受理"}`。
 
 ---
 

@@ -163,7 +163,9 @@ def auth_settings(payload: dict):
         # 关闭期间任何人都能拿到旧 Token，启用时换一枚新的，避免"开着的门配着旧钥匙"
         token = auth.rotate_token()
     log.info("访问控制已%s", "启用" if enabled else "关闭")
-    return {"ok": True, "enabled": enabled, "token": token}
+    # v1.14.1：补 B-11 包络的 code 字段。这曾是唯一一个「成功响应既没 code 也没
+    # list/detail」的写接口，第三方客户端容易漏判（审计 M3）。ok 保留兼容旧面板。
+    return {"code": SUCCESS_CODE, "ok": True, "enabled": enabled, "token": token}
 
 
 @router.get("/api/v1/auth/token", summary="查看 API Token（需登录）")
@@ -1513,6 +1515,11 @@ def video_list(
     type_name = _qp(request, "type_name", type_name)
     wd = _qp(request, "wd", wd)
     tag = _qp(request, "tag", tag)
+    # v1.14.1（审计 M2 配合）：关键词超长不再 422，静默截断到 64。
+    # 粘贴长句搜索时 422 + 英文 detail 的观感是「搜索坏了」；
+    # 截断对 wd（模糊匹配）无害，对 tag 则大概率 tag_found=false → 客户端回退 wd。
+    wd = (wd or "").strip()[:64]
+    tag = (tag or "").strip()[:64]
     detail_mode = ac in ("detail", "videolist")
 
     slugs = [s.strip() for s in source.split(",") if s.strip()] if source else None
@@ -1703,10 +1710,10 @@ def video_detail(
 # ---------------------------------------------------------------------------
 @router.get("/api/v1/search")
 def aggregate_search(
-    wd: str = Query("", max_length=64, description="影视名称关键词（与 tag 二选一）"),
+    wd: str = Query("", description="影视名称关键词（与 tag 二选一；超 64 字符自动截断）"),
     tag: str = Query(
-        "", max_length=64,
-        description="v1.14.0：标签精确检索（分词后逐段精确匹配，不是模糊搜）",
+        "",
+        description="v1.14.0：标签精确检索（分词后逐段精确匹配，不是模糊搜；超 64 字符自动截断）",
     ),
     source: str = Query("", description="限定源站 slug，逗号分隔；留空=搜索全部源站"),
     type_name: str = Query("", description="按分类名称过滤"),
@@ -1739,8 +1746,10 @@ def aggregate_search(
       索引没建完时后端仍能响应（只是结果不全），不会 500。
     """
     started = time.time()
-    kw = (wd or "").strip()
-    tag = (tag or "").strip()
+    # v1.14.1（审计 M2）：去掉 Query max_length 校验（超长 422 + 英文 detail），
+    # 改为静默截断 —— 前端粘贴长句搜索不再报错。
+    kw = (wd or "").strip()[:64]
+    tag = (tag or "").strip()[:64]
     if not kw and not tag:
         raise HTTPException(
             status_code=400, detail="必须提供 wd（名称关键词）或 tag（标签）之一"

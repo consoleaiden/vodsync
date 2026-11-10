@@ -140,6 +140,22 @@ def main():
     check("C5 已完成的站续跑不重扫（indexed 不变）",
           res2["indexed"] == res["indexed"], (res, res2))
 
+    # 线上实况复现：done + processed=0 + cursor>0（v1.14.0 真跑过一部分、
+    # processed 列是后补的恒 0）→ 也要自愈（v1.14.1 初版条件含 cursor==0，
+    # 这类行永远修不回来）
+    with database.write_txn() as conn:
+        from app.models import tag_index_state as _tis
+        conn.execute(_tis.update().where(_tis.c.slug == "hotfix_nt")
+                     .values(status="done", processed=0, cursor=99999, total=25))
+    tags.invalidate_ready_cache()
+    check("C6 needs_repair 发现假 done 行", tags.needs_repair() is True, "")
+    res3 = tags.rebuild_source("hotfix_nt")
+    check("C7 cursor>0 且 processed=0 的 done 行自愈重扫",
+          res3["status"] == "done" and res3["indexed"] > 0, res3)
+    tags.invalidate_ready_cache()
+    check("C8 修完 needs_repair=False", tags.needs_repair() is False, "")
+    check("C9 ready() 保持 true", tags.ready() is True, tags.ready())
+
     # ---------------- D. tag_found 信号 ----------------
     print("\nD. tag_found 信号")
     t = tags.search_page(["hotfix_nt"], "悬疑")
