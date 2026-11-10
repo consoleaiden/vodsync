@@ -1344,10 +1344,25 @@ function openSettings() {
           <td><span class="badge ${it.scope === "admin" ? "ok" : "mute"}">${esc(it.scope)}</span></td>
           <td style="font-size:11px">${esc(it.note || "")}</td>
           <td style="font-size:11px">${esc(fmtTime(it.created_at))}</td>
+          <td>${it.kind === "scoped"
+            ? `<button class="danger" data-revoke="${it.id}">吊销</button>`
+            : `<span style="font-size:11px;color:var(--muted)">—</span>`}</td>
         </tr>`).join("");
       box.innerHTML = `<table>
-        <thead><tr><th>ID</th><th>类型</th><th>权限</th><th>备注</th><th>创建时间</th></tr></thead>
+        <thead><tr><th>ID</th><th>类型</th><th>权限</th><th>备注</th><th>创建时间</th><th>操作</th></tr></thead>
         <tbody>${rows}</tbody></table>`;
+      box.querySelectorAll("[data-revoke]").forEach((b) => {
+        b.addEventListener("click", async () => {
+          if (!confirm("吊销后该 Token 立即失效，正在使用它的客户端会 401。继续？")) return;
+          try {
+            await api(`/api/v1/auth/tokens/${b.dataset.revoke}`, { method: "DELETE" });
+            toast("已吊销");
+            q("#btnTokenList").click();   // 重新拉清单，被吊销的行即消失
+          } catch (e) {
+            toast(e.message, true);
+          }
+        });
+      });
       box.style.display = "";
     } catch (e) {
       toast(e.message, true);

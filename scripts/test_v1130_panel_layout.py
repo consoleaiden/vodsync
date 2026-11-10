@@ -315,6 +315,12 @@ const out = {{}};
         ver = (0, 0, 0)
     check("G1 版本号不低于 1.13.0", ver >= (1, 13, 0), __version__)
 
+    # G2~G4 Token 清单吊销入口（v1.14.1 审查补齐：DELETE 接口的 UI 入口）
+    check("G2 Token 清单有吊销按钮", 'data-revoke="${it.id}"' in js and "吊销" in js, "")
+    check("G3 Token 清单有操作列", "<th>操作</th>" in js, "")
+    check("G4 吊销走 DELETE 且有确认",
+          '{ method: "DELETE" }' in js and "正在使用它的客户端会 401" in js, "")
+
     print()
     print("=" * 50)
     print(f"通过 {passed} / 失败 {failed} / 跳过 {skipped}")

@@ -1479,8 +1479,8 @@ Token 并存：升级后不需要动任何客户端配置。
 
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `scope` | string | `read` | `read` / `admin`；非法值按 `read` 处理 |
-| `note` | string | 空 | 用途备注（≤128 字），轮换时避免误删 |
+| `scope` | string | `read` | `read` / `admin`；非法值返回 `400 / 40001`（detail：`scope 只能是 read 或 admin`） |
+| `note` | string | 空 | 用途备注（超 128 字截断入库，响应与库中一致） |
 
 ```json
 { "code": 0, "id": 3, "token": "vs_xxx", "scope": "read", "note": "App 只读", "created_at": "..." }
@@ -1495,6 +1495,8 @@ Token 并存：升级后不需要动任何客户端配置。
 #### 强制校验与灰度
 
 - 默认 `TOKEN_SCOPE_ENFORCE=false`：**所有 Token 等价 admin**（升级当天零影响）。
+  ⚠️ 这意味着只读 Token 也能调 `GET /api/v1/auth/token` 拿到 admin 明文 Token ——
+  **给 App 签发 read Token 后请尽快置 `TOKEN_SCOPE_ENFORCE=true`**，否则权限档位形同虚设。
 - 打开后，只读 Token 调写接口返回 `403 / 40301 / insufficient_scope / required: "admin"`。
 - `TOKEN_SCOPE_LEGACY_BELOW=1.6.0` 时，低于该版本的客户端（`X-Client-Version` 头或
   `client_version` 参数自报）按 admin 放行；**不自报版本的也放行**（宽进严出），
@@ -1837,7 +1839,7 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.14.1（当前） | **修复**：`/api/v1/tag/status` 的 `progress` 由 `cursor/total` 改为 `processed/total`（两者同量纲），修复上游 `vod_id` 稀疏导致进度显示 147%、172% 的 bug；新增 `processed` 字段；管理面板列名改为「已处理 / 总条数」，`cursor` 降为 tooltip。**纯展示层修复，接口字段只增不改，客户端无感** |
+| v1.14.1（当前） | **修复**：`/api/v1/tag/status` 的 `progress` 由 `cursor/total` 改为 `processed/total`（两者同量纲），修复上游 `vod_id` 稀疏导致进度显示 147%、172% 的 bug；新增 `processed` 字段；管理面板列名改为「已处理 / 总条数」，`cursor` 降为 tooltip。**纯展示层修复，接口字段只增不改，客户端无感**。**审查修订（2026-11-10）**：`POST /api/v1/auth/tokens` 非法 `scope` 的行为文档勘误——实际返回 `400/40001`（原文档误写「按 read 处理」，实现一直是 400，接口行为无变化）；面板 Token 清单补「吊销」操作列（此前 `DELETE /api/v1/auth/tokens/{id}` 只能 curl 调用）；补充 `TOKEN_SCOPE_ENFORCE=false` 期间 read Token 可读取 admin 明文的安全提示 |
 | v1.14.0 | **后端契约升级（B-01/B-02/B-03/B-04/B-05/B-06/B-08/B-09/B-10/B-11）**：`/healthz` 新增 `capabilities` 能力清单（`tag_search` / `error_codes` / `token_scope` …，DB 降级时自动收缩）；错误码统一为「非 2xx + `{code, error, detail, message}`」（`40001`/`40101`/`40301`/`40401`，参数校验由 422 改 400 并带 `field`）；**成功码默认 0**（`API_SUCCESS_CODE` 可退回 1，MacCMS 兼容接口恒 1）；`/api/v1/search` 与 `/api/v1/videos` 新增 `?tag=` 标签精确检索（倒排表 `video_tags`，索引就绪才声明能力）；列表新增 `remarks` / `vod_area` / `vod_year`，详情新增 `play_lines` / `tag` 同值别名，剧集新增 `from`/`type`/`playable`；`total_approximate` 恒出现；`page_size` 缺省改 18；新增 `GET /api/v1/tag/status`、`POST /api/v1/maintenance/tag-index`、`GET\|POST /api/v1/auth/tokens`、`DELETE /api/v1/auth/tokens/{id}`（read/admin 两档权限，默认宽权限放行）。详见 `MIGRATION_NOTES.md` |
 | v1.13.0 | **面板布局调整 + 管理能力补齐（无接口变更）**：「明星词库」从设置弹层移到主面板独立区块；`main` 去掉 1280px 限宽改为全屏自适应；面板新增此前只有 API 的 5 个维护能力入口 —— 明星 Tag 覆盖统计（`/star/tags/status`）、高频词建议（`/star/tags/untracked`，支持一键加入词库）、重建明星 Tag（`/maintenance/star-tags`）、推荐覆盖率（`/related/status`）、按源站重算推荐（`/maintenance/related-recompute`），以及源站行的「回填线路」（`/sync/{slug}?mode=backfill_play_from`） |
 | v1.12.2 | **修复数据表浏览「查询没有数据」**：面板把 `/rows` 返回的列名（字符串数组）当对象取 `.name`，导致表头空白、每格渲染成 `-`；改由 `tbCols()` 归一化后再渲染。接口无变化，纯前端修复 |

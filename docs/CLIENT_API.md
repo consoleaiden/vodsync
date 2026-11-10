@@ -31,6 +31,12 @@
 
 Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token；或调 `GET /api/v1/auth/token`（需登录会话）。
 
+> **Token 有 `read` / `admin` 两档权限（v1.14.0 起）**：给 App 播放用建议签发只读
+> Token（面板「⚙ 设置」→「签发只读 Token」，或 `POST /api/v1/auth/tokens`，
+> 明文只返回一次）。管理接口清单 / 吊销等运维操作见 `API_SPEC_FOR_AI.md` 4.26 节。
+> 注意：`TOKEN_SCOPE_ENFORCE=false`（默认）期间所有 Token 等价 admin，正式分发
+> read Token 前请先在服务端开启强制校验。
+
 鉴权失败返回 `401 {"detail":"未授权：请求头需携带 Authorization: Bearer <token>..."}`。
 
 > 判断是否启用鉴权：调 `GET /api/v1/auth/state`，`{"enabled":true}` 即已启用。

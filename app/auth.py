@@ -185,13 +185,6 @@ def token_scope() -> str:
     return scope if scope in SCOPES else "admin"
 
 
-def token_ok(supplied: str) -> bool:
-    if not supplied:
-        return False
-    candidates = [get_token(), config.API_KEY]
-    return any(c and hmac.compare_digest(supplied, c) for c in candidates)
-
-
 # ---------------------------------------------------------------------------
 # 多 Token 与权限粒度（v1.14.0 / B-08）
 #
@@ -211,10 +204,11 @@ def create_scoped_token(scope: str = "read", note: str = "") -> dict:
     scope = scope if scope in SCOPES else "read"
     raw = "vs_" + secrets.token_urlsafe(32)
     now = datetime.now()
+    note = (note or "")[:128]     # 与入库截断一致，响应里的 note 不能和库里对不上
     with database.write_txn() as conn:
         rid = conn.execute(
             api_tokens.insert().values(
-                token_hash=_hash(raw), scope=scope, note=(note or "")[:128],
+                token_hash=_hash(raw), scope=scope, note=note,
                 created_at=now, revoked=0,
             )
         ).inserted_primary_key[0]
@@ -454,10 +448,10 @@ def request_authorized(request: Request) -> bool:
     """
     API 请求是否放行：Token（客户端）或会话 cookie（面板 JS）任一有效。
 
-    v1.14.0 / B-08：判据从 token_ok（只认存量单 Token 与 API_KEY）换成
-    resolve_scope —— 后者还会查 api_tokens 表，否则新签发的只读 Token
-    拿着合法凭据却一路 401。权限够不够由 main._auth_guard 另行判断，
-    这里只回答「这枚 Token 是否存在且未吊销」。
+    v1.14.0 / B-08：判据是 resolve_scope —— 它除了存量单 Token 与 API_KEY，
+    还会查 api_tokens 表，否则新签发的只读 Token 拿着合法凭据却一路 401。
+    权限够不够由 main._auth_guard 另行判断，这里只回答「这枚 Token 是否
+    存在且未吊销」。
     """
     if not is_enabled():
         return True
