@@ -88,17 +88,21 @@ ALTER TABLE tag_index_state ADD COLUMN processed INTEGER DEFAULT 0;
 
 ```bash
 # 看进度（不写数据）
-docker compose exec vodsync python scripts/backfill_tags.py --status
+docker compose exec vodsync python -c "from app import tags; print(tags.status())"
 
 # 全部启用源站（断点续跑）
-docker compose exec vodsync python scripts/backfill_tags.py
+docker compose exec vodsync python -c "from app import tags; print(tags.rebuild_all())"
 
 # 只补一个站
-docker compose exec vodsync python scripts/backfill_tags.py --slug ffzy
+docker compose exec vodsync python -c "from app import tags; print(tags.rebuild_all(slug='ffzy'))"
 
 # 怀疑索引脏了，清空该站后重建
-docker compose exec vodsync python scripts/backfill_tags.py --slug ffzy --force
+docker compose exec vodsync python -c "from app import tags; print(tags.rebuild_all(slug='ffzy', force=True))"
 ```
+
+> 生产镜像只 `COPY app ./app`，不含 `scripts/`。源码目录（或把 scripts 挂载进
+> 容器）里也可以用等价的 CLI：`python scripts/backfill_tags.py --status` /
+> `--slug ffzy` / `--force`，输出更友好。详见 3.1 节的排障说明。
 
 也可以走接口（面板「标签索引 → 重建索引」按钮就是它）：
 
@@ -116,6 +120,43 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:8181/api/v1/tag
 
 想快可以临时调大：`TAG_INDEX_BATCH=5000 TAG_INDEX_SLEEP_MS=0`，但**别在同步高峰做**
 —— 回填和同步抢的是同一块盘。
+
+### 3.1 定点修补：明星Tag回填与倒排表不一致（v1.14.1，2026-11-11）
+
+**症状**：`/api/v1/tag/status` 显示所有源站 `done`、进度 100%，但 `video_tags`
+行数长期不涨（线上曾停在 ≈3.3% 覆盖）；明星词库补进去的名字 `?tag=` 搜不到。
+
+**根因**：`vod_tag` 有两条写入路径 —— `syncer.upsert_batch` 在同一事务里维护
+`video_tags`，而 `star_tags` 夜间明星词库回填（`_flush_tag_updates`）以前只
+UPDATE 主表。补进去的标签既不进倒排、也不计入索引行数，且每晚重建持续制造
+新缺口。线上实测：`s0c4e337e00` 有 77,020 条视频带标签、`video_tags` 中 0 行；
+`s430327adfe` 4,270 条、同样 0 行；另有 5 个源站在倒排表里完全没有行。
+
+**代码已修**：`_flush_tag_updates` 现在同事务（savepoint 隔离）调用
+`tags.index_rows`，标签被清空时也会删掉旧倒排行。升级后新产生的回填自动一致。
+
+**存量数据必须手动补一次** —— 全量 `--force` 重扫线上约 10 小时，不要用它：
+
+```bash
+# 只扫「有标签」的行（约占全表 3%），秒级~分钟级；clean=True 先删后插、
+# 单事务原子，顺带洗掉「主表已无标签、倒排里还留着」的孤儿行
+docker exec vodsync python -c "from app import tags; r=tags.sync_all_sources(clean=True); print({k:v for k,v in r.items() if k!='detail'}); print([d for d in r['detail'] if d['scanned']>0][:10])"
+
+# 只修一个站
+docker exec vodsync python -c "from app import tags; print(tags.sync_source_tags('s0c4e337e00', clean=True))"
+```
+
+`python -c` 是刻意的：生产镜像 `Dockerfile` 只 `COPY app ./app`，**不含
+`scripts/`**，上面 `backfill_tags.py` 这类 CLI 只在源码目录或挂载了 scripts
+的环境可用；容器内请用 `python -c` 调 `tags.rebuild_all()` /
+`tags.sync_all_sources()`，或走面板 / `POST /api/v1/maintenance/tag-index` 接口。
+
+> **「3.3% 覆盖」不是索引完成度**。`processed / total`（面板进度）才是完成度，
+> 100% 就表示每条视频都扫过了。覆盖率 = `video_tags` 行数 / 视频总行数，
+> 上限由上游 `vod_tag` 字段本身决定：多数采集站该字段为空（实测某站 12.8 万条
+> 视频仅 15 条带标签）。想提高它只能扩大明星词库命中面
+> （`STAR_TAG_NIGHTLY_BUDGET` 默认每晚只重建 2 个站）或让上游补标签，
+> **重扫索引不会改变它**。
 
 ### 回填期间的行为
 

@@ -28,7 +28,10 @@
 - **标签精确检索**（v1.14.0）：详情页标签胶囊点进去按「分词后整段相等」检索（`?tag=`），
   而不是把标签当关键词模糊搜 —— 后者会搜进「悬疑喜剧」「反悬疑」、又漏掉片名不含但标签是的片。
   倒排表 `video_tags` + `(tag_norm, source)` 索引支撑，`total` 精确计数；同步增量维护、
-  升级后启动自动回填（可断点续跑），**索引没建完不会对外声明能力**，客户端继续用 `wd` 检索
+  升级后启动自动回填（可断点续跑），**索引没建完不会对外声明能力**，客户端继续用 `wd` 检索。
+  v1.14.1 修订：明星词库夜间回填写入 `vod_tag` 时也同步维护倒排表（此前只写主表）；
+  存量数据用 `python -c "from app import tags; tags.sync_all_sources(clean=True)"` 一次补齐，
+  详见 [MIGRATION_NOTES 3.1](docs/MIGRATION_NOTES.md)
 - **能力清单与统一错误码**（v1.14.0）：`/healthz` 返回 `capabilities`（`tag_search` /
   `error_codes` / `token_scope` …），前后端发版不再需要同时完成；业务失败统一为
   「非 2xx + `{code, error, detail}`」（`40001`/`40101`/`40301`/`40401`），不再有

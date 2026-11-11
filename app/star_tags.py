@@ -87,13 +87,34 @@ def _hits_for_row(name_raw: str, actor_raw: str, pattern, library: frozenset):
     return canon_hits(pattern.findall(_star_norm(name_raw or ""))) & library, "title"
 
 
-def _flush_tag_updates(table, upd_rows: list):
-    """批量回写 vod_tag（executemany，一次事务一批）。"""
+def _flush_tag_updates(slug: str, table, upd_rows: list):
+    """批量回写 vod_tag（一次事务一批），并同步标签倒排表。
+
+    v1.14.1 修订：`vod_tag` 有两条写入路径 —— `syncer.upsert_batch` 在同一
+    事务里维护 `video_tags`，而这里（明星词库回填）以前只 UPDATE 主表。结果
+    夜间补进去的明星标签既搜不到、也不计入索引行数：线上实测两个源站共
+    81,290 条视频有标签，`video_tags` 里却是 0 行，且每晚重建会持续制造
+    新的不一致。现在同事务顺手维护倒排，用 savepoint 隔离 —— 索引是附加
+    能力，它失败绝不能让明星Tag回填整体回滚。
+    """
     with database.write_txn() as conn:
         conn.execute(
             table.update().where(table.c.vod_id == bindparam("vid")),
             [{"vid": r["vid"], "vod_tag": r["tag"]} for r in upd_rows],
         )
+        if config.TAG_SEARCH_ENABLED and upd_rows:
+            from . import tags
+
+            try:
+                with conn.begin_nested():
+                    tags.index_rows(
+                        slug,
+                        [{"vod_id": r["vid"], "vod_tag": r["tag"]} for r in upd_rows],
+                        conn=conn,
+                    )
+            except Exception as e:  # noqa: BLE001
+                log.warning("[%s] 明星Tag 回填后标签倒排同步失败（不影响主表）: %s",
+                            slug, e)
 
 
 def _flush_map_insert(rows: list):
@@ -150,7 +171,7 @@ def _scan_and_collect(slug: str, pattern, library: frozenset) -> dict:
                      "src": src, "computed_at": now}
                 )
         if batch_tag:
-            _flush_tag_updates(table, batch_tag)
+            _flush_tag_updates(slug, table, batch_tag)
             tag_rows.extend(batch_tag)
         if batch_map:
             _flush_map_insert(batch_map)
@@ -230,7 +251,7 @@ def update_ids(slug: str, ids: list) -> dict:
                 )
             )
         if tag_rows:
-            _flush_tag_updates(table, tag_rows)
+            _flush_tag_updates(slug, table, tag_rows)
         if map_rows:
             _flush_map_insert(map_rows)
     return {"updated": len(tag_rows) + len(map_rows)}

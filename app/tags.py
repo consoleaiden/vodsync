@@ -151,6 +151,92 @@ def delete_source_rows(slug: str) -> None:
         log.warning("[%s] 清理标签索引失败（忽略）: %s", slug, e)
 
 
+def sync_source_tags(slug: str, batch: int = 2000, clean: bool = False) -> dict:
+    """
+    定点修补：把主表有 `vod_tag` 的行同步进倒排表（运维/排障用）。
+
+    与 `rebuild_source(force=True)` 的区别：只扫「有标签」的行（线上约占
+    3%），不碰 650 万条无标签视频 —— 全量重扫在线上要跑约 10 小时，定点
+    修补是秒级。`clean=True` 时先清掉该站全部倒排行再重建，顺带洗掉「主表
+    标签已清空、倒排里还留着」的孤儿行；整个过程单事务原子，中途失败回滚。
+
+    典型场景：v1.14.1 之前 `star_tags` 夜间回填只写主表、不同步倒排，升级后
+    历史数据需要一次性补齐（`scripts/sync_star_tags.py`）。
+    """
+    table = build_vod_table(slug)
+    if not database.table_exists(table.name):
+        return {"slug": slug, "scanned": 0, "written": 0, "rows": 0,
+                "skipped": "no_table"}
+
+    batches, scanned, cursor = [], 0, 0
+    with database.engine.connect() as conn:
+        while True:
+            rows = conn.execute(
+                select(table.c.vod_id, table.c.vod_tag)
+                .where(table.c.vod_id > cursor,
+                       table.c.vod_tag.isnot(None),
+                       table.c.vod_tag != "")
+                .order_by(table.c.vod_id)
+                .limit(batch)
+            ).mappings().all()
+            if not rows:
+                break
+            batches.append([dict(r) for r in rows])
+            cursor = rows[-1]["vod_id"]
+            scanned += len(rows)
+
+    written = 0
+    with database.write_txn() as conn:
+        if clean:
+            conn.execute(video_tags.delete().where(video_tags.c.source == slug))
+        for rows in batches:
+            written += index_rows(slug, rows, conn=conn)
+        actual = conn.execute(
+            select(func.count()).where(video_tags.c.source == slug)
+        ).scalar() or 0
+        # 只更新已有进度行的 indexed（面板「已写行」列）。绝不新插一行：
+        # 默认 status=pending 会让 ready() 撤回 tag_search 能力声明。
+        conn.execute(
+            tag_index_state.update()
+            .where(tag_index_state.c.slug == slug)
+            .values(indexed=int(actual))
+        )
+    invalidate_ready_cache()
+    return {"slug": slug, "scanned": scanned, "written": written,
+            "rows": int(actual), "clean": clean}
+
+
+def sync_all_sources(slug: str = "", clean: bool = False) -> dict:
+    """
+    对所有启用源站跑定点修补（`sync_source_tags`），返回汇总。
+
+    生产镜像只 COPY 了 app/，运维在容器里一行即可调用：
+      docker exec vodsync python -c "from app import tags; print(tags.sync_all_sources(clean=True))"
+    单站失败不影响其它站；`detail` 里每站的 scanned/written/rows 可直接
+    用来核对「主表有标签视频数」与「倒排表行数」是否对齐。
+    """
+    with database.engine.connect() as conn:
+        q = select(sources.c.slug).where(sources.c.enabled == 1).order_by(sources.c.id)
+        if slug:
+            q = select(sources.c.slug).where(sources.c.slug == slug)
+        slugs = [r[0] for r in conn.execute(q).all()]
+    detail, failed = [], []
+    for s in slugs:
+        try:
+            detail.append(sync_source_tags(s, clean=clean))
+        except Exception as e:  # noqa: BLE001
+            log.exception("[%s] 标签倒排定点修补失败", s)
+            failed.append({"slug": s, "error": str(e)[:200]})
+    return {
+        "stations": len(slugs),
+        "scanned": sum(d.get("scanned", 0) for d in detail),
+        "written": sum(d.get("written", 0) for d in detail),
+        "rows": sum(d.get("rows", 0) for d in detail),
+        "failed": failed,
+        "detail": detail,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 全量回填（可断点续跑）
 # ---------------------------------------------------------------------------
