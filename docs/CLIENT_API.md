@@ -5,7 +5,7 @@
 > 本文档面向「调用 VodSync 服务的客户端 App」（原生 App / H5 / 小程序 / 播放器 / 采集器均可）。
 > 目标：一个 AI 客户端开发者（或 AI 编程助手）拿这份文档即可完成全部对接，无需阅读服务端代码。
 >
-> 对应服务版本：**v1.13.0** ｜ 文档版本：`2026-11-09` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.15.0** ｜ 文档版本：`2026-11-11` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 ---
 
@@ -90,10 +90,66 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 | `page` / `pg` | 列表类 | 页码，从 1 开始 |
 | `page_size` | 列表类 | 每页条数，**v1.14.0 起默认 18**（与客户端固定传值一致），上限 100；超上限返回 `400 / 40001` |
 | `tag` | search / videos | **v1.14.0**：标签精确检索（与 `wd` 二选一，同时传以 `tag` 为准），见 3.5 |
+| `minor_mode` | 全部数据接口 | **v1.15.0**：未成年模式开关（`1`/`0`，也接受 `minor` / `teen_mode` 别名）；推荐改用请求头 `X-Minor-Mode`，见 1.5 |
 
 ### 1.4 时间格式
 
 所有时间字段为 ISO 8601 字符串或 `"YYYY-MM-DD HH:MM:SS"`（来自源站原始数据），如 `"2026-10-30T13:00:30"`。可直接字符串比较排序。
+
+### 1.5 未成年模式与 18+ 源站标记（v1.15.0）
+
+服务端为每个源站持久化一个「是否包含 18+ 视频内容」的标记，管理面板「源站管理」表格
+的 **18+ 内容** 列可逐站查看 / 修改（选择即保存）。**存量源站未设置一律按「否」**。
+
+**能力探测**：`GET /healthz`（或 `/healthz.capabilities`）的 `capabilities` 数组含
+`minor_mode` 才表示服务端已支持。老版本没有这项，前端应降级为「只在本地隐藏入口」。
+
+**开启**：客户端的**每一个** API 请求都要带上开关，二选一：
+
+```
+请求头:  X-Minor-Mode: 1                  ← 推荐（所有请求统一加）
+查询参数: ?minor_mode=1                   ← 无法自定义请求头的场景（<img>、播放器内核）
+```
+
+也接受 `?minor=1` / `?teen_mode=1`；值 `1 / true / on / yes` 为开，`0 / false / off / no` 为关。
+请求头优先于查询参数。
+
+**关闭**：不带上述参数即可，也可显式传 `0`。屏蔽只作用于「读路径的可见集合」，
+**从不删改任何数据**，所以关闭后原有展示与访问行为立即恢复，无需重新同步或刷新缓存。
+
+开启后服务端的行为（前端不需要自己再过滤一遍）：
+
+| 位置 | 行为 |
+|---|---|
+| `GET /source`、`GET /api/v1/sources` | 直接剔除 18+ 源站；每项新增 `is_adult` 布尔字段，响应顶层新增 `minor_mode: true` |
+| `GET /api/v1/categories` / `videos` / `search` | 只查询非 18+ 源站；全部被屏蔽时返回 `200 + list=[]`（不是 404），`total=0` |
+| `GET /api/v1/videos/{slug}/{vod_id}` | 18+ 源站的详情（含播放地址）直接 404 |
+| `GET /api/v1/{slug}?ac=list\|detail` | 苹果 CMS 兼容接口同样 404，第三方采集器/播放器不能绕过 |
+| `GET /api/v1/related` / `star/related` / `star/works` | 推荐与明星作品入口同样 404 |
+| `GET /api/v1/sources/{slug}` | 单源站详情同样 404 |
+
+即使前端显式传 `?source=<18+ 的 slug>` 或 `?ids=...` 点名访问，服务端也会先剔除，
+**搜索和批量详情不是旁路**。管理面板不带该开关，所以始终能查看并编辑全部源站，
+同步、词库、Token、统计、数据表浏览等原有管理操作完全不受影响。
+
+**管理端接口**：
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| POST | `/api/v1/sources/{slug}/adult?enabled=true\|false` | 设置单源站 18+ 标记（也可 body `{"enabled": true}`）；只改这一列，立即生效 |
+| GET | `/api/v1/minor-mode` | 诊断：`forced` / `requested` / `active` / `adult_sources` / `adult_count` |
+
+**兼容性（重点）**：不传 `X-Minor-Mode` / `minor_mode` 时，服务端**一次额外查询都不做**，
+所有接口的字段、分页、错误码与 v1.14.1 完全一致。新增的 `is_adult` / `minor_mode`
+都是纯新增字段，老客户端按「多余字段忽略」处理即可，不需要发版。
+
+**已知限制**：请求级开关由客户端自报，技术上可以去掉头绕过。需要服务端强制管控时，
+在部署环境设 `MINOR_MODE_FORCE=true`（compose 环境变量），此时所有请求都进入未成年模式，
+客户端无法通过不带头关闭。默认是 `false`。FORCE 生效期间**管理面板的源站清单也会隐藏
+18+ 行**（面板走同一个 `GET /api/v1/sources`），要改标记请临时关掉 FORCE 或直接调
+`POST /api/v1/sources/{slug}/adult`（该端点不受拦截）。另外
+`GET /api/v1/admin/tables/{name}/rows` 是管理员会话专用的数据表浏览接口，按
+「原有管理操作不受影响」的要求保持可见。
 
 ---
 
@@ -111,6 +167,7 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 | GET | `/api/v1/related` | 相关推荐（服务端预计算，详情页「相关」栏） |
 | GET | `/api/v1/star/related` | 明星维度推荐（详情页「全部/按明星」Tab） |
 | GET | `/api/v1/star/works` | 按明星查作品（**v1.9.2** 明星 Tab 完整作品列表） |
+| GET | `/api/v1/minor-mode` | **v1.15.0** 未成年模式状态（是否生效 / 被标记的 18+ 源站） |
 | GET | `/api/v1/{slug}?ac=list\|detail` | 苹果 CMS(MacCMS) 兼容接口，现有播放器可直接对接 |
 
 ### B. 管理接口（管理端 App / 面板功能）
@@ -130,6 +187,7 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 | POST | `/api/v1/sources/{slug}/pause` | 暂停单个源站（独立于全局暂停） |
 | POST | `/api/v1/sources/{slug}/resume` | 继续单个源站（按 auto 续跑） |
 | POST | `/api/v1/sources/{slug}/auto-sync?enabled=` | 单源站自动同步开关（是否参与定时任务/全站同步） |
+| POST | `/api/v1/sources/{slug}/adult?enabled=` | **v1.15.0** 单源站「是否含 18+ 内容」标记（面板源站管理表格调用） |
 | POST | `/api/v1/sources/auto-sync?enabled=&slugs=` | 批量自动同步开关（`slugs=all` 或逗号分隔列表） |
 | GET | `/api/v1/logs?limit=50` | 最近同步日志（跨源站） |
 | POST | `/api/v1/maintenance/recount` | 条数校准（异步执行） |
@@ -139,7 +197,7 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 > 管理接口全部为**异步受理**模式：POST 立即返回 `{"code":0,"msg":"...已受理"}`
 > （v1.14.1 纠偏：v1.14.0 起成功码统一为 0，原文档示例仍是旧的 1，已过时），实际进度通过轮询 `/api/v1/sources`（看 `syncing`/`progress` 字段）与 `/api/v1/logs` 获取。
 >
-> 上表只列客户端最常用的管理接口。**完整清单（共 55 个，方法+路径）见
+> 上表只列客户端最常用的管理接口。**完整清单（共 57 个，方法+路径）见
 > [`API_SPEC_FOR_AI.md` 4.0 接口总表](./API_SPEC_FOR_AI.md)** —— 其中鉴权（`/api/v1/auth/*`）、
 > 自定义源站（`/api/v1/sources/custom` 等）、明星词库维护（`/api/v1/star-terms*`）、
 > 明星 Tag 重建（`/api/v1/maintenance/star-tags`）本文未展开。
@@ -152,13 +210,14 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 
 App 初始化时调用一次，得到全部可用源站及其对接路径。
 
-**参数**：`status=ok|down`（按上游状态过滤）、`only_ready=true`（仅返回已有本地数据的源站）
+**参数**：`status=ok|down`（按上游状态过滤）、`only_ready=true`（仅返回已有本地数据的源站）；
+v1.15.0 起可带 `X-Minor-Mode: 1` / `?minor_mode=1`，带上了这份清单就不含 18+ 源站（见 1.5）。
 
 **响应**：
 
 ```json
 {
-  "code": 0, "total": 52, "alive": 52, "ready": 1,
+  "code": 0, "minor_mode": false, "total": 52, "alive": 52, "ready": 1,
   "server_time": "2026-10-30T13:00:00",
   "list": [{
     "name": "JKUN资源站",            // 展示名
@@ -171,12 +230,15 @@ App 初始化时调用一次，得到全部可用源站及其对接路径。
     "synced": true,                  // 是否已同步过
     "last_sync_at": "2026-10-30T13:00:30",
     "local_api": "/api/v1/jkun",     // 本服务 MacCMS 兼容路径
-    "local_list_api": "/api/v1/videos?source=jkun"  // 本服务 REST 路径
+    "local_list_api": "/api/v1/videos?source=jkun",  // 本服务 REST 路径
+    "is_adult": false                // v1.15.0：是否含 18+ 内容（纯新增，老客户端忽略）
   }]
 }
 ```
 
-列表按 `video_count` 倒序（数据多的站在前）。
+列表按 `video_count` 倒序（数据多的站在前）。`is_adult` 与顶层 `minor_mode` 均为
+v1.15.0 纯新增字段；未成年模式下 18+ 源站**不会出现在 list 里**，`total` 也随之变小，
+不需要客户端再做一次本地过滤。
 
 ### 3.2 GET `/api/v1/categories` — 分类清单
 

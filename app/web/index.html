@@ -643,6 +643,14 @@ async function loadSources() {
           ${[["inherit", "跟随全局"], ["filter", "过滤"], ["off", "不过滤"], ["whitelist", "只保留直链"]]
             .map(([v, label]) => `<option value="${v}" ${linePolicy === v ? "selected" : ""}>${label}</option>`).join("")}
         </select>${lineHint}`;
+      // 18+ 内容标记（v1.15.0）：标记为「是」后，前端开启未成年模式时该源站
+      // 及其展示入口、全部视频内容由后端统一屏蔽；关闭模式立即恢复。
+      // 与「自动同步」「线路策略」一致：change 即保存，不额外加按钮。
+      const adultOn = !!s.is_adult;
+      const adultCell = `<select class="adultSel" data-slug="${esc(s.slug)}" title="该源站是否包含 18+ 视频内容。标记为「是」后，前端开启未成年模式时该源站及其展示入口、全部视频内容会被屏蔽；关闭未成年模式后立即恢复。未设置按「否」处理。">
+          <option value="0" ${adultOn ? "" : "selected"}>否</option>
+          <option value="1" ${adultOn ? "selected" : ""}>是</option>
+        </select>`;
       return `<tr>
         <td><input type="checkbox" class="selRow" data-slug="${esc(s.slug)}" ${selectedSlugs.has(s.slug) ? "checked" : ""}></td>
         <td>
@@ -657,6 +665,7 @@ async function loadSources() {
         <td class="muted num" style="font-size:12px">${esc(s.watermark || "-")}</td>
         <td class="muted num" style="font-size:12px">${fmtTime(s.last_sync_at)}</td>
         <td style="white-space:nowrap">${autoCell}</td>
+        <td style="white-space:nowrap">${adultCell}</td>
         <td style="white-space:nowrap">
           <button class="sm" data-act="incr" data-slug="${esc(s.slug)}">增量</button>
           <button class="sm" data-act="full" data-slug="${esc(s.slug)}">全量</button>
@@ -671,7 +680,7 @@ async function loadSources() {
     $("#sourcesBody").innerHTML = `<table>
       <thead><tr>
         <th style="width:34px" title="全选 / 取消全选"><input type="checkbox" id="selAll" ${allSel ? "checked" : ""}></th>
-        <th>源站</th><th>来源</th><th>状态</th><th>线路</th><th>已入库</th><th>全量进度</th><th>增量水位线</th><th>最后同步</th><th>自动同步</th><th>操作</th>
+        <th>源站</th><th>来源</th><th>状态</th><th>线路</th><th>已入库</th><th>全量进度</th><th>增量水位线</th><th>最后同步</th><th>自动同步</th><th title="该源站是否包含 18+ 视频内容。标记为「是」后，前端开启未成年模式时会被屏蔽；关闭未成年模式立即恢复。未设置按「否」处理。">18+ 内容</th><th>操作</th>
       </tr></thead><tbody>${rows}</tbody></table>`;
     updateBulkButtons(list.filter((s) => s.auto_sync).length);
   } catch (e) { toast("源站列表加载失败：" + e.message, true); }
@@ -798,6 +807,23 @@ $("#sourcesBody").addEventListener("change", async (ev) => {
       toast(res.msg || "已更新线路策略");
     } catch (e) {
       toast("线路策略设置失败：" + e.message, true);
+    } finally {
+      loadSources();
+    }
+    return;
+  }
+  // 单源站 18+ 内容标记（v1.15.0）
+  if (t.classList.contains("adultSel")) {
+    const slug = t.dataset.slug, want = t.value === "1";
+    t.disabled = true;   // 请求期间禁用，避免轮询覆盖用户刚选的值
+    try {
+      const res = await api(
+        `/api/v1/sources/${encodeURIComponent(slug)}/adult?enabled=${want}`,
+        { method: "POST" }
+      );
+      toast(res.msg || "已保存 18+ 标记");
+    } catch (e) {
+      toast("18+ 标记保存失败：" + e.message, true);
     } finally {
       loadSources();
     }

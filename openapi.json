@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.14.1"
+    "version": "1.15.0"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -413,7 +413,7 @@
     "/api/v1/sources": {
       "get": {
         "summary": "List Sources",
-        "description": "所有源站及本地同步状态。\n\n字段口径（易混淆，特意分开）：\n  running       此刻是否有同步任务在跑（只有 true 才应该提供「暂停」操作）\n  running_mode  正在跑的类型：full / incremental\n  running_seconds 本次已运行秒数\n  syncing       全量同步是否「未跑完」（有断点），不代表正在跑，仅用于展示进度条\n  synced        是否同步过（无水位线、无数据、无断点 = false，进度恒为 0）\n  paused        该源站是否被单独暂停（持久化）",
+        "description": "所有源站及本地同步状态。\n\n字段口径（易混淆，特意分开）：\n  running       此刻是否有同步任务在跑（只有 true 才应该提供「暂停」操作）\n  running_mode  正在跑的类型：full / incremental\n  running_seconds 本次已运行秒数\n  syncing       全量同步是否「未跑完」（有断点），不代表正在跑，仅用于展示进度条\n  synced        是否同步过（无水位线、无数据、无断点 = false，进度恒为 0）\n  paused        该源站是否被单独暂停（持久化）\n\nv1.15.0：每项新增 `is_adult`（该源站是否含 18+ 内容，布尔）。请求带\n`X-Minor-Mode: 1` 时本清单会直接剔除 18+ 源站，并带顶层 `minor_mode: true`。\n管理面板不带该头，因此始终能看到并编辑全部源站 —— 管理操作不受影响。",
         "operationId": "list_sources_api_v1_sources_get",
         "responses": {
           "200": {
@@ -430,7 +430,7 @@
     "/source": {
       "get": {
         "summary": "Source Catalog",
-        "description": "资源站 API 清单。\n\n对外提供「当前服务掌握的所有上游资源站」及其采集接口地址，方便下游客户端\n自行直连上游，或改用本服务的统一接口（local_api / local_list_api）。\n\n返回字段说明：\n  api             上游苹果 CMS 采集接口地址（可直接 ?ac=list / ?ac=detail 调用）\n  local_api       本服务的 MacCMS 兼容接口（同样支持 ?ac=list|detail）\n  local_list_api  本服务的 REST 列表接口\n  video_count     本服务已同步入库的条数（未同步为 0）\n  synced          是否已同步过（有水位线或已入库）",
+        "description": "资源站 API 清单。\n\n对外提供「当前服务掌握的所有上游资源站」及其采集接口地址，方便下游客户端\n自行直连上游，或改用本服务的统一接口（local_api / local_list_api）。\n\n返回字段说明：\n  api             上游苹果 CMS 采集接口地址（可直接 ?ac=list / ?ac=detail 调用）\n  local_api       本服务的 MacCMS 兼容接口（同样支持 ?ac=list|detail）\n  local_list_api  本服务的 REST 列表接口\n  video_count     本服务已同步入库的条数（未同步为 0）\n  synced          是否已同步过（有水位线或已入库）\n  is_adult        v1.15.0：该源站是否包含 18+ 内容（布尔）\n\nv1.15.0：请求带 `X-Minor-Mode: 1`（或 `?minor_mode=1`）时，本清单直接从\n服务端剔除 18+ 源站 —— App 初始化时拿到的就是「可见源站全集」，不会漏出\n展示入口。不带该头时行为与升级前完全一致（含全部源站）。",
         "operationId": "source_catalog_source_get",
         "parameters": [
           {
@@ -458,6 +458,84 @@
             "description": "仅返回本地已有数据的源站"
           }
         ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/minor-mode": {
+      "get": {
+        "summary": "未成年模式状态（能力诊断用）",
+        "description": "返回当前请求是否处于未成年模式、部署级强制开关是否打开、以及被标记为\n18+ 的源站列表。纯只读，不改变任何状态；供面板与客户端排障使用。",
+        "operationId": "minor_mode_status_api_v1_minor_mode_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sources/{slug}/adult": {
+      "post": {
+        "summary": "设置源站 18+ 内容标记",
+        "description": "持久化单个源站的「是否包含 18+ 视频内容」标记（`sources.is_adult`）。\n\n- 只改这一列，不动同步状态、水位线、断点与已入库数据，也不需要重新同步；\n- 立即生效：读路径每次实时查 `is_adult`，没有缓存窗口；\n- 关闭（enabled=false）后，未成年模式下该源站立刻恢复展示与访问；\n- 这是**管理操作**，不受未成年模式影响（面板不带 X-Minor-Mode 头）。\n\n兼容性与请求级开关一致：面板用查询参数，App 控制台习惯用 body，两者都收，\nbody 优先。缺参返回 400 —— 避免误把标记清成「否」。",
+        "operationId": "set_source_adult_api_v1_sources__slug__adult_post",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Slug"
+            }
+          },
+          {
+            "name": "enabled",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "true/false 或 1/0；也支持 body {\"enabled\": true}",
+              "default": "",
+              "title": "Enabled"
+            },
+            "description": "true/false 或 1/0；也支持 body {\"enabled\": true}"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "title": "Payload"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -1509,7 +1587,7 @@
     "/api/v1/videos/{slug}/{vod_id}": {
       "get": {
         "summary": "Video Detail",
-        "description": "视频详情（含结构化播放地址列表）。RELATED_IN_DETAIL=true 时附带 related 推荐数组。\n\nv1.11.0（播放线路）：`vod_play_list` 默认已过滤掉 `/share/`、`/play/`、`.html`\n这类「H5 分享页」线路（返回 text/html，真实流地址由 JS 生成且带过期 sign）。\n每条线路带 `from`（上游 provider）/`type`/`playable`/`original_index`；\n`vod_play_url` 原始串不变。真的过滤掉线路时响应顶层带 `play_line_filtered: true`。\n\nv1.10.1（纯新增）：返回 `vod_actor` / `vod_director` / `vod_area` / `vod_year` /\n`vod_tag` 五个字段 —— 列 v1.9.0 起就在库里，之前没透出，NAS 模式的客户端拿不到\n演员与明星标签。字段恒为字符串（缺失/NULL 为 \"\"），客户端不必判 null。",
+        "description": "视频详情（含结构化播放地址列表）。RELATED_IN_DETAIL=true 时附带 related 推荐数组。\n\nv1.11.0（播放线路）：`vod_play_list` 默认已过滤掉 `/share/`、`/play/`、`.html`\n这类「H5 分享页」线路（返回 text/html，真实流地址由 JS 生成且带过期 sign）。\n每条线路带 `from`（上游 provider）/`type`/`playable`/`original_index`；\n`vod_play_url` 原始串不变。真的过滤掉线路时响应顶层带 `play_line_filtered: true`。\n\nv1.10.1（纯新增）：返回 `vod_actor` / `vod_director` / `vod_area` / `vod_year` /\n`vod_tag` 五个字段 —— 列 v1.9.0 起就在库里，之前没透出，NAS 模式的客户端拿不到\n演员与明星标签。字段恒为字符串（缺失/NULL 为 \"\"），客户端不必判 null。\n\nv1.15.0：未成年模式下 18+ 源站的详情（含播放地址）直接 404，\n光靠列表页隐藏入口是挡不住直接调 API 的。",
         "operationId": "video_detail_api_v1_videos__slug___vod_id__get",
         "parameters": [
           {
@@ -1686,7 +1764,7 @@
     "/api/v1/related": {
       "get": {
         "summary": "Related Videos",
-        "description": "视频相关推荐（预计算结果直读，P95 < 50ms）。\n\n返回 {code, slug, vod_id, limit, fallback, computed_at, algo_version, list}：\n  - list 为对齐视频卡片结构的数组（含 source/source_name/score），\n    source 用于客户端跨站点击跳转\n  - fallback=true 表示**整条列表**都来自兜底链（同分类/同地区年代/最新收录），\n    客户端可按需弱化展示或改成「猜你想看」；列表永远非空（只要该视频本身存在）\n  - 视频不存在返回 404 标准错误结构\n\nv1.10.0 变更（对接需注意，均为纯新增或语义收紧）：\n  - 新增 `algo_version`：当前算法版本。与旧值不同的缓存建议直接丢弃。\n  - 卡片新增 `reason`：命中原因，逗号分隔，如 \"title,actor\" / \"director\"。\n    兜底条目为空串。可按它做「因为你也看过…」这类展示，也可忽略。\n  - 语义收紧：**仅同分类+同地区+同年代的配对不再进推荐位**（旧版会给这类\n    配对 0.667 的高分，属于 Bug 级误判）。同一部片不会出现在自己的推荐里。\n  - 零命中时的兜底条数从 12 条降到 6 条（RELATED_FALLBACK_LIMIT），\n    不与真命中混排；`fallback=true` 时 `score` 恒为 0、`mode` 为 \"fallback\"。",
+        "description": "视频相关推荐（预计算结果直读，P95 < 50ms）。\n\n返回 {code, slug, vod_id, limit, fallback, computed_at, algo_version, list}：\n  - list 为对齐视频卡片结构的数组（含 source/source_name/score），\n    source 用于客户端跨站点击跳转\n  - fallback=true 表示**整条列表**都来自兜底链（同分类/同地区年代/最新收录），\n    客户端可按需弱化展示或改成「猜你想看」；列表永远非空（只要该视频本身存在）\n  - 视频不存在返回 404 标准错误结构\n\nv1.10.0 变更（对接需注意，均为纯新增或语义收紧）：\n  - 新增 `algo_version`：当前算法版本。与旧值不同的缓存建议直接丢弃。\n  - 卡片新增 `reason`：命中原因，逗号分隔，如 \"title,actor\" / \"director\"。\n    兜底条目为空串。可按它做「因为你也看过…」这类展示，也可忽略。\n  - 语义收紧：**仅同分类+同地区+同年代的配对不再进推荐位**（旧版会给这类\n    配对 0.667 的高分，属于 Bug 级误判）。同一部片不会出现在自己的推荐里。\n  - 零命中时的兜底条数从 12 条降到 6 条（RELATED_FALLBACK_LIMIT），\n    不与真命中混排；`fallback=true` 时 `score` 恒为 0、`mode` 为 \"fallback\"。\nv1.15.0：未成年模式下 18+ 源站的相关推荐直接 404（推荐卡片也是内容入口）。",
         "operationId": "related_videos_api_v1_related_get",
         "parameters": [
           {
@@ -2318,7 +2396,7 @@
     "/api/v1/{slug}": {
       "get": {
         "summary": "Maccms Compat",
-        "description": "与苹果 CMS 采集接口输出结构一致：\n  ?ac=list   -> {code,page,pagecount,limit,total,class,list:[轻量字段]}\n  ?ac=detail -> {code,page,pagecount,limit,total,class,list:[全字段含播放地址]}\n\nv1.11.0：`vod_play_list` 已按策略过滤（默认剔除 /share/、/play/、.html 这类\n分享页线路），`vod_play_url` 原始串保持不变 —— 采集端若自己解析原始串，\n行为与旧版完全一致；用 vod_play_list 的客户端自动拿到可播线路。",
+        "description": "与苹果 CMS 采集接口输出结构一致：\n  ?ac=list   -> {code,page,pagecount,limit,total,class,list:[轻量字段]}\n  ?ac=detail -> {code,page,pagecount,limit,total,class,list:[全字段含播放地址]}\n\nv1.11.0：`vod_play_list` 已按策略过滤（默认剔除 /share/、/play/、.html 这类\n分享页线路），`vod_play_url` 原始串保持不变 —— 采集端若自己解析原始串，\n行为与旧版完全一致；用 vod_play_list 的客户端自动拿到可播线路。\nv1.15.0：未成年模式下 18+ 源站的 MacCMS 兼容接口同样屏蔽 —— 第三方采集器\n和播放器内核也会走这条路，漏掉它等于整站屏蔽形同虚设。",
         "operationId": "maccms_compat_api_v1__slug__get",
         "parameters": [
           {

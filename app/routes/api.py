@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from sqlalchemy import bindparam, func, select, text
 
-from .. import __version__, apiresp, auth, config, database
+from .. import __version__, apiresp, auth, config, database, minor_mode
 from ..models import build_vod_table, sources, sync_logs
 from ..syncer import (
     delete_custom_source,
@@ -495,6 +495,7 @@ def reset_categories_cache() -> None:
 
 @router.get("/api/v1/categories")
 def categories(
+    request: Request,
     source: str = Query("", description="源站 slug，逗号分隔多源；留空=全部源站合并"),
 ):
     """
@@ -511,17 +512,23 @@ def categories(
     """
     from collections import defaultdict
 
-    slugs = [s.strip() for s in source.split(",") if s.strip()] if source else None
-    if slugs:
-        for s in slugs:
+    raw = [s.strip() for s in source.split(",") if s.strip()] if source else None
+    if raw:
+        for s in raw:
             validate_slug(s)
+        # v1.15.0：未成年模式下显式指定的 18+ 源站也要剔除
+        slugs = minor_mode.filter_slugs(request, raw)
     else:
+        clause = minor_mode.source_clause(request)
+        cond = [sources.c.enabled == 1] + ([clause] if clause is not None else [])
         with database.engine.connect() as conn:
             slugs = [r[0] for r in conn.execute(
-                select(sources.c.slug).where(sources.c.enabled == 1)
+                select(sources.c.slug).where(*cond)
             ).all()]
 
-    cache_key = (tuple(slugs), source)
+    # 缓存 key 必须带未成年模式状态：否则开启/关闭两种模式会串用同一份
+    # 分类结果，关掉后仍看到被屏蔽站的分类数（或反之）。
+    cache_key = (tuple(slugs), source, minor_mode.active(request))
     ttl = config.CATEGORIES_CACHE_SECONDS
     if ttl > 0:
         with _categories_lock:
@@ -682,7 +689,7 @@ def compute_progress(row, live: dict = None) -> float:
 
 
 @router.get("/api/v1/sources")
-def list_sources():
+def list_sources(request: Request):
     """
     所有源站及本地同步状态。
 
@@ -693,6 +700,10 @@ def list_sources():
       syncing       全量同步是否「未跑完」（有断点），不代表正在跑，仅用于展示进度条
       synced        是否同步过（无水位线、无数据、无断点 = false，进度恒为 0）
       paused        该源站是否被单独暂停（持久化）
+
+    v1.15.0：每项新增 `is_adult`（该源站是否含 18+ 内容，布尔）。请求带
+    `X-Minor-Mode: 1` 时本清单会直接剔除 18+ 源站，并带顶层 `minor_mode: true`。
+    管理面板不带该头，因此始终能看到并编辑全部源站 —— 管理操作不受影响。
     """
     from .. import playline, syncer
 
@@ -700,6 +711,8 @@ def list_sources():
     queued = syncer.queued_slugs()
     line_stats = playline.stats_snapshot()["by_source"]
 
+    clause = minor_mode.source_clause(request)
+    cond = [clause] if clause is not None else []
     with database.engine.connect() as conn:
         rows = conn.execute(
             select(
@@ -708,15 +721,18 @@ def list_sources():
                 sources.c.last_page, sources.c.total_pages, sources.c.last_sync_at,
                 sources.c.paused, sources.c.paused_at, sources.c.auto_sync,
                 sources.c.origin, sources.c.fail_streak, sources.c.skip_until,
-                sources.c.play_line_policy,
-            ).order_by(sources.c.id)
+                sources.c.play_line_policy, sources.c.is_adult,
+            ).where(*cond).order_by(sources.c.id)
         ).mappings().all()
     return {
         "code": SUCCESS_CODE,
+        # 纯新增字段：老客户端忽略即可；前端用它确认「当前清单是否已按未成年模式过滤」
+        "minor_mode": minor_mode.active(request),
         "list": [
             {
                 "slug": r["slug"],
                 "name": r["name"],
+                "is_adult": minor_mode.is_adult(r["is_adult"]),
                 "api_url": r["api_url"],
                 "origin": r["origin"] or "latest",
                 "status": r["status"],
@@ -761,6 +777,7 @@ def list_sources():
 
 @router.get("/source")
 def source_catalog(
+    request: Request,
     status: str = Query("", description="按状态过滤：ok / down，留空=全部"),
     only_ready: bool = Query(False, description="仅返回本地已有数据的源站"),
 ):
@@ -776,15 +793,23 @@ def source_catalog(
       local_list_api  本服务的 REST 列表接口
       video_count     本服务已同步入库的条数（未同步为 0）
       synced          是否已同步过（有水位线或已入库）
+      is_adult        v1.15.0：该源站是否包含 18+ 内容（布尔）
+
+    v1.15.0：请求带 `X-Minor-Mode: 1`（或 `?minor_mode=1`）时，本清单直接从
+    服务端剔除 18+ 源站 —— App 初始化时拿到的就是「可见源站全集」，不会漏出
+    展示入口。不带该头时行为与升级前完全一致（含全部源站）。
     """
+    clause = minor_mode.source_clause(request)
+    cond = [sources.c.enabled == 1] + ([clause] if clause is not None else [])
     with database.engine.connect() as conn:
         rows = conn.execute(
             select(
                 sources.c.name, sources.c.slug, sources.c.api_url, sources.c.homepage,
                 sources.c.description, sources.c.status, sources.c.enabled,
                 sources.c.total_videos, sources.c.watermark, sources.c.last_sync_at,
+                sources.c.is_adult,
             )
-            .where(sources.c.enabled == 1)
+            .where(*cond)
             .order_by(sources.c.total_videos.desc(), sources.c.id)
         ).mappings().all()
 
@@ -806,15 +831,92 @@ def source_catalog(
             "last_sync_at": r["last_sync_at"].isoformat() if r["last_sync_at"] else None,
             "local_api": f"/api/v1/{r['slug']}",
             "local_list_api": f"/api/v1/videos?source={r['slug']}",
+            # v1.15.0：纯新增字段，老客户端忽略；前端据此自行标记/隐藏入口
+            "is_adult": minor_mode.is_adult(r["is_adult"]),
         })
 
     return {
         "code": SUCCESS_CODE,
+        # 纯新增：让客户端确认这份清单是否已按未成年模式过滤
+        "minor_mode": minor_mode.active(request),
         "total": len(items),
         "alive": sum(1 for x in items if x["status"] == "ok"),
         "ready": sum(1 for x in items if x["video_count"] > 0),
         "server_time": datetime.now().isoformat(),
         "list": items,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 18+ 内容标记 / 未成年模式（v1.15.0）
+#
+# 这两个端点注册在 `/api/v1/{slug}`（MacCMS 兼容通配路由）之前 —— 否则
+# `GET /api/v1/minor-mode` 会被当成 slug="minor-mode" 吃进采集接口返回 404。
+# ---------------------------------------------------------------------------
+@router.get("/api/v1/minor-mode", summary="未成年模式状态（能力诊断用）")
+def minor_mode_status(request: Request):
+    """
+    返回当前请求是否处于未成年模式、部署级强制开关是否打开、以及被标记为
+    18+ 的源站列表。纯只读，不改变任何状态；供面板与客户端排障使用。
+    """
+    return {"code": SUCCESS_CODE, **minor_mode.status(request)}
+
+
+@router.post("/api/v1/sources/{slug}/adult", summary="设置源站 18+ 内容标记")
+def set_source_adult(
+    slug: str,
+    enabled: str = Query(
+        "", description="true/false 或 1/0；也支持 body {\"enabled\": true}"
+    ),
+    payload: dict = None,
+):
+    """
+    持久化单个源站的「是否包含 18+ 视频内容」标记（`sources.is_adult`）。
+
+    - 只改这一列，不动同步状态、水位线、断点与已入库数据，也不需要重新同步；
+    - 立即生效：读路径每次实时查 `is_adult`，没有缓存窗口；
+    - 关闭（enabled=false）后，未成年模式下该源站立刻恢复展示与访问；
+    - 这是**管理操作**，不受未成年模式影响（面板不带 X-Minor-Mode 头）。
+
+    兼容性与请求级开关一致：面板用查询参数，App 控制台习惯用 body，两者都收，
+    body 优先。缺参返回 400 —— 避免误把标记清成「否」。
+    """
+    slug = validate_slug(slug)
+    raw = (payload or {}).get("enabled")
+    if raw is None:
+        raw = enabled
+    if raw is None or str(raw).strip() == "":
+        raise HTTPException(status_code=400, detail="必须提供 enabled=true 或 enabled=false")
+    if isinstance(raw, bool):
+        flag = raw
+    else:
+        val = str(raw).strip().lower()
+        if val not in ("true", "false", "1", "0", "yes", "no", "on", "off"):
+            raise HTTPException(status_code=400, detail="enabled 只能是 true 或 false")
+        flag = val in ("true", "1", "yes", "on")
+
+    with database.engine.connect() as conn:
+        row = conn.execute(
+            select(sources.c.name).where(sources.c.slug == slug)
+        ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"源站 {slug} 不存在")
+    with database.write_txn() as conn:
+        conn.execute(
+            sources.update()
+            .where(sources.c.slug == slug)
+            .values(is_adult=1 if flag else 0)
+        )
+    # 分类清单有 CATEGORIES_CACHE_SECONDS 秒的进程内缓存，且 key 带未成年模式
+    # 状态。标记变了必须清一次，否则面板刚保存完，未成年模式下的分类结果
+    # 可能还在用旧的可见源站集合（最长残留一个 TTL）。
+    reset_categories_cache()
+    log.info("[未成年模式] 源站 %s 18+ 标记 = %s", slug, flag)
+    return {
+        "code": SUCCESS_CODE,
+        "msg": f"源站 {row[0]} 已标记为{'包含' if flag else '不包含'} 18+ 内容",
+        "slug": slug,
+        "is_adult": flag,
     }
 
 
@@ -903,9 +1005,12 @@ def stats():
 
 
 @router.get("/api/v1/sources/{slug}")
-def source_detail(slug: str):
+def source_detail(slug: str, request: Request):
     from .. import syncer
 
+    # v1.15.0：未成年模式下 18+ 源站的详情入口也要挡住（含同步日志），
+    # 与「屏蔽展示入口」一致。面板不带 X-Minor-Mode 头，管理不受影响。
+    minor_mode.guard(request, validate_slug(slug))
     src, _ = _require_table(slug)
     live = syncer.running_snapshot().get(slug)
     with database.engine.connect() as conn:
@@ -917,6 +1022,7 @@ def source_detail(slug: str):
         "code": SUCCESS_CODE,
         "source": {
             "slug": src["slug"], "name": src["name"], "api_url": src["api_url"],
+            "is_adult": minor_mode.is_adult(src["is_adult"]),
             "status": src["status"], "total_videos": src["total_videos"],
             "watermark": src["watermark"], "last_page": src["last_page"],
             "running": live is not None,
@@ -1522,18 +1628,31 @@ def video_list(
     tag = (tag or "").strip()[:64]
     detail_mode = ac in ("detail", "videolist")
 
-    slugs = [s.strip() for s in source.split(",") if s.strip()] if source else None
+    raw_slugs = [s.strip() for s in source.split(",") if s.strip()] if source else None
 
-    if slugs:
-        for s in slugs:
+    if raw_slugs:
+        for s in raw_slugs:
             validate_slug(s)
+        # v1.15.0：显式指定的 18+ 源站同样要剔除，不能因为「点名了」就放行
+        slugs = minor_mode.filter_slugs(request, raw_slugs)
     else:
+        clause = minor_mode.source_clause(request)
+        cond = [sources.c.enabled == 1] + ([clause] if clause is not None else [])
         with database.engine.connect() as conn:
             slugs = [r[0] for r in conn.execute(
-                select(sources.c.slug).where(sources.c.enabled == 1)
+                select(sources.c.slug).where(*cond)
             ).all()]
-        if not slugs:
+        if not slugs and not minor_mode.active(request):
             raise HTTPException(status_code=404, detail="暂无源站，请先触发 /api/v1/sources/refresh")
+
+    # 未成年模式下可见源站为空（全被标记 18+，或库里本来就没数据）：
+    # 返回标准空列表而不是 404，App 显示「暂无内容」即可，不该弹错误提示。
+    # 注意不能落回上面的 else 分支重新枚举全部源站 —— 那会把屏蔽绕过去。
+    if not slugs and minor_mode.active(request):
+        return {
+            "code": SUCCESS_CODE, "page": page, "pagecount": 0, "total": 0,
+            "total_approximate": False, "minor_mode": True, "list": [], "query_ms": 0,
+        }
 
     # ---- 用法 2：按 ID 批量取详情（含播放地址） ----
     if ids:
@@ -1667,6 +1786,7 @@ def video_list(
 def video_detail(
     slug: str,
     vod_id: int,
+    request: Request,
     play_raw: int = Query(0, ge=0, le=1,
                           description="v1.11.0：1=不做线路过滤/排序，返回原始 vod_play_list（排障用）"),
 ):
@@ -1681,7 +1801,11 @@ def video_detail(
     v1.10.1（纯新增）：返回 `vod_actor` / `vod_director` / `vod_area` / `vod_year` /
     `vod_tag` 五个字段 —— 列 v1.9.0 起就在库里，之前没透出，NAS 模式的客户端拿不到
     演员与明星标签。字段恒为字符串（缺失/NULL 为 ""），客户端不必判 null。
+
+    v1.15.0：未成年模式下 18+ 源站的详情（含播放地址）直接 404，
+    光靠列表页隐藏入口是挡不住直接调 API 的。
     """
+    minor_mode.guard(request, validate_slug(slug))
     src, table = _require_table(slug)
     with database.engine.connect() as conn:
         row = conn.execute(
@@ -1710,6 +1834,7 @@ def video_detail(
 # ---------------------------------------------------------------------------
 @router.get("/api/v1/search")
 def aggregate_search(
+    request: Request,
     wd: str = Query("", description="影视名称关键词（与 tag 二选一；超 64 字符自动截断）"),
     tag: str = Query(
         "",
@@ -1756,25 +1881,39 @@ def aggregate_search(
         )
 
     # 1) 确定待搜索的源站
+    clause = minor_mode.source_clause(request)
+    cond = [sources.c.enabled == 1] + ([clause] if clause is not None else [])
     with database.engine.connect() as conn:
         if source:
-            slugs = [s.strip() for s in source.split(",") if s.strip()]
-            for s in slugs:
+            raw_slugs = [s.strip() for s in source.split(",") if s.strip()]
+            for s in raw_slugs:
                 validate_slug(s)
+            # v1.15.0：点名搜索 18+ 源站也不放行，否则搜索成了屏蔽的旁路
+            slugs = minor_mode.filter_slugs(request, raw_slugs)
             name_map = {
                 r[0]: r[1] for r in conn.execute(
                     select(sources.c.slug, sources.c.name).where(sources.c.slug.in_(slugs))
                 ).all()
-            }
+            } if slugs else {}
             slugs = [s for s in slugs if s in name_map]
         else:
             rows = conn.execute(
                 select(sources.c.slug, sources.c.name)
-                .where(sources.c.enabled == 1)
+                .where(*cond)
                 .order_by(sources.c.id)
             ).all()
             name_map = {r[0]: r[1] for r in rows}
             slugs = list(name_map.keys())
+
+    # 未成年模式下没有可见源站：返回标准空结果，不是 404（与 tag 空结果同语义）
+    if not slugs and minor_mode.active(request):
+        return {
+            "code": SUCCESS_CODE, "wd": kw, "tag": tag or "",
+            "page": page, "page_size": page_size, "pagecount": 0, "total": 0,
+            "total_approximate": True, "total_is_partial": False,
+            "truncated_sources": [], "sources_searched": 0, "sources_failed": [],
+            "query_ms": 0, "elapsed_ms": 0, "minor_mode": True, "list": [],
+        }
 
     # ---- tag 路径（v1.14.0 / B-01）----
     # 空源站也返回空结果而不是 404：标签检索的语义是「没有就是没有」，
@@ -1908,6 +2047,7 @@ def _related_cards(slug: str, source_name: str, vod_id: int, limit: int, table) 
 
 @router.get("/api/v1/related")
 def related_videos(
+    request: Request,
     slug: str = Query(..., description="源站 slug"),
     id: int = Query(..., ge=1, description="视频 vod_id"),
     limit: int = Query(config.RELATED_LIMIT_DEFAULT, ge=1, le=config.RELATED_LIMIT_MAX,
@@ -1931,7 +2071,9 @@ def related_videos(
         配对 0.667 的高分，属于 Bug 级误判）。同一部片不会出现在自己的推荐里。
       - 零命中时的兜底条数从 12 条降到 6 条（RELATED_FALLBACK_LIMIT），
         不与真命中混排；`fallback=true` 时 `score` 恒为 0、`mode` 为 "fallback"。
+    v1.15.0：未成年模式下 18+ 源站的相关推荐直接 404（推荐卡片也是内容入口）。
     """
+    minor_mode.guard(request, validate_slug(slug))
     src, table = _require_table(slug)
     with database.engine.connect() as conn:
         exists = conn.execute(
@@ -2188,6 +2330,7 @@ def star_terms_recompute():
 # ---------------------------------------------------------------------------
 @router.get("/api/v1/star/related")
 def star_related_api(
+    request: Request,
     slug: str = Query(..., description="源站 slug"),
     vod_id: int = Query(0, ge=0, description="视频 ID（与 name 二选一，id 优先）"),
     name: str = Query("", max_length=255, description="视频名称（先精确后模糊）"),
@@ -2206,6 +2349,7 @@ def star_related_api(
     from .. import star_tags
 
     slug = validate_slug(slug)
+    minor_mode.guard(request, slug)
     _src, _table = _require_table(slug)
     result = star_tags.star_related(slug, vod_id=vod_id, name=name, limit=limit)
     if result is None:
@@ -2215,6 +2359,7 @@ def star_related_api(
 
 @router.get("/api/v1/star/works")
 def star_works_api(
+    request: Request,
     slug: str = Query(..., description="源站 slug"),
     term: str = Query(..., min_length=1, max_length=64, description="明星名（主名或别名）"),
     limit: int = Query(config.STAR_WORKS_LIMIT_DEFAULT,
@@ -2230,6 +2375,7 @@ def star_works_api(
     from .. import star_tags
 
     slug = validate_slug(slug)
+    minor_mode.guard(request, slug)
     _src, _table = _require_table(slug)
     result = star_tags.star_works(slug, term, limit=limit, exclude_id=exclude_id)
     return {"code": SUCCESS_CODE, **result}
@@ -2237,6 +2383,7 @@ def star_works_api(
 
 @router.get("/api/v1/star/tags/untracked")
 def star_tags_untracked(
+    request: Request,
     slug: str = Query("", description="源站 slug；留空=全部启用源站抽样"),
     limit: int = Query(100, ge=1, le=500),
     sample: int = Query(0, ge=0, le=200000, description="抽样标题数（0=用配置默认）"),
@@ -2249,6 +2396,8 @@ def star_tags_untracked(
 
     if slug:
         slug = validate_slug(slug)
+        # 诊断接口只返回词频候选、不含视频内容；显式点名 18+ 站时仍要挡住
+        minor_mode.guard(request, slug)
         _require_table(slug)
     return {"code": SUCCESS_CODE, **star_tags.untracked_terms(slug=slug, limit=limit, sample=sample)}
 
@@ -2383,6 +2532,7 @@ def related_recompute(
 @router.get("/api/v1/{slug}")
 def maccms_compat(
     slug: str,
+    request: Request,
     ac: str = Query(default="detail", pattern="^(list|detail)$"),
     pg: int = Query(default=1, ge=1),
     ids: str = Query(default="", description="按 ID 批量取详情，逗号分隔"),
@@ -2399,7 +2549,10 @@ def maccms_compat(
     v1.11.0：`vod_play_list` 已按策略过滤（默认剔除 /share/、/play/、.html 这类
     分享页线路），`vod_play_url` 原始串保持不变 —— 采集端若自己解析原始串，
     行为与旧版完全一致；用 vod_play_list 的客户端自动拿到可播线路。
+    v1.15.0：未成年模式下 18+ 源站的 MacCMS 兼容接口同样屏蔽 —— 第三方采集器
+    和播放器内核也会走这条路，漏掉它等于整站屏蔽形同虚设。
     """
+    minor_mode.guard(request, validate_slug(slug))
     src, table = _require_table(slug)
     page, page_size = paging
     play_meta: dict = {}

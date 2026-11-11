@@ -3,7 +3,7 @@
 > **本文档的用途**：把 VodSync 服务作为后端，交由 AI（或 AI 编程助手）开发客户端 App。
 > 文档自包含：只读本文即可完成全部对接，**不需要**阅读服务端源码。
 >
-> 对应服务版本：**v1.13.0** ｜ 文档版本：`2026-11-09` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.15.0** ｜ 文档版本：`2026-11-11` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 **目录**
 
@@ -13,7 +13,7 @@
 | [1](#1-服务能提供什么) | 服务能力概览 |
 | [2](#2-通用约定) | 鉴权 / 响应格式 / 错误码 / 分页 / 编码 |
 | [3](#3-数据模型字段字典) | 数据模型与字段字典 |
-| [4](#4-接口参考) | 47 个接口逐一说明 |
+| [4](#4-接口参考) | 接口逐一说明（54 个编号条目，含 4.27 未成年模式） |
 | [5](#5-状态语义与推荐-ui最容易做错的部分) | 状态语义与推荐 UI（running / syncing / paused / auto_sync） |
 | [6](#6-端到端流程可直接交给-ai-实现) | 端到端流程（观影 App / 管理 App） |
 | [7](#7-客户端代码骨架) | 客户端代码骨架（TS / Kotlin / Flutter / Swift） |
@@ -367,8 +367,12 @@ type PlayLine = {
 | 50 | GET | `/api/v1/auth/tokens` | 鉴权 | **v1.14.0** 已签发 Token 清单（不返回明文） |
 | 51 | POST | `/api/v1/auth/tokens` | 鉴权 | **v1.14.0** 新增具名 Token（`scope=read\|admin`，明文只返回一次） |
 | 52 | DELETE | `/api/v1/auth/tokens/{token_id}` | 鉴权 | **v1.14.0** 吊销具名 Token（id=0 的存量 Token 不可单独吊销） |
+| 53 | POST | `/api/v1/sources/{slug}/adult` | 管理 | **v1.15.0** 设置单源站「是否含 18+ 内容」标记（详见 4.27） |
+| 54 | GET | `/api/v1/minor-mode` | 业务 | **v1.15.0** 未成年模式状态（是否生效 / 18+ 源站清单，详见 4.27） |
 
-> 共 **52 个接口**。标「管理」的主要供管理面板使用，客户端 App 只需一枚 Token（见 2.1）即可调用「数据」「业务」类接口。
+> 本表编号 1~54。服务端实际共 **57 个方法+路径**（`openapi.json` 为准，含
+> `POST /api/v1/auth/logout`、`GET /healthz.capabilities` 等未单列的自解释端点）。
+> 标「管理」的主要供管理面板使用，客户端 App 只需一枚 Token（见 2.1）即可调用「数据」「业务」类接口。
 > 鉴权类中 `/api/v1/auth/login` 与 `/api/v1/auth/state` **免鉴权**，其余需登录会话 cookie（`POST /api/v1/auth/password` 等也可用 Token 访问）。
 
 ---
@@ -381,10 +385,10 @@ type PlayLine = {
 {
   "status": "ok",
   "db": true,
-  "version": "1.14.1",
+  "version": "1.15.0",
   "build": "<commit sha>",
   "capabilities": ["backfill_play_from", "play_line_filter", "error_codes",
-                   "token_scope", "star_tags", "related", "paging_v2", "tag_search"],
+                   "token_scope", "star_tags", "related", "paging_v2", "minor_mode", "tag_search"],
   "time": "2026-11-09T09:07:31.882914"
 }
 ```
@@ -408,6 +412,7 @@ type PlayLine = {
 | `star_tags` | `/star/works`、`/star/related`、`/star/tags/*` 可用 | 详情页明星作品/相关推荐 |
 | `related` | 服务端预计算的相关推荐可用 | 详情页推荐栏 |
 | `paging_v2` | `pagecount` 恒以 `page_size` 为基准，缺省 18 | 按 `pagecount` 判定翻页到底 |
+| `minor_mode` | **v1.15.0**：请求带 `X-Minor-Mode` / `minor_mode` 时服务端屏蔽 18+ 源站 | 有未成年模式开关的 App 才下发该开关；没有则降级为本地隐藏入口（详见 4.27） |
 
 形态：**数组**（推荐）。也接受对象形态 `{"tag_search": true, ...}`（加 `?detail=1` 时返回，
 给人看的，客户端不用）。
@@ -416,8 +421,8 @@ type PlayLine = {
 与 `/healthz` 同级）：
 
 ```json
-{ "status": "ok", "db": true, "version": "1.14.1",
-  "capabilities": ["backfill_play_from", "...", "tag_search"], "time": "..." }
+{ "status": "ok", "db": true, "version": "1.15.0",
+  "capabilities": ["backfill_play_from", "...", "minor_mode", "tag_search"], "time": "..." }
 ```
 
 v1.14.0 文档中的 `/healthz.capabilities` 本意是「/healthz 响应里的 capabilities 字段」
@@ -1519,6 +1524,98 @@ Token 并存：升级后不需要动任何客户端配置。
   `client_version` 参数自报）按 admin 放行；**不自报版本的也放行**（宽进严出），
   避免老 App 整站失效。
 - 回滚：把 `TOKEN_SCOPE_ENFORCE` 设回 `false` 重启，不需要改数据。
+
+### 4.27 未成年模式与 18+ 源站标记（v1.15.0）
+
+#### 数据模型
+
+`sources.is_adult INTEGER DEFAULT 0`：`1` = 该源站含 18+ 内容；`0` / `NULL` / 任意非 1 值
+一律按「否」。存量库由 `database._migrate()` 自动补列（DEFAULT 0），**无需手工 SQL**；
+`refresh_sources()` 的 INSERT 不带该列（走 server_default）、UPDATE 只改 name/status/
+description，标记不会被刷新洗掉。新登记的源站默认「否」。
+
+#### 开关契约（请求级，无状态）
+
+| 项 | 规则 |
+|---|---|
+| 主通道 | 请求头 `X-Minor-Mode: 1`（推荐，App 全局拦截器统一加） |
+| 备通道 | 查询参数 `minor_mode=1`，兼容别名 `minor=1` / `teen_mode=1`（`<img>`、播放器内核等无法加头的场景） |
+| 取值 | 开：`1 / true / on / yes`；关：`0 / false / off / no`（不区分大小写，去空白） |
+| 优先级 | 请求头 > 查询参数（按 `minor_mode` → `minor` → `teen_mode` 顺序取第一个显式值） |
+| 关闭 | 不带上述参数即可；也可显式传 `0` |
+| 服务端强制 | 环境变量 `MINOR_MODE_FORCE=true`（默认 `false`）→ 所有请求强制生效，客户端无法绕过 |
+| 最终判定 | `MINOR_MODE_FORCE OR 请求级开关` |
+
+**开关必须加在每一个 API 请求上**，包括图片/播放地址之外的所有数据接口。只给
+`/source` 加、详情接口不加，等于没屏蔽。
+
+#### 生效范围
+
+| 接口 | 未成年模式下的行为 |
+|---|---|
+| `GET /source`、`GET /api/v1/sources` | 源站清单剔除 18+ 站；每项**新增** `is_adult`（bool），顶层**新增** `minor_mode: true` |
+| `GET /api/v1/sources/{slug}` | 单站详情新增 `is_adult`；18+ 站返回 `404 / 40401` |
+| `GET /api/v1/categories` | 只统计非 18+ 站（缓存 key 含模式状态，开/关不会串味） |
+| `GET /api/v1/videos` | 列表 / `ids=` 批量详情 / `ac=detail` / `?tag=` 全部只查非 18+ 站；显式 `?source=<18+ slug>` 也先剔除 |
+| `GET /api/v1/search` | 只搜非 18+ 站；`source` 点名 18+ 站同样剔除 |
+| `GET /api/v1/videos/{slug}/{vod_id}` | 18+ 站详情（含播放地址）`404 / 40401` |
+| `GET /api/v1/{slug}?ac=list\|detail` | MacCMS 兼容接口 `404 / 40401`（第三方采集器/播放器不能绕过） |
+| `GET /api/v1/related`、`/star/related`、`/star/works` | `404 / 40401`（推荐卡片也是内容入口） |
+| `GET /api/v1/star/tags/untracked` | 显式指定 18+ 站时 `404`；全源诊断模式只返回词频候选，不含视频内容 |
+
+**可见源站为空时返回 `200 + list=[] + total=0`**（不是 404），并带 `minor_mode: true`，
+App 显示「暂无内容」即可。这是刻意的：屏蔽 ≠ 报错，不能让客户端弹「服务异常」。
+
+**不受影响的接口**（管理操作与其它业务）：`/api/v1/stats`、`/logs`、`/pause`、`/resume`、
+`/sync*`、`/sources/refresh`、`/sources/custom*`、`/sources/{slug}/auto-sync`、
+`/sources/{slug}/pause|resume|play-line-policy|adult`、`/star-terms*`、`/auth/*`、
+`/admin/tables*`、`/maintenance/*`、`/tag/status`、`/related/status`、`/star/tags/status`、
+`/healthz*`。管理面板不带开关，因此始终能看到并编辑全部源站。
+
+#### 管理端点
+
+**`POST /api/v1/sources/{slug}/adult`**
+
+| 参数 | 位置 | 说明 |
+|---|---|---|
+| `enabled` | query（必填）或 body | `true/false`、`1/0`、`yes/no`、`on/off`；body 优先；缺失或非法 → `400 / 40001` |
+
+```json
+{ "code": 0, "msg": "源站 XX资源站 已标记为包含 18+ 内容", "slug": "xx", "is_adult": true }
+```
+
+只 UPDATE `sources.is_adult` 一列，不动同步状态/水位线/断点/已入库数据，不触发重同步。
+读路径实时查列、不缓存，**保存后下一次请求立即生效**；源站不存在 → `404 / 40401`。
+
+**`GET /api/v1/minor-mode`**（诊断，只读）
+
+```json
+{ "code": 0, "forced": false, "requested": true, "active": true,
+  "adult_sources": ["xx", "yy"], "adult_count": 2 }
+```
+
+#### 兼容性与回滚
+
+- **不传开关时，服务端一次额外 SQL 都不执行**，所有字段、分页、错误码与 v1.14.1 完全一致；
+  `is_adult`（源站项内）、`minor_mode`（响应顶层）、`minor_mode`（能力清单项）均为纯新增，
+  老客户端按「忽略多余字段」处理，**不需要发版**。
+- 屏蔽只改变读路径的可见集合，**从不删改数据**；关闭开关立即恢复原有展示与访问，
+  不需要恢复备份、不需要重建索引、不需要重新同步。
+- 回滚代码版本：把镜像退回 1.14.1 即可，`is_adult` 多一列对旧代码无害（旧代码按 key 取列）。
+- 回滚标记：`POST /api/v1/sources/{slug}/adult?enabled=false`。
+- 灰度开关：`CAPABILITIES_DISABLE=minor_mode` 可只撤能力声明（接口仍在，客户端不再下发开关）。
+
+#### 已知限制
+
+1. 请求级开关由客户端自报，**技术上可去掉头绕过**；真需要防绕过请设 `MINOR_MODE_FORCE=true`
+   或在网关层统一注入该头。后续可考虑把开关绑定到只读 Token（Token 级强制）。
+   FORCE 是「全局无差别生效」，管理面板的 `GET /api/v1/sources` 也会隐藏 18+ 行；
+   `POST /api/v1/sources/{slug}/adult` 本身不受拦截，FORCE 期间改标记请临时关 FORCE
+   或直接调该端点。默认 `FORCE=false` 时面板不带开关，管理操作完全不受影响。
+2. 分类口径是「源站级」，不是「单条视频级」：标记一个站为 18+ 会屏蔽该站全部视频。
+   这是设计取舍 —— 上游 `vod_tag` 缺失率极高，逐条判定不可靠。
+3. `GET /api/v1/admin/tables/{name}/rows` 是需管理员会话的数据表浏览接口，
+   按「原有管理操作不受影响」保持可见；它不在 App 的普通 Token 可达范围内。
 
 ---
 

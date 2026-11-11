@@ -37,6 +37,13 @@
   「非 2xx + `{code, error, detail}`」（`40001`/`40101`/`40301`/`40401`），不再有
   「200 + code:1 表示失败」的二义形态；Token 拆 `read`/`admin` 两档（默认宽权限放行，
   打开强制前不影响现网）
+- **18+ 源站标记与未成年模式**（v1.15.0）：管理面板「源站管理」可逐站标记「是否含 18+
+  内容」（持久化在 `sources.is_adult`，存量站默认「否」）；源站清单下发 `is_adult`。
+  前端开启未成年模式时（`X-Minor-Mode: 1` 或 `?minor_mode=1`），服务端统一屏蔽 18+
+  源站的展示入口及其列表/详情/搜索/推荐/MacCMS 全部内容，关闭后立即恢复。
+  不传开关时行为与 v1.14.1 完全一致，现有 API 调用无需改动；`MINOR_MODE_FORCE=true`
+  可做服务端强制管控。详见 [CLIENT_API 1.5](docs/CLIENT_API.md) 与
+  [API_SPEC 4.27](docs/API_SPEC_FOR_AI.md)
 
 > 文档入口：[`docs/README.md`](docs/README.md)（按用途索引全部文档）
 

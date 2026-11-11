@@ -48,6 +48,10 @@ def _static() -> list:
         "related",
         # 分页语义固化（B-04）：pagecount 恒以 page_size 为基准，缺省 18
         "paging_v2",
+        # 未成年模式（v1.15.0）：请求带 X-Minor-Mode / ?minor_mode=1 时，
+        # 服务端屏蔽 is_adult=1 的源站及其全部内容；源站清单每项带 is_adult。
+        # 静态项：声明的是「服务端已实现这套过滤」，不依赖库里有没有标记。
+        "minor_mode",
     ]
 
 

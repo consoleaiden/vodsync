@@ -31,8 +31,9 @@ Android 7+ **不信任用户自签 CA**。自签证书不会弹「证书有风�
 
 ## 3. 必须检查的 5 个点
 
-1. **头透传**：`Authorization`、`X-API-Key`、`X-Client-Version` 都要到后端。
-   漏掉 `Authorization` 的表现是全站 401，而不是 403。
+1. **头透传**：`Authorization`、`X-API-Key`、`X-Client-Version`、`X-Minor-Mode` 都要到后端。
+   漏掉 `Authorization` 的表现是全站 401，而不是 403；漏掉 `X-Minor-Mode`（v1.15.0）
+   则是**未成年模式静默失效**——接口照样 200，但 18+ 源站没被屏蔽，最容易被忽略。
 2. **XFF 覆盖而非追加**：反代要用 `$remote_addr` **覆盖** `X-Forwarded-For`。
    客户端自带的 XFF 若被信任，登录失败锁定形同虚设。后端要配合 `TRUST_PROXY=true` 才采信。
 3. **超时**：`proxy_read_timeout ≥ 30s`（样例给 60s）。700+ 集的详情响应在慢网络下会超。
@@ -63,6 +64,11 @@ curl -s https://vodsync.example.com/healthz | python -c "import json,sys;d=json.
 curl -s -o /dev/null -w '%{http_code}\n' \
   -H "Authorization: Bearer $TOKEN" https://vodsync.example.com/api/v1/sources
 # 期望：200
+
+# 5b) 未成年模式开关头确实透传（v1.15.0）
+curl -s -H "Authorization: Bearer $TOKEN" -H "X-Minor-Mode: 1" \
+  https://vodsync.example.com/api/v1/minor-mode
+# 期望：active=true；若是 false 说明反代把头丢了，需补 proxy_set_header
 
 # 6) 大响应不超时（挑一部集数多的影片）
 time curl -s -H "Authorization: Bearer $TOKEN" \

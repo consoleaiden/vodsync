@@ -209,6 +209,18 @@ API_KEY = os.environ.get("API_KEY", "").strip()
 API_SUCCESS_CODE = int(os.environ.get("API_SUCCESS_CODE", "0"))
 
 # ---------------------------------------------------------------------------
+# 未成年模式（v1.15.0）
+#
+# 请求级开关由客户端自报（X-Minor-Mode 头 / ?minor_mode=1），默认关 —— 现有
+# 前端一个字都不用改，行为与升级前完全一致。仅靠客户端自报是可以绕过的（去掉
+# 头即可），所以留一个部署级强制开关：设为 true 后**所有**请求都进入未成年模式，
+# 客户端无法通过不带头绕过，适合家长在服务端统一管控。
+# 两者是 OR 关系；标记编辑端点本身永不拦截。但 FORCE=true 时**面板的源站清单
+# 也会被过滤**（面板同样走 GET /api/v1/sources），此时看不到 18+ 行，需临时
+# 关掉 FORCE 或直接调 POST /api/v1/sources/{slug}/adult 修改标记。
+# ---------------------------------------------------------------------------
+MINOR_MODE_FORCE = os.environ.get("MINOR_MODE_FORCE", "false").lower() == "true"
+
 # 能力清单灰度开关（v1.14.0 / B-10）
 #
 # `/healthz.capabilities` 是客户端「能不能用新参数」的唯一判据。灰度期需要

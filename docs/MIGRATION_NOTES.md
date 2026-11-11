@@ -1,7 +1,7 @@
-# v1.14.0 数据迁移说明（MIGRATION_NOTES）
+# 数据迁移说明（v1.14.0 ~ v1.15.0，MIGRATION_NOTES）
 
-> 对应需求：`BACKEND_UPGRADE_REQUIREMENTS_2026-11-09.md`（B-01 / B-08 / B-09 / B-10 / B-11）
-> 影响面：**新增 3 张表 + 可选 1 列**，不改任何现有列、不重命名任何字段。
+> 对应需求：`BACKEND_UPGRADE_REQUIREMENTS_2026-11-09.md`（B-01 / B-08 / B-09 / B-10 / B-11）与 v1.15.0「源站 18+ 标记与未成年模式」
+> 影响面：**新增 3 张表 + 2 个追加列**，不改任何现有列、不重命名任何字段。
 > 升级方式：拉新镜像重启即可，`init_db()` 会自动建表补列，无需手工 SQL。
 
 ---
@@ -78,6 +78,53 @@ ALTER TABLE tag_index_state ADD COLUMN processed INTEGER DEFAULT 0;
   查看，或直接点面板「重建索引」（幂等，已完成站也会重扫一遍，耗时按数据量）。
 
 回滚到 v1.14.0 不需要删列（旧代码不读 `processed`，多一列无害）。
+
+## 2.2 v1.15.0 追加列：`sources.is_adult`（2026-11-11）
+
+给每个源站持久化「是否包含 18+ 视频内容」的标记。**自动迁移**，无需手工执行：
+
+```sql
+ALTER TABLE sources ADD COLUMN is_adult INTEGER DEFAULT 0;
+```
+
+| 值 | 含义 |
+|---|---|
+| `0` / `NULL` / 任意非 1 值 | 不含 18+（**未设置的存量源站一律按此处理**） |
+| `1` | 含 18+，未成年模式下整站屏蔽 |
+
+兼容要点：
+
+- 存量行由 `DEFAULT 0` 填 0；读侧一律 `COALESCE(is_adult, 0) == 1` 判定，
+  即使手工塞了 NULL 也不会误屏蔽。
+- 新登记的源站（`refresh_sources()` INSERT / 面板自定义源站）不显式带这列，
+  走 `server_default='0'`，同样是「否」。
+- `refresh_sources()` 对已存在源站的 UPDATE 只写 `name` / `status` / `description`，
+  不会把用户设的标记洗掉；`update_custom_source()` 按字段白名单更新，同理。
+- 旧版本镜像连新库不会报错（多一列不影响 `select(sources)` 按 key 取值）；
+  **回滚代码不需要删列**。
+- 标记只影响读路径的可见集合，**不删改任何数据**：关闭未成年模式立即恢复，
+  不需要重建索引或重新同步。
+
+面板「源站管理」新增「18+ 内容」下拉列（选择即保存），等价命令：
+
+```bash
+curl -X POST -H "Authorization: Bearer <admin-token>" \
+  "http://<host>:8181/api/v1/sources/<slug>/adult?enabled=true"
+curl -H "Authorization: Bearer <admin-token>" \
+  "http://<host>:8181/api/v1/minor-mode"
+# 期望：{"code":0,"adult_sources":["<slug>"],"adult_count":1,...}
+```
+
+升级自检：
+
+```bash
+curl -s http://<host>:8181/healthz | grep -o '"version":"[^"]*"'   # 期望 1.15.0
+# capabilities 里应含 minor_mode
+# 不带 X-Minor-Mode 调 /source，list 长度应与升级前一致（现有调用零影响）
+# 带 -H "X-Minor-Mode: 1" 调 /source，list 不应含被标记的 slug
+```
+
+服务端强制管控（可选，默认关）：compose 里设 `MINOR_MODE_FORCE: "true"`。
 
 ## 3. 回填（把存量数据灌进 `video_tags`）
 

@@ -14,7 +14,7 @@
 services:
   vodsync:
     # 官方发布镜像（GitHub Actions 自动构建，双架构 amd64/arm64，公开可拉取）
-    # tag 说明（v1.9.3 起每次构建都带版本号；当前版本 1.14.0）：
+    # tag 说明（v1.9.3 起每次构建都带版本号；当前版本 1.15.0）：
     #   latest          最新（生产默认）
     #   1.14.0          版本号；同一版本多次构建时指向最新那次
     #   1.14.0-<sha7>   版本 + 提交，不可变 —— **回滚就用这个**
@@ -80,6 +80,11 @@ services:
       API_PAGE_SIZE_DEFAULT: "18"          # 每页条数默认值，与客户端固定传值一致（上限见 API_PAGE_SIZE_MAX）
       # 成功响应的 code（契约值为 0；设成 1 可退回 v1.13 的 MacCMS 风格，灰度回滚用）
       API_SUCCESS_CODE: "0"
+      # ---- 未成年模式（v1.15.0）----
+      # 默认 false：只有客户端请求带 X-Minor-Mode: 1 / ?minor_mode=1 时才屏蔽
+      #   sources.is_adult=1 的源站；不带开关的现有调用行为完全不变。
+      # 设 true：服务端对所有请求强制生效，客户端无法通过不带头绕过（家长统一管控）。
+      MINOR_MODE_FORCE: "false"
       # ---- 能力清单灰度（v1.14.0）----
       # 单独关掉某项能力而不改代码：CAPABILITIES_DISABLE=tag_search
       # CAPABILITIES_DISABLE: ""

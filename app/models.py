@@ -92,6 +92,12 @@ sources = Table(
     # 为什么按源站配：只有「第 1 条线路恒为 /share/ 分享页」这类站点需要过滤，
     # 一刀切的全局策略会误伤本来正常的站。
     Column("play_line_policy", String(16), default="inherit", server_default="inherit"),
+    # ---- 18+ 内容标记（v1.15.0）----
+    # 1 = 该源站包含 18+ 视频，未成年模式下整站屏蔽；0 / NULL = 不含（未设置按否）。
+    # 存 Integer 而不是 Boolean：与 enabled / paused / auto_sync 同口径，且 SQLite
+    # 测试库与 PG 都能用同一套 COALESCE(is_adult, 0) 判定，不依赖方言布尔类型。
+    # 存量库由 database._migrate() 补列（DEFAULT 0），刷新源站列表不会覆盖此列。
+    Column("is_adult", Integer, default=0, server_default="0"),
     Column("last_sync_at", DateTime),                     # 最近一次成功同步时间
     Column("created_at", DateTime, server_default=func.now()),
     Column("updated_at", DateTime, server_default=func.now(), onupdate=func.now()),

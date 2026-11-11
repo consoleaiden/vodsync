@@ -155,6 +155,9 @@ def _migrate():
         # 标签回填的已处理条数（v1.14.1）：进度分母是行数，不能拿 vod_id 水位
         # （cursor）当条数算，否则上游 ID 稀疏时会算出 147% 这种进度
         ("tag_index_state", "processed", "INTEGER DEFAULT 0"),
+        # 18+ 内容标记（v1.15.0）：存量源站一律补 0（=不含 18+），
+        # 读侧再用 COALESCE 兜住 NULL，保证「未设置按否」。
+        ("sources", "is_adult", "INTEGER DEFAULT 0"),
     ]
     insp = inspect(engine)
     existing_tables = set(insp.get_table_names())
