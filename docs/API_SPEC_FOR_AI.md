@@ -31,7 +31,7 @@
 2. 所有响应为 JSON，编码 UTF-8；业务成功标记为 `code: 1`。
 3. 失败是 **HTTP 状态码 + `detail`**，不是 `code: 0`。客户端必须按状态码分支，不要只判断 `code`。
 4. `source` 参数是**源站标识 slug**（如 `jkun`、`s361c088099`），**不是**站点名。slug 只能匹配 `^[a-z0-9_]{1,64}$`；中文站名在服务端被哈希成 `s` + 10 位十六进制。
-5. 列表接口的分页参数统一为 `page`（从 1 开始）与 `page_size`（默认 30，上限 100，可用 `API_PAGE_SIZE_DEFAULT` / `API_PAGE_SIZE_MAX` 调整；`/api/v1/search` 与列表保持一致）。**超过上限会直接 422**，不是自动截断——客户端请按上限内取值，三列宫格推荐 30（10 行 × 3 列）。
+5. 列表接口的分页参数统一为 `page`（从 1 开始）与 `page_size`（默认 30，上限 100，可用 `API_PAGE_SIZE_DEFAULT` / `API_PAGE_SIZE_MAX` 调整；`/api/v1/search` 与列表保持一致）。**超过上限返回 `400 / 40001`**（v1.14.0 起参数校验由 422 统一改 400，见 3.1），不是自动截断——客户端请按上限内取值，三列宫格推荐 30（10 行 × 3 列）。
 6. **一个 URL 只能有一个 `?`**。写成 `?a=1&?b=2` 时第二个键会变成 `?b`（服务端对数据接口做了兼容，但不要依赖）。
 7. 播放地址以 `vod_play_list` 结构化字段为准（v1.11.0 起已过滤掉 `/share/` 这类分享页线路），`vod_play_url` 是上游原始串，仅作兜底；需要未过滤版本时加 `play_raw=1`。
 8. 管理类接口（触发同步、暂停、开关）都是**异步受理**：POST 立即返回，进度靠轮询 `GET /api/v1/sources` 得到。
@@ -1592,7 +1592,7 @@ App 显示「暂无内容」即可。这是刻意的：屏蔽 ≠ 报错，不�
 
 | 参数 | 位置 | 说明 |
 |---|---|---|
-| `enabled` | query（必填） | `true` = 标记为含 18+，`false` = 取消标记；缺失 → `422` |
+| `enabled` | query（必填） | `true` = 标记为含 18+，`false` = 取消标记；缺失 → `400 / 40001`（`field=enabled`） |
 | `slugs` | query | 逗号分隔的 slug 列表；`all` 或留空 = 全部源站 |
 
 一次 UPDATE 改完，效果与逐站调单站端点完全一致（同样只动 `is_adult`、同样清分类缓存）。
@@ -1907,8 +1907,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 | 9 | 暂停按钮点了没反应 | 用 `syncing` 判断"正在跑" | 改用 `running`；仅 `running=true` 时展示暂停 |
 | 10 | 某站不参与定时同步 | `auto_sync=false` 或 `paused=true` | 分别调用 auto-sync 开启 / resume 继续 |
 | 11 | 搜索 `total` 与翻页对不上 | `total` 是候选上限内的近似值 | 以 `pagecount` 为准 |
-| 12 | `page_size=500` 报 422 | 服务端上限 100，超限直接拒绝 | 改用 `page_size=100` 分页；上限可由部署方用 `API_PAGE_SIZE_MAX` 调整 |
-| 13 | 422 且 `detail` 是数组 | FastAPI 参数校验失败 | 按 `detail[0].loc` 定位参数名 |
+| 12 | `page_size=500` 报 400 | 服务端上限 100，超限直接拒绝（v1.14.0 起参数校验返回 400，不再 422） | 改用 `page_size=100` 分页；上限可由部署方用 `API_PAGE_SIZE_MAX` 调整 |
+| 13 | `400` + `error=bad_request` 且带 `field` | 参数校验失败（v1.14.0 起把 FastAPI 的 422 统一成 400，`detail` 里指出哪个字段错了） | 按响应里的 `field` 定位参数名（老客户端若仍判断 422，改成判断非 2xx 更稳） |
 | 14 | 管理操作返回成功但没进度 | 异步受理 | 轮询 `/api/v1/sources` 的 `running` / `progress` |
 | 15 | 某源站一直同步失败 | 直连被墙/被风控 | 服务端会自动切中转代理；查看 `/api/v1/stats` 的 `proxy` 段确认是否走代理 |
 | 16 | 未同步的站显示「已完成」 | v1.4.0 前的进度口径 bug | 升级后按 `synced` 字段判断：`false` 一律显示「未同步」 |
