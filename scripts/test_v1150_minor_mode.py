@@ -107,7 +107,7 @@ def main():
 
     print("\nA. 数据兼容与版本")
     before = setup()
-    check("A1 版本号 1.15.0", __version__ == "1.15.0", __version__)
+    check("A1 版本号 1.15.1", __version__ == "1.15.1", __version__)
     check("A2 capabilities 声明 minor_mode",
           "minor_mode" in caps.snapshot(db_ok=True), caps.snapshot(db_ok=True))
     check("A3 sources 表存在 is_adult 列", "is_adult" in {c.name for c in models.sources.c}, "")
@@ -355,9 +355,10 @@ def main():
     for p in ("openapi.json", os.path.join("docs", "openapi.json")):
         spec = json.load(open(os.path.join(ROOT, p), encoding="utf-8"))
         check(f"J2 {p} 版本与新增端点",
-              spec["info"]["version"] == "1.15.0"
+              spec["info"]["version"] == "1.15.1"
               and "/api/v1/minor-mode" in spec["paths"]
-              and "/api/v1/sources/{slug}/adult" in spec["paths"], "")
+              and "/api/v1/sources/{slug}/adult" in spec["paths"]
+              and "/api/v1/sources/adult" in spec["paths"], "")
     cdoc = open(os.path.join(ROOT, "docs", "CLIENT_API.md"), encoding="utf-8").read()
     adoc = open(os.path.join(ROOT, "docs", "API_SPEC_FOR_AI.md"), encoding="utf-8").read()
     check("J3 客户端文档含 X-Minor-Mode 契约",
@@ -365,6 +366,51 @@ def main():
     nginx = open(os.path.join(ROOT, "deploy", "nginx-vodsync.conf"), encoding="utf-8").read()
     check("J4 反代样例显式透传 X-Minor-Mode",
           "proxy_set_header X-Minor-Mode" in nginx and "$http_x_minor_mode" in nginx, "")
+
+    print("\nK. 批量 18+ 标记（面板多选）")
+    r = client.post("/api/v1/sources/adult?enabled=true&slugs=safe_a,safe_b")
+    check("K1 批量标记 200 且 updated=2",
+          r.status_code == 200 and r.json().get("updated") == 2, r.text[:200])
+    _, js = jget(client, "/api/v1/minor-mode")
+    check("K2 批量生效：两站都进 adult_sources",
+          set(js.get("adult_sources") or []) == {"safe_a", "safe_b", "adult_x"},
+          js.get("adult_sources"))
+    _, js = jget(client, "/api/v1/sources", headers=MINOR)
+    check("K3 三站全标记后未成年模式列表为空",
+          js.get("list") == [], js.get("list"))
+
+    r = client.post("/api/v1/sources/adult?enabled=false&slugs=safe_a,safe_b")
+    check("K4 批量取消 200 且 updated=2",
+          r.status_code == 200 and r.json().get("updated") == 2, r.text[:200])
+    _, js = jget(client, "/api/v1/sources", headers=MINOR)
+    check("K5 取消后立刻恢复可见",
+          sorted(x["slug"] for x in js["list"]) == ["safe_a", "safe_b"], js.get("list"))
+
+    r = client.post("/api/v1/sources/adult?enabled=true&slugs=safe_a,nope")
+    _, js = jget(client, "/api/v1/minor-mode")
+    check("K6 含不存在 slug 时整批拒绝且不改任何数据",
+          r.status_code == 404 and "safe_a" not in (js.get("adult_sources") or []),
+          (r.status_code, js.get("adult_sources")))
+
+    r = client.post("/api/v1/sources/adult?enabled=true&slugs=all")
+    _, js = jget(client, "/api/v1/minor-mode")
+    check("K7 slugs=all 全量标记",
+          r.status_code == 200 and len(js.get("adult_sources") or []) == 3,
+          (r.status_code, js.get("adult_sources")))
+    client.post("/api/v1/sources/adult?enabled=false&slugs=all")
+    _, js = jget(client, "/api/v1/minor-mode")
+    check("K8 slugs=all 取消后无残留", js.get("adult_sources") == [], js.get("adult_sources"))
+    check("K9 缺 enabled 返回 422",
+          client.post("/api/v1/sources/adult?slugs=safe_a").status_code in (400, 422), "")
+
+    html = open(os.path.join(ROOT, "app", "web", "index.html"), encoding="utf-8").read()
+    check("K10 面板有批量标记按钮且走批量端点",
+          "btnAdultSelOn" in html and "btnAdultSelOff" in html
+          and "/api/v1/sources/adult?enabled=" in html, "")
+    check("K11 轮询在表格操作期间跳过重渲染",
+          "function sourcesBusy()" in html
+          and "if (!force && sourcesBusy()) return;" in html
+          and "loadSources(true)" in html, "")
 
     print(f"\n==== v1.15.0 未成年模式测试: {passed} passed, {failed} failed ====")
     return 1 if failed else 0

@@ -5,7 +5,7 @@
 > 本文档面向「调用 VodSync 服务的客户端 App」（原生 App / H5 / 小程序 / 播放器 / 采集器均可）。
 > 目标：一个 AI 客户端开发者（或 AI 编程助手）拿这份文档即可完成全部对接，无需阅读服务端代码。
 >
-> 对应服务版本：**v1.15.0** ｜ 文档版本：`2026-11-11` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.15.1** ｜ 文档版本：`2026-11-11` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 ---
 
@@ -99,7 +99,8 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 ### 1.5 未成年模式与 18+ 源站标记（v1.15.0）
 
 服务端为每个源站持久化一个「是否包含 18+ 视频内容」的标记，管理面板「源站管理」表格
-的 **18+ 内容** 列可逐站查看 / 修改（选择即保存）。**存量源站未设置一律按「否」**。
+的 **18+ 内容** 列可逐站查看 / 修改（选择即保存）；勾选多行后用 **标记所选 18+** /
+**取消所选 18+** 批量改（走 `POST /api/v1/sources/adult`，一次请求）。**存量源站未设置一律按「否」**。
 
 **能力探测**：`GET /healthz`（或 `/healthz.capabilities`）的 `capabilities` 数组含
 `minor_mode` 才表示服务端已支持。老版本没有这项，前端应降级为「只在本地隐藏入口」。
@@ -188,6 +189,7 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 | POST | `/api/v1/sources/{slug}/resume` | 继续单个源站（按 auto 续跑） |
 | POST | `/api/v1/sources/{slug}/auto-sync?enabled=` | 单源站自动同步开关（是否参与定时任务/全站同步） |
 | POST | `/api/v1/sources/{slug}/adult?enabled=` | **v1.15.0** 单源站「是否含 18+ 内容」标记（面板源站管理表格调用） |
+| POST | `/api/v1/sources/adult?enabled=&slugs=` | **v1.15.1** 批量设置 18+ 标记（`slugs=all` 或逗号分隔；面板勾选多行后一次改完） |
 | POST | `/api/v1/sources/auto-sync?enabled=&slugs=` | 批量自动同步开关（`slugs=all` 或逗号分隔列表） |
 | GET | `/api/v1/logs?limit=50` | 最近同步日志（跨源站） |
 | POST | `/api/v1/maintenance/recount` | 条数校准（异步执行） |

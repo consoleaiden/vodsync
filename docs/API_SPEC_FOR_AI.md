@@ -3,7 +3,7 @@
 > **本文档的用途**：把 VodSync 服务作为后端，交由 AI（或 AI 编程助手）开发客户端 App。
 > 文档自包含：只读本文即可完成全部对接，**不需要**阅读服务端源码。
 >
-> 对应服务版本：**v1.15.0** ｜ 文档版本：`2026-11-11` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.15.1** ｜ 文档版本：`2026-11-11` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 **目录**
 
@@ -369,8 +369,9 @@ type PlayLine = {
 | 52 | DELETE | `/api/v1/auth/tokens/{token_id}` | 鉴权 | **v1.14.0** 吊销具名 Token（id=0 的存量 Token 不可单独吊销） |
 | 53 | POST | `/api/v1/sources/{slug}/adult` | 管理 | **v1.15.0** 设置单源站「是否含 18+ 内容」标记（详见 4.27） |
 | 54 | GET | `/api/v1/minor-mode` | 业务 | **v1.15.0** 未成年模式状态（是否生效 / 18+ 源站清单，详见 4.27） |
+| 55 | POST | `/api/v1/sources/adult` | 管理 | **v1.15.1** 批量设置多站 18+ 标记（面板多选一次改完，详见 4.27） |
 
-> 本表编号 1~54。服务端实际共 **57 个方法+路径**（`openapi.json` 为准，含
+> 本表编号 1~55。服务端实际共 **58 个方法+路径**（`openapi.json` 为准，含
 > `POST /api/v1/auth/logout`、`GET /healthz.capabilities` 等未单列的自解释端点）。
 > 标「管理」的主要供管理面板使用，客户端 App 只需一枚 Token（见 2.1）即可调用「数据」「业务」类接口。
 > 鉴权类中 `/api/v1/auth/login` 与 `/api/v1/auth/state` **免鉴权**，其余需登录会话 cookie（`POST /api/v1/auth/password` 等也可用 Token 访问）。
@@ -385,7 +386,7 @@ type PlayLine = {
 {
   "status": "ok",
   "db": true,
-  "version": "1.15.0",
+  "version": "1.15.1",
   "build": "<commit sha>",
   "capabilities": ["backfill_play_from", "play_line_filter", "error_codes",
                    "token_scope", "star_tags", "related", "paging_v2", "minor_mode", "tag_search"],
@@ -421,7 +422,7 @@ type PlayLine = {
 与 `/healthz` 同级）：
 
 ```json
-{ "status": "ok", "db": true, "version": "1.15.0",
+{ "status": "ok", "db": true, "version": "1.15.1",
   "capabilities": ["backfill_play_from", "...", "minor_mode", "tag_search"], "time": "..." }
 ```
 
@@ -1568,7 +1569,7 @@ App 显示「暂无内容」即可。这是刻意的：屏蔽 ≠ 报错，不�
 
 **不受影响的接口**（管理操作与其它业务）：`/api/v1/stats`、`/logs`、`/pause`、`/resume`、
 `/sync*`、`/sources/refresh`、`/sources/custom*`、`/sources/{slug}/auto-sync`、
-`/sources/{slug}/pause|resume|play-line-policy|adult`、`/star-terms*`、`/auth/*`、
+`/sources/{slug}/pause|resume|play-line-policy|adult`、`/sources/adult`（批量）、`/star-terms*`、`/auth/*`、
 `/admin/tables*`、`/maintenance/*`、`/tag/status`、`/related/status`、`/star/tags/status`、
 `/healthz*`。管理面板不带开关，因此始终能看到并编辑全部源站。
 
@@ -1586,6 +1587,21 @@ App 显示「暂无内容」即可。这是刻意的：屏蔽 ≠ 报错，不�
 
 只 UPDATE `sources.is_adult` 一列，不动同步状态/水位线/断点/已入库数据，不触发重同步。
 读路径实时查列、不缓存，**保存后下一次请求立即生效**；源站不存在 → `404 / 40401`。
+
+**`POST /api/v1/sources/adult`**（**v1.15.1** 批量，面板多选一次改完）
+
+| 参数 | 位置 | 说明 |
+|---|---|---|
+| `enabled` | query（必填） | `true` = 标记为含 18+，`false` = 取消标记；缺失 → `422` |
+| `slugs` | query | 逗号分隔的 slug 列表；`all` 或留空 = 全部源站 |
+
+一次 UPDATE 改完，效果与逐站调单站端点完全一致（同样只动 `is_adult`、同样清分类缓存）。
+**只要有一个 slug 不存在就整批拒绝**（`404 / 40401`，不做部分成功）—— 避免面板里勾选
+的行和实际改动对不上。返回的 `updated` 是实际影响行数。
+
+```json
+{ "code": 0, "msg": "已将 13 个源站标记为包含 18+ 内容", "updated": 13, "is_adult": true }
+```
 
 **`GET /api/v1/minor-mode`**（诊断，只读）
 

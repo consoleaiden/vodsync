@@ -42,7 +42,8 @@
   前端开启未成年模式时（`X-Minor-Mode: 1` 或 `?minor_mode=1`），服务端统一屏蔽 18+
   源站的展示入口及其列表/详情/搜索/推荐/MacCMS 全部内容，关闭后立即恢复。
   不传开关时行为与 v1.14.1 完全一致，现有 API 调用无需改动；`MINOR_MODE_FORCE=true`
-  可做服务端强制管控。详见 [CLIENT_API 1.5](docs/CLIENT_API.md) 与
+  可做服务端强制管控。v1.15.1 起面板可勾选多行批量标记/取消（`POST /api/v1/sources/adult`），
+  且 5 秒轮询不再打断正在操作的表格。详见 [CLIENT_API 1.5](docs/CLIENT_API.md) 与
   [API_SPEC 4.27](docs/API_SPEC_FOR_AI.md)
 
 > 文档入口：[`docs/README.md`](docs/README.md)（按用途索引全部文档）

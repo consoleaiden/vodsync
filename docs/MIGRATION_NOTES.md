@@ -118,7 +118,7 @@ curl -H "Authorization: Bearer <admin-token>" \
 升级自检：
 
 ```bash
-curl -s http://<host>:8181/healthz | grep -o '"version":"[^"]*"'   # 期望 1.15.0
+curl -s http://<host>:8181/healthz | grep -o '"version":"[^"]*"'   # 期望 1.15.1
 # capabilities 里应含 minor_mode
 # 不带 X-Minor-Mode 调 /source，list 长度应与升级前一致（现有调用零影响）
 # 带 -H "X-Minor-Mode: 1" 调 /source，list 不应含被标记的 slug

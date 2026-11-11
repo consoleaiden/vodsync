@@ -920,6 +920,68 @@ def set_source_adult(
     }
 
 
+@router.post("/api/v1/sources/adult", summary="批量设置源站 18+ 内容标记")
+def bulk_set_source_adult(
+    enabled: bool = Query(..., description="true=标记为包含 18+，false=标记为不包含"),
+    slugs: str = Query("all", description="逗号分隔的源站 slug；all 或留空=全部源站"),
+):
+    """
+    批量把源站的「是否包含 18+ 视频内容」置为同一个值（`sources.is_adult`）。
+
+    与单站端点语义完全一致，只是把多次往返合成一次；用途是管理面板勾选多行后
+    一次改完。**只改这一列**，不动同步状态/水位线/断点/已入库数据，也无需重新同步。
+
+    用法：
+      POST /api/v1/sources/adult?enabled=true&slugs=jkun,t1,bfzytv   勾选的站标记为 18+
+      POST /api/v1/sources/adult?enabled=false&slugs=jkun,t1        取消标记
+      POST /api/v1/sources/adult?enabled=false&slugs=all            全部改回「否」
+
+    显式点名的 slug 里只要有一个不存在就整批拒绝（400/404），不做「部分成功」——
+    避免面板里勾选的行和实际改动对不上。
+    """
+    raw = (slugs or "").strip()
+    slug_list = None
+    if raw and raw.lower() not in ("all", "*"):
+        slug_list = [s.strip() for s in raw.split(",") if s.strip()] or None
+        for s in slug_list or []:
+            validate_slug(s)
+
+    if slug_list:
+        with database.engine.connect() as conn:
+            known = {
+                r[0] for r in conn.execute(
+                    select(sources.c.slug).where(sources.c.slug.in_(slug_list))
+                ).all()
+            }
+        missing = [s for s in slug_list if s not in known]
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail=f"源站不存在: {', '.join(missing[:5])}"
+                       + ("…" if len(missing) > 5 else ""),
+            )
+
+    flag = 1 if enabled else 0
+    with database.write_txn() as conn:
+        stmt = sources.update().values(is_adult=flag)
+        if slug_list:
+            stmt = stmt.where(sources.c.slug.in_(slug_list))
+        n = conn.execute(stmt).rowcount or 0
+
+    # 同单站端点：分类清单有进程内缓存，标记变了必须清一次
+    reset_categories_cache()
+    log.info(
+        "[未成年模式] 批量 18+ 标记 = %s，影响 %s 个源站（%s）",
+        enabled, n, "all" if not slug_list else f"{len(slug_list)} 个指定源站",
+    )
+    return {
+        "code": SUCCESS_CODE,
+        "msg": f"已将 {n} 个源站标记为{'包含' if enabled else '不包含'} 18+ 内容",
+        "updated": n,
+        "is_adult": enabled,
+    }
+
+
 def _tag_stats_brief() -> dict:
     """
     概览用的标签索引摘要（v1.14.0 / B-01）。

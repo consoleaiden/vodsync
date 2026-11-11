@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.15.0"
+    "version": "1.15.1"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -536,6 +536,58 @@
             }
           }
         },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sources/adult": {
+      "post": {
+        "summary": "批量设置源站 18+ 内容标记",
+        "description": "批量把源站的「是否包含 18+ 视频内容」置为同一个值（`sources.is_adult`）。\n\n与单站端点语义完全一致，只是把多次往返合成一次；用途是管理面板勾选多行后\n一次改完。**只改这一列**，不动同步状态/水位线/断点/已入库数据，也无需重新同步。\n\n用法：\n  POST /api/v1/sources/adult?enabled=true&slugs=jkun,t1,bfzytv   勾选的站标记为 18+\n  POST /api/v1/sources/adult?enabled=false&slugs=jkun,t1        取消标记\n  POST /api/v1/sources/adult?enabled=false&slugs=all            全部改回「否」\n\n显式点名的 slug 里只要有一个不存在就整批拒绝（400/404），不做「部分成功」——\n避免面板里勾选的行和实际改动对不上。",
+        "operationId": "bulk_set_source_adult_api_v1_sources_adult_post",
+        "parameters": [
+          {
+            "name": "enabled",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "boolean",
+              "description": "true=标记为包含 18+，false=标记为不包含",
+              "title": "Enabled"
+            },
+            "description": "true=标记为包含 18+，false=标记为不包含"
+          },
+          {
+            "name": "slugs",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "逗号分隔的源站 slug；all 或留空=全部源站",
+              "default": "all",
+              "title": "Slugs"
+            },
+            "description": "逗号分隔的源站 slug；all 或留空=全部源站"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",

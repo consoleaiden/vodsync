@@ -390,6 +390,8 @@
       <button class="sm warn" id="btnAutoAllOff" title="所有源站退出定时自动同步（手动同步不受影响）">全部暂停自动同步</button>
       <button class="sm" id="btnAutoSelOn" disabled title="仅对勾选的源站开启自动同步">开启所选</button>
       <button class="sm warn" id="btnAutoSelOff" disabled title="仅对勾选的源站暂停自动同步">暂停所选</button>
+      <button class="sm" id="btnAdultSelOn" disabled title="把勾选的源站标记为「包含 18+ 内容」；前端开启未成年模式时这些站整站被屏蔽（含正常影视）">标记所选 18+</button>
+      <button class="sm" id="btnAdultSelOff" disabled title="把勾选的源站改回「不包含 18+ 内容」，未成年模式下立即恢复展示">取消所选 18+</button>
       <button class="sm" id="sourcesToggle" title="折叠 / 展开本区块（折叠时不参与 5 秒轮询，降低后端压力）">展开 ▾</button>
     </div>
     <div id="sourcesWrap" style="display:none">
@@ -555,11 +557,23 @@ function updateBulkButtons(autoCount) {
   const n = selectedSlugs.size;
   $("#btnAutoSelOn").disabled = n === 0;
   $("#btnAutoSelOff").disabled = n === 0;
+  $("#btnAdultSelOn").disabled = n === 0;
+  $("#btnAdultSelOff").disabled = n === 0;
   const base = `共 ${currentSlugs.length} 个源站 · 自动同步 ${autoCount ?? "…"} 个`;
   $("#sourcesHint").textContent = n ? `${base} · 已选 ${n} 个` : base;
 }
 
-async function loadSources() {
+// 5 秒轮询会用 innerHTML 重建整张源站表：用户正在操作某个下拉/输入框时会被
+// 打断——展开的下拉收起、刚选的值被冲掉。焦点落在表格内的表单控件上就跳过
+// 这一轮；用户自己的显式操作（保存成功、批量、勾选）用 loadSources(true) 强制刷新。
+function sourcesBusy() {
+  const ae = document.activeElement;
+  if (!ae || !/^(SELECT|INPUT|TEXTAREA)$/.test(ae.tagName)) return false;
+  return $("#sourcesBody").contains(ae);
+}
+
+async function loadSources(force = false) {
+  if (!force && sourcesBusy()) return;
   try {
     const data = await api("/api/v1/sources");
     const list = data.list || [];
@@ -768,7 +782,7 @@ $("#sourcesBody").addEventListener("change", async (ev) => {
   if (t.id === "selAll") {
     if (t.checked) currentSlugs.forEach((s) => selectedSlugs.add(s));
     else selectedSlugs.clear();
-    loadSources();
+    loadSources(true);
     return;
   }
   // 单行勾选（多选）
@@ -792,7 +806,7 @@ $("#sourcesBody").addEventListener("change", async (ev) => {
       toast("设置失败：" + e.message, true);
     } finally {
       delete pendingAuto[slug];
-      loadSources();
+      loadSources(true);
     }
     return;
   }
@@ -808,7 +822,7 @@ $("#sourcesBody").addEventListener("change", async (ev) => {
     } catch (e) {
       toast("线路策略设置失败：" + e.message, true);
     } finally {
-      loadSources();
+      loadSources(true);
     }
     return;
   }
@@ -825,7 +839,7 @@ $("#sourcesBody").addEventListener("change", async (ev) => {
     } catch (e) {
       toast("18+ 标记保存失败：" + e.message, true);
     } finally {
-      loadSources();
+      loadSources(true);
     }
   }
 });
@@ -838,7 +852,7 @@ async function bulkAutoSync(enabled, slugs) {
     const res = await api(`/api/v1/sources/auto-sync?enabled=${enabled}&slugs=${encodeURIComponent(param)}`, { method: "POST" });
     toast(res.msg || "已更新");
     selectedSlugs.clear();
-    loadSources();
+    loadSources(true);
   } catch (e) { toast("批量设置失败：" + e.message, true); }
 }
 
@@ -846,6 +860,29 @@ $("#btnAutoAllOn").onclick = () => bulkAutoSync(true, "all");
 $("#btnAutoAllOff").onclick = () => bulkAutoSync(false, "all");
 $("#btnAutoSelOn").onclick = () => { if (selectedSlugs.size) bulkAutoSync(true, [...selectedSlugs]); };
 $("#btnAutoSelOff").onclick = () => { if (selectedSlugs.size) bulkAutoSync(false, [...selectedSlugs]); };
+
+// 批量设置 18+ 标记：勾选多行一次改完（走单次请求的批量端点，不是循环单站）。
+// 标记为「是」会整站屏蔽，所以只在「标记」方向要求二次确认；取消标记不必确认。
+async function bulkAdultMark(enabled) {
+  if (!selectedSlugs.size) return;
+  const slugs = [...selectedSlugs];
+  if (enabled && !window.confirm(
+    `确认把选中的 ${slugs.length} 个源站标记为「包含 18+ 内容」？\n\n` +
+    `前端开启未成年模式时，这些源站及其全部视频内容会被屏蔽（含其中的正常影视）；\n` +
+    `关闭未成年模式后立即恢复。`
+  )) return;
+  try {
+    const res = await api(
+      `/api/v1/sources/adult?enabled=${enabled}&slugs=${encodeURIComponent(slugs.join(","))}`,
+      { method: "POST" }
+    );
+    toast(res.msg || "已更新");
+    selectedSlugs.clear();
+    await loadSources(true);
+  } catch (e) { toast("批量标记失败：" + e.message, true); }
+}
+$("#btnAdultSelOn").onclick = () => bulkAdultMark(true);
+$("#btnAdultSelOff").onclick = () => bulkAdultMark(false);
 
 async function showSourceLogs(slug) {
   try {
