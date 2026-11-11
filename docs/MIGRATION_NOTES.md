@@ -158,6 +158,14 @@ docker exec vodsync python -c "from app import tags; print(tags.sync_source_tags
 > （`STAR_TAG_NIGHTLY_BUDGET` 默认每晚只重建 2 个站）或让上游补标签，
 > **重扫索引不会改变它**。
 
+### 标签倒排与主表的一致性（v1.14.1 热修，2026-11-11）
+
+`upsert_batch` 现在按「主表最终 `vod_tag`」维护倒排：上游 `vod_tag` 为空时
+沿用主表已有的明星Tag，不再把 `video_tags` 里该视频的行先删后不插。
+`star_tags` 夜间回填、字段回填、日常全量/增量同步三条路径因此不会再互相
+洗掉标签。若升级前已出现覆盖率下降，执行一次 `tags.sync_all_sources(clean=True)`
+即可对齐（命令见 3.1 节）。
+
 ### 回填期间的行为
 
 - `/healthz` **不声明** `tag_search`（客户端继续用名称模糊检索，无需回滚）；

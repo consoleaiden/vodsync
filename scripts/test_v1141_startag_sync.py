@@ -182,6 +182,47 @@ def main():
     check("D5 ready() 未被修补动作破坏",
           tags.ready() is True, tags.ready())
 
+    # ---------------- E. 全量/增量同步不得洗掉明星标签倒排 ----------------
+    print("\nE. upsert_batch 与明星标签倒排的一致性")
+    from app import syncer
+
+    src_sync = open(os.path.join(ROOT, "app", "syncer.py"), encoding="utf-8").read()
+    check("E1 源码契约：构造 index_payload 而非直传上游 rows",
+          "index_payload" in src_sync and "existing_tags" in src_sync, "")
+    check("E2 源码契约：倒排与主表同 coalesce 规则",
+          'r.get("vod_tag") or existing_tags.get(r["vod_id"], "")' in src_sync, "")
+
+    config.TAG_INDEX_ON_SYNC = True
+    star_tags._flush_tag_updates(slug, table, [
+        {"vid": 1, "tag": "明星A,明星B"},
+        {"vid": 2, "tag": "明星A"},
+        {"vid": 3, "tag": ""},
+    ])
+    tags.sync_source_tags(slug, clean=True)
+    check("E3 准备状态：主表 3 个标签词 / 倒排 3 行", n_tags() == 3, n_tags())
+
+    def _up(vid, tag):
+        return {"vod_id": vid, "type_id": 1, "name": f"测试片{vid}",
+                "vod_time": now, "vod_tag": tag}
+
+    syncer.upsert_batch(slug, [_up(1, ""), _up(2, ""), _up(3, "")])
+    with database.engine.connect() as conn:
+        t1 = conn.execute(select(table.c.vod_tag).where(table.c.vod_id == 1)).scalar()
+    check("E4 上游空 tag 不覆盖主表明星Tag", t1 == "明星A,明星B", t1)
+    check("E5 全量 UPSERT 后倒排行仍在（3 行，不被洗掉）", n_tags() == 3, n_tags())
+    check("E6 1 号两个标签都还在", n_tags(1) == 2, n_tags(1))
+
+    syncer.upsert_batch(slug, [_up(1, "新标签")])
+    with database.engine.connect() as conn:
+        t1 = conn.execute(select(table.c.vod_tag).where(table.c.vod_id == 1)).scalar()
+    check("E7 上游给新 tag 时主表更新", t1 == "新标签", t1)
+    check("E8 倒排同步换成新标签（1 号 1 行）", n_tags(1) == 1, n_tags(1))
+    r = tags.search_page([slug], "新标签", page=1, page_size=10)
+    check("E9 新标签可被检索", r["total"] == 1 and r["tag_found"] is True, r["total"])
+
+    syncer.upsert_batch(slug, [_up(99, "新增标签")])
+    check("E10 新增视频的标签也进倒排", n_tags(99) == 1, n_tags(99))
+
     print(f"\n通过 {passed} / 失败 {failed}")
     return 1 if failed else 0
 

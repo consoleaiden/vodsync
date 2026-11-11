@@ -522,13 +522,16 @@ def upsert_batch(slug: str, rows: list) -> tuple:
     # 先查询本批中已存在的 id，用于统计 inserted/updated
     ids = [r["vod_id"] for r in rows]
     existing = set()
+    existing_tags = {}
     with database.write_txn() as conn:
         for i in range(0, len(ids), 500):
             chunk = ids[i : i + 500]
             found = conn.execute(
-                select(table.c.vod_id).where(table.c.vod_id.in_(chunk))
+                select(table.c.vod_id, table.c.vod_tag).where(table.c.vod_id.in_(chunk))
             )
-            existing.update(r[0] for r in found)
+            for vid, old_tag in found:
+                existing.add(vid)
+                existing_tags[vid] = old_tag or ""
 
         stmt = (
             database.dialect_insert(table)
@@ -575,7 +578,17 @@ def upsert_batch(slug: str, rows: list) -> tuple:
                 from . import tags
 
                 with conn.begin_nested():
-                    tags.index_rows(slug, rows, conn=conn)
+                    # 倒排表必须与「主表最终 vod_tag」一致。主表用
+                    # coalesce(nullif(上游tag,''), 旧tag) 保住明星词库回填的标签，
+                    # 而 index_rows 是「先删后插」——若把上游原始 rows（tag 多为
+                    # 空）直接传进去，每次全量/增量同步都会把该站明星标签倒排行
+                    # 删光，覆盖率越同步越低。这里按主表的合并规则重建 payload。
+                    index_payload = [
+                        {"vod_id": r["vod_id"],
+                         "vod_tag": r.get("vod_tag") or existing_tags.get(r["vod_id"], "")}
+                        for r in rows
+                    ]
+                    tags.index_rows(slug, index_payload, conn=conn)
             except Exception as e:  # noqa: BLE001
                 log.warning("[%s] 标签索引写入失败（不影响同步，可稍后回填）: %s", slug, e)
     inserted = sum(1 for i in ids if i not in existing)
