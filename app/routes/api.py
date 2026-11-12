@@ -1174,15 +1174,30 @@ def adfilter_admin_rollback(
     }
 
 
-@router.get("/api/v1/adfilter/admin/stats", summary="去广告上报统计（管理端）")
-def adfilter_admin_stats(days: int = Query(7, ge=1, le=90)):
+@router.get("/api/v1/adfilter/admin/stats", summary="去广告上报统计（管理端，含按站点分布）")
+def adfilter_admin_stats(
+    days: int = Query(7, ge=1, le=90),
+    limit: int = Query(0, ge=0, le=config.ADFILTER_HOST_STATS_MAX_LIMIT,
+                       description="hosts 返回条数，0=用服务端默认（异常站点排最前）"),
+    min_reports: int = Query(0, ge=0, le=10000,
+                             description="参与异常判定的最少样本数，0=用服务端默认"),
+):
     """
-    上报量聚合：总量 / 近 N 天 / 去重地址数 / 删除时长占比。
+    上报量聚合 + **按 host 的分布**（v1.16.1）。
 
-    `removed_ratio`（删除时长 ÷ 原始总时长）突增 = 规则可能过激；
-    **不返回任何 url** —— 播放地址属于用户隐私，契约明确要求不得进对外接口。
+    全局 `removed_ratio` 会被正常站点稀释：某个站把正片当广告删了，只要别的站
+    上报量够大，平均值看不出异常。所以新增 `hosts`，每组给
+    reports / distinct_urls / avg_removed_ratio / max_removed_ratio /
+    avg_removed_runs / last_at，并附 `suspicious` 标记与服务端 `thresholds`。
+
+    判定只用统计量，**不自动发布规则包**：阈值命中只是「建议管理员看一眼」，
+    是否给该站加 `mode:"off"` 止血由人在面板上确认后点发布，避免一次误判直接
+    改掉全量客户端的规则。`limit=0` / `min_reports=0` 都表示用服务端默认值，
+    老调用方不传这两个参数时行为完全不变（既有字段一个都没改）。
+
+    仍然**不返回任何 url 原文**：host 是站点级标识，播放地址属于用户隐私。
     """
-    return {"code": SUCCESS_CODE, **adfilter.stats(days)}
+    return {"code": SUCCESS_CODE, **adfilter.stats(days, limit, min_reports)}
 
 
 def _tag_stats_brief() -> dict:

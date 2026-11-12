@@ -1,8 +1,9 @@
-# 数据迁移说明（v1.14.0 ~ v1.16.0，MIGRATION_NOTES）
+# 数据迁移说明（v1.14.0 ~ v1.16.1，MIGRATION_NOTES）
 
 > 对应需求：`BACKEND_UPGRADE_REQUIREMENTS_2026-11-09.md`（B-01 / B-08 / B-09 / B-10 / B-11）、
-> v1.15.0「源站 18+ 标记与未成年模式」、v1.16.0「智能去广告规则下发与命中上报」
-> 影响面：**新增 5 张表 + 2 个追加列**，不改任何现有列、不重命名任何字段。
+> v1.15.0「源站 18+ 标记与未成年模式」、v1.16.0「智能去广告规则下发与命中上报」、
+> v1.16.1「按站点分布统计」
+> 影响面：**新增 5 张表 + 3 个追加列**，不改任何现有列、不重命名任何字段。
 > 升级方式：拉新镜像重启即可，`init_db()` 会自动建表补列，无需手工 SQL。
 
 ---
@@ -17,6 +18,7 @@
 | `sources.is_adult` | 追加列（18+ 标记） | 自动 `ALTER` | 保留无害（旧代码不读） |
 | `adfilter_rule_packs` | 新表（v1.16.0 去广告规则包） | 自动建表 + 启动播种 v1 | `DROP TABLE adfilter_rule_packs` |
 | `adfilter_reports` | 新表（v1.16.0 命中上报明细） | 自动建表 | `DROP TABLE adfilter_reports`（只影响统计，不影响播放） |
+| `adfilter_reports.host` | 追加列（v1.16.1 按站点聚合） | 自动 `ALTER` + 启动分批回填 | 保留无害（旧代码不读） |
 | `settings.api_token_scope` | 新增一条配置行 | 启动时自动写入 `admin` | 删行即可（等价 admin） |
 
 **没有**改动的：`vod_{slug}` 表结构、`sources` 表、任何响应字段名、`list` / `detail` / `pagecount` /
@@ -187,7 +189,7 @@ CREATE INDEX IF NOT EXISTS idx_adfilter_report_at ON adfilter_reports (at);
 升级自检：
 
 ```bash
-curl -s http://<host>:8181/healthz | grep -o '"version":"[^"]*"'   # 期望 1.16.0
+curl -s http://<host>:8181/healthz | grep -o '"version":"[^"]*"'   # 期望 1.16.0 及以上
 # capabilities 里应含 adfilter
 curl -s -H "Authorization: Bearer <token>" \
   "http://<host>:8181/api/v1/adfilter/rules?version=0"
@@ -199,6 +201,44 @@ curl -s -H "Authorization: Bearer <token>" \
 
 回滚到 1.15.x 不需要删表（旧代码不读这两张表）；模型里的表定义不会影响
 `select(sources)` 等既有查询。
+
+## 2.4 v1.16.1：`adfilter_reports.host` 追加列与回填（2026-11-12）
+
+**动机**：全局 `removed_ratio` 会被正常站点稀释，误杀必须按 host 分组才看得出来。
+读侧用 `GROUP BY host` 聚合，避免把明细全捞回 Python，也避免在 SQL 里写
+PG `split_part` / SQLite `instr` 两套方言。
+
+```sql
+-- 等价于 init_db() 自动执行的语句，正常不需要手工跑
+ALTER TABLE adfilter_reports ADD COLUMN host VARCHAR(255) DEFAULT '';
+-- 新库由 META.create_all() 直接带上该列，DEFAULT '' 只是给老行占位
+```
+
+- **新写入**：`adfilter.ingest()` 直接落 `host_of(url)`（小写 hostname，去端口 /
+  userinfo / 路径，≤253 字符；解析不出写 `'-'`）。客户端**不需要发版**。
+- **老行回填**：`adfilter.ensure_seed()` 在启动阶段（且在「已有规则包就 return」之前）
+  每轮最多取 5000 行 `host='' OR host IS NULL`，用 Python 解析 url 后逐行 UPDATE。
+  几十万行会在几次重启内填完（自托管通常一次就完），不会拖慢单次启动。
+  解析不出的写 `'-'`，和「待回填」的空串区分开，避免每轮重扫；统计时两者都排除。
+- **无锁表风险**：PG 的 `ADD COLUMN ... DEFAULT ''` 是元数据操作；回填是逐行小事务，
+  只写新列，不碰 `url` / 去重索引，也不影响上报写入路径。
+- **不建 host 索引**：窗口查询已有 `idx_adfilter_report_at(at)` 先按时间收敛，
+  再对结果集分组；单租户量级下额外索引的写放大不划算。
+
+升级自检：
+
+```bash
+curl -s http://<host>:8181/healthz | grep -o '"version":"[^"]*"'   # 期望 1.16.1
+docker compose exec vodsync-pg psql -U vodsync -d vodsync -c \
+  "SELECT count(*) AS pending FROM adfilter_reports WHERE host = '' OR host IS NULL;"
+# 期望 0（重启完成后）；启动日志里有「已回填 N 条上报的 host」
+curl -s -H "Authorization: Bearer <token>" \
+  "http://<host>:8181/api/v1/adfilter/admin/stats?days=7"
+# 期望：原有字段照旧，多出 hosts / hosts_total / suspicious_count / thresholds / host_limit
+```
+
+回滚到 1.16.0 不需要删列（旧代码不读 `host`，INSERT 时该列走 `DEFAULT ''`）；
+旧版 stats 只给全局字段，面板退回显示一行概览。
 
 ## 3. 回填（把存量数据灌进 `video_tags`）
 

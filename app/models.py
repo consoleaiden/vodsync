@@ -303,6 +303,10 @@ adfilter_reports = Table(
     Column("user_id", Integer, nullable=False, server_default="0"),
     Column("url", String(2048), nullable=False),          # 原始播放列表地址（不对外暴露）
     Column("url_hash", String(64), nullable=False),       # sha256(url) 十六进制，去重用
+    # v1.16.1：按站点分布统计用的冗余列。写时从 url 解析好，读侧直接 GROUP BY，
+    # 不必在 SQL 里做方言相关的字符串切分（PG split_part / SQLite instr 不通用），
+    # 也不必把明细全捞回 Python 里聚合。空串 = 老行待回填，'-' = 解析不出 host。
+    Column("host", String(255), nullable=False, server_default=""),
     Column("rule_version", Integer, default=0, server_default="0"),
     Column("removed_runs", Integer, default=0, server_default="0"),
     # 时长用 BIGINT：毫秒级数值本身不大，但（a）总时长可能来自多集拼片，

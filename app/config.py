@@ -258,6 +258,15 @@ ADFILTER_AT_SKEW_SEC = int(os.environ.get("ADFILTER_AT_SKEW_SEC", str(7 * 86400)
 # 管理端历史版本保留条数（面板只展示最近这么多，更老的仍留在库里供回滚）
 ADFILTER_PACK_HISTORY = int(os.environ.get("ADFILTER_PACK_HISTORY", "20"))
 
+# v1.16.1 按站点分布 / 误杀判定口径（前端给的运营阈值，做成可配置而不是写死）。
+# 判定必须同时满足「样本量够」，否则一条异常上报就能把一个正常站标成过激。
+ADFILTER_HOST_SUSPECT_RATIO = float(os.environ.get("ADFILTER_HOST_SUSPECT_RATIO", "0.15"))
+ADFILTER_HOST_SUSPECT_RUNS = float(os.environ.get("ADFILTER_HOST_SUSPECT_RUNS", "4"))
+ADFILTER_HOST_MIN_REPORTS = int(os.environ.get("ADFILTER_HOST_MIN_REPORTS", "5"))
+# stats.hosts 默认/最大返回条数（只是列表长度，不等于 SQL 扫描量）
+ADFILTER_HOST_STATS_LIMIT = int(os.environ.get("ADFILTER_HOST_STATS_LIMIT", "20"))
+ADFILTER_HOST_STATS_MAX_LIMIT = 200
+
 # ---------------------------------------------------------------------------
 # 标签精确检索（v1.14.0 / B-01）
 #

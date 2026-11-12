@@ -158,6 +158,9 @@ def _migrate():
         # 18+ 内容标记（v1.15.0）：存量源站一律补 0（=不含 18+），
         # 读侧再用 COALESCE 兜住 NULL，保证「未设置按否」。
         ("sources", "is_adult", "INTEGER DEFAULT 0"),
+        # 去广告上报按站点聚合（v1.16.1）：空串表示「老行待回填」，
+        # 回填在 adfilter.ensure_seed() 里用 Python 解析 url，避免方言差异。
+        ("adfilter_reports", "host", "VARCHAR(255) DEFAULT ''"),
     ]
     insp = inspect(engine)
     existing_tables = set(insp.get_table_names())

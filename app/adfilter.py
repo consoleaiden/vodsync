@@ -31,8 +31,9 @@ import logging
 import threading
 import time
 from datetime import datetime
+from urllib.parse import urlsplit
 
-from sqlalchemy import func, select, text
+from sqlalchemy import Float, case, cast, func, select, text
 
 from . import config, database
 from .models import adfilter_reports, adfilter_rule_packs
@@ -60,6 +61,63 @@ _THRESHOLDS = {
 # 语义化商业词：放进 url_patterns 会把「/shop/ 目录下的正片」当广告删掉。
 # 不硬拒（个别站的广告路径确实带 ads 字样的正常目录），只作为发布告警返回。
 _SOFT_BAD_PATTERNS = ("/shop/", "/sale/", "/brand/", "/buy/", "/cart/")
+
+# v1.16.1：解析不出 host 的上报行用这个占位，和「尚未回填」（空串）区分开，
+# 否则每次启动都会把同一批脏数据重扫一遍。统计时排除它。
+HOST_UNKNOWN = "-"
+
+
+def host_of(url: str) -> str:
+    """
+    从播放列表地址提取站点级 host：**小写、去端口、去 userinfo、去路径**。
+
+    同一站点的多个 CDN 路径/端口必须归到一组，否则按 host 的分布又会被拆散，
+    和「全局平均被稀释」是同一个问题。IPv6 的方括号由 urlsplit.hostname 去掉。
+    """
+    if not isinstance(url, str) or not url.strip():
+        return HOST_UNKNOWN
+    raw = url.strip()
+    try:
+        # 正常上报都是 http(s)://；没有 scheme 时按相对 URL 补 // 再解析
+        parts = urlsplit(raw if "//" in raw else "//" + raw)
+        host = (parts.hostname or "").strip().lower().rstrip(".")
+    except Exception:  # noqa: BLE001 —— 畸形 URL 不该让上报或启动失败
+        return HOST_UNKNOWN
+    return host[:MAX_HOST_LEN] if host else HOST_UNKNOWN
+
+
+def _backfill_hosts(limit: int = 5000) -> int:
+    """
+    v1.16.0 建的表没有 host 列，加列后老行的值是空串 —— 启动时补齐。
+
+    分批（每次最多 limit 行）而不是一次性全表 UPDATE：url 最长 2048 字符，
+    全表读进内存再逐行 UPDATE 在积累几十万行后会拖慢启动；分几轮跑完即可。
+    回填只依赖 url，不依赖客户端发版。
+    """
+    try:
+        with database.engine.connect() as conn:
+            rows = conn.execute(
+                select(adfilter_reports.c.id, adfilter_reports.c.url)
+                .where(
+                    (adfilter_reports.c.host == "")
+                    | (adfilter_reports.c.host.is_(None))
+                )
+                .limit(limit)
+            ).all()
+        if not rows:
+            return 0
+        with database.write_txn() as conn:
+            for rid, url in rows:
+                conn.execute(
+                    adfilter_reports.update()
+                    .where(adfilter_reports.c.id == rid)
+                    .values(host=host_of(url))
+                )
+        log.info("[adfilter] 已回填 %d 条上报的 host（分批，下次启动继续）", len(rows))
+        return len(rows)
+    except Exception as e:  # noqa: BLE001
+        log.warning("[adfilter] host 回填失败（不影响服务）: %s", str(e)[:160])
+        return 0
 
 
 def default_rules() -> dict:
@@ -417,7 +475,11 @@ def ensure_seed() -> None:
     为什么要有：不发一版，客户端 version=0 拉到的服务端版本也是 0，
     面板上「当前版本」永远是 0，管理员会以为功能没生效。播种一次后
     「服务端有 v1」是明确事实，之后一切改动都是 v2、v3…… 可追溯。
+
+    v1.16.1 起顺带做 host 列的历史回填：必须放在「已有规则包就 return」之前，
+    否则升级已有部署时永远走不到回填，老上报行在按站点统计里会整批消失。
     """
+    _backfill_hosts()
     try:
         with database.engine.connect() as conn:
             exists = conn.execute(
@@ -542,6 +604,7 @@ def ingest(items: list, user_id: int) -> dict:
             "user_id": int(user_id),
             "url": url,
             "url_hash": hashlib.sha256(url.encode("utf-8")).hexdigest(),
+            "host": host_of(url),   # v1.16.1：写时归一，读侧直接 GROUP BY
             "rule_version": rule_version,
             "removed_runs": removed_runs,
             "removed_ms": removed_ms,
@@ -584,9 +647,28 @@ def ingest(items: list, user_id: int) -> dict:
 # ---------------------------------------------------------------------------
 # 聚合统计（管理端，不含 url —— 播放地址属于用户隐私，不对外暴露）
 # ---------------------------------------------------------------------------
-def stats(days: int = 7) -> dict:
-    """上报量概览：总量、近 N 天增量、去重后的地址数、平均删除时长占比。"""
-    since = int(time.time()) - max(1, int(days)) * 86400
+def stats(days: int = 7, limit: int = 0, min_reports: int = 0) -> dict:
+    """
+    上报量概览 + **按站点分布**（v1.16.1：全站平均会稀释单站误杀，必须分组看）。
+
+    统计口径（写死在服务端，客户端不参与，前端只负责展示）：
+      - host = 播放列表 URL 的 hostname，小写、去端口/userinfo/路径；
+      - 单条 removed_ratio = removed_ms / total_ms；total_ms=0 的单条按 0 计入；
+      - avg_removed_ratio / max_removed_ratio = 窗口内**逐条 ratio 的算术平均 / 最大**
+        （不是 sum(removed_ms)/sum(total_ms)，后者会让长片压过短片，与 max 也不同源）；
+      - 窗口 = `at >= now - days*86400`（与既有 recent 一致，按客户端上报时刻）；
+      - distinct_urls 按 url_hash 去重，不返回任何 url 原文。
+
+    异常判定（只**标记**，绝不自动改规则包）：样本数 >= min_reports 且
+    avg_removed_ratio > ADFILTER_HOST_SUSPECT_RATIO 或
+    avg_removed_runs > ADFILTER_HOST_SUSPECT_RUNS。min_reports 是必要的护栏：
+    一条脏上报不该把正常站点标成「规则过激」。
+    """
+    days = max(1, int(days))
+    limit = max(1, min(int(limit) or config.ADFILTER_HOST_STATS_LIMIT,
+                       config.ADFILTER_HOST_STATS_MAX_LIMIT))
+    min_reports = max(1, int(min_reports) or config.ADFILTER_HOST_MIN_REPORTS)
+    since = int(time.time()) - days * 86400
     try:
         with database.engine.connect() as conn:
             total, urls, removed, total_ms = conn.execute(
@@ -601,16 +683,82 @@ def stats(days: int = 7) -> dict:
                 select(func.count()).where(adfilter_reports.c.at >= since)
             ).scalar() or 0
             last_at = conn.execute(select(func.max(adfilter_reports.c.at))).scalar()
+
+            # 逐条 ratio 必须用 CAST(... AS FLOAT)：两列都是 BIGINT，
+            # PG 和 SQLite 都会做整数除法，不转类型的话结果恒为 0。
+            ratio_expr = case(
+                (adfilter_reports.c.total_ms > 0,
+                 cast(adfilter_reports.c.removed_ms, Float) / adfilter_reports.c.total_ms),
+                else_=0.0,
+            )
+            grouped = conn.execute(
+                select(
+                    adfilter_reports.c.host,
+                    func.count().label("reports"),
+                    func.count(func.distinct(adfilter_reports.c.url_hash)).label("distinct_urls"),
+                    func.avg(ratio_expr).label("avg_ratio"),
+                    func.max(ratio_expr).label("max_ratio"),
+                    func.avg(adfilter_reports.c.removed_runs).label("avg_runs"),
+                    func.max(adfilter_reports.c.at).label("last_at"),
+                )
+                .select_from(adfilter_reports)
+                .where(
+                    adfilter_reports.c.at >= since,
+                    adfilter_reports.c.host != "",          # 待回填的老行
+                    adfilter_reports.c.host != HOST_UNKNOWN,  # 解析不出域名的行
+                )
+                .group_by(adfilter_reports.c.host)
+            ).all()
     except Exception as e:  # noqa: BLE001
         log.warning("adfilter 统计失败: %s", str(e)[:160])
         return {"available": False}
+
     ratio = round(removed / total_ms, 4) if total_ms else 0.0
+    hosts_all = []
+    for row in grouped:
+        m = row._mapping
+        n = int(m["reports"] or 0)
+        avg_ratio = round(float(m["avg_ratio"] or 0), 4)
+        max_ratio = round(float(m["max_ratio"] or 0), 4)
+        avg_runs = round(float(m["avg_runs"] or 0), 2)
+        reasons = []
+        if n >= min_reports:
+            if avg_ratio > config.ADFILTER_HOST_SUSPECT_RATIO:
+                reasons.append("avg_removed_ratio")
+            if avg_runs > config.ADFILTER_HOST_SUSPECT_RUNS:
+                reasons.append("avg_removed_runs")
+        hosts_all.append({
+            "host": m["host"],
+            "reports": n,
+            "distinct_urls": int(m["distinct_urls"] or 0),
+            "avg_removed_ratio": avg_ratio,
+            "max_removed_ratio": max_ratio,
+            "avg_removed_runs": avg_runs,
+            "last_at": int(m["last_at"]) if m["last_at"] else None,
+            "suspicious": bool(reasons),   # 给面板高亮，不代表已止血
+            "reasons": reasons,
+        })
+    # 疑似过激的排最前，其次按平均删除占比；同值再按样本量，保证结果稳定可复现
+    hosts_all.sort(key=lambda h: (
+        not h["suspicious"], -h["avg_removed_ratio"], -h["reports"], h["host"],
+    ))
     return {
+        # ↓ 以下是 v1.16.0 既有字段，一个都没改；老调用方零影响
         "available": True,
         "total": int(total or 0),
         "recent": int(recent or 0),
-        "days": int(days),
+        "days": days,
         "distinct_urls": int(urls or 0),
         "removed_ratio": ratio,          # 删除时长 / 总时长，突增说明规则过激
         "last_at": int(last_at) if last_at else None,
+        # ↓ v1.16.1 新增
+        "hosts": hosts_all[:limit],
+        "hosts_total": len(hosts_all),   # 窗口内站点总数（可能大于 hosts 长度）
+        "suspicious_count": sum(1 for h in hosts_all if h["suspicious"]),
+        "thresholds": {
+            "avg_removed_ratio": config.ADFILTER_HOST_SUSPECT_RATIO,
+            "avg_removed_runs": config.ADFILTER_HOST_SUSPECT_RUNS,
+            "min_reports": min_reports,
+        },
+        "host_limit": limit,
     }

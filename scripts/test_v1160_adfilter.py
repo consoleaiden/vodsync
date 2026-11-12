@@ -98,12 +98,14 @@ def main():
     client = TestClient(_app)
 
     print("\nA. 版本、能力声明与数据表")
-    check("A1 版本号 1.16.0", __version__ == "1.16.0", __version__)
+    # 逐版改测试太脆：只看「不低于引入 adfilter 的版本」，openapi 用严格相等
+    _ver = tuple(int(x) for x in __version__.split(".")[:3])
+    check("A1 版本号 ≥ 1.16.0", _ver >= (1, 16, 0), __version__)
     snap = caps.snapshot(db_ok=True)
     check("A2 capabilities 含 adfilter", "adfilter" in snap, snap)
     st, js = jget(client, "/healthz")
-    check("A3 /healthz 下发 adfilter 且版本 1.16.0",
-          st == 200 and "adfilter" in js.get("capabilities", []) and js.get("version") == "1.16.0",
+    check("A3 /healthz 下发 adfilter 且版本一致",
+          st == 200 and "adfilter" in js.get("capabilities", []) and js.get("version") == __version__,
           (st, js.get("version")))
     old = config.ADFILTER_ENABLED
     config.ADFILTER_ENABLED = False
@@ -363,8 +365,8 @@ def main():
           and "adfilter_reports" in mdoc, "")
     spec = json.load(open(os.path.join(ROOT, "openapi.json"), encoding="utf-8"))
     spec2 = json.load(open(os.path.join(ROOT, "docs", "openapi.json"), encoding="utf-8"))
-    check("I7 两份 openapi 一致且版本 1.16.0 / 65 方法",
-          spec == spec2 and spec["info"]["version"] == "1.16.0"
+    check("I7 两份 openapi 一致且版本与代码一致 / 65 方法",
+          spec == spec2 and spec["info"]["version"] == __version__
           and sum(len(v) for v in spec["paths"].values()) == 65, spec["info"]["version"])
     check("I8 openapi 收录 6 条 adfilter 路径",
           len([p for p in spec["paths"] if "adfilter" in p]) == 6,

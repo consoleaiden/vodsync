@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.16.0"
+    "version": "1.16.1"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -911,8 +911,8 @@
     },
     "/api/v1/adfilter/admin/stats": {
       "get": {
-        "summary": "去广告上报统计（管理端）",
-        "description": "上报量聚合：总量 / 近 N 天 / 去重地址数 / 删除时长占比。\n\n`removed_ratio`（删除时长 ÷ 原始总时长）突增 = 规则可能过激；\n**不返回任何 url** —— 播放地址属于用户隐私，契约明确要求不得进对外接口。",
+        "summary": "去广告上报统计（管理端，含按站点分布）",
+        "description": "上报量聚合 + **按 host 的分布**（v1.16.1）。\n\n全局 `removed_ratio` 会被正常站点稀释：某个站把正片当广告删了，只要别的站\n上报量够大，平均值看不出异常。所以新增 `hosts`，每组给\nreports / distinct_urls / avg_removed_ratio / max_removed_ratio /\navg_removed_runs / last_at，并附 `suspicious` 标记与服务端 `thresholds`。\n\n判定只用统计量，**不自动发布规则包**：阈值命中只是「建议管理员看一眼」，\n是否给该站加 `mode:\"off\"` 止血由人在面板上确认后点发布，避免一次误判直接\n改掉全量客户端的规则。`limit=0` / `min_reports=0` 都表示用服务端默认值，\n老调用方不传这两个参数时行为完全不变（既有字段一个都没改）。\n\n仍然**不返回任何 url 原文**：host 是站点级标识，播放地址属于用户隐私。",
         "operationId": "adfilter_admin_stats_api_v1_adfilter_admin_stats_get",
         "parameters": [
           {
@@ -926,6 +926,34 @@
               "default": 7,
               "title": "Days"
             }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 0,
+              "description": "hosts 返回条数，0=用服务端默认（异常站点排最前）",
+              "default": 0,
+              "title": "Limit"
+            },
+            "description": "hosts 返回条数，0=用服务端默认（异常站点排最前）"
+          },
+          {
+            "name": "min_reports",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 10000,
+              "minimum": 0,
+              "description": "参与异常判定的最少样本数，0=用服务端默认",
+              "default": 0,
+              "title": "Min Reports"
+            },
+            "description": "参与异常判定的最少样本数，0=用服务端默认"
           }
         ],
         "responses": {

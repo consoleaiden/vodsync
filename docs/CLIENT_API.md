@@ -5,7 +5,7 @@
 > 本文档面向「调用 VodSync 服务的客户端 App」（原生 App / H5 / 小程序 / 播放器 / 采集器均可）。
 > 目标：一个 AI 客户端开发者（或 AI 编程助手）拿这份文档即可完成全部对接，无需阅读服务端代码。
 >
-> 对应服务版本：**v1.16.0** ｜ 文档版本：`2026-11-12` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.16.1** ｜ 文档版本：`2026-11-12` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 ---
 
@@ -203,6 +203,36 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 > 广告过滤本身在端上完成，所以即使这两个接口全挂，播放与本地过滤也照常工作 ——
 > 拉不到新规则就用内置规则，上报失败就按你的队列重试/滚动丢弃。
 
+#### 管理端：按站点发现误杀（v1.16.1，客户端无需发版）
+
+`GET /api/v1/adfilter/admin/stats?days=7&limit=0&min_reports=0` 在原有一组全局字段之外，
+新增 `hosts` 数组（按站点分组），用于发现「全站平均看不出来的单站误杀」：
+
+```json
+{ "available": true, "total": 96, "recent": 96, "days": 7, "distinct_urls": 61,
+  "removed_ratio": 0.018, "last_at": 1762926745,
+  "hosts": [ { "host": "2609.lbsl2026.com", "reports": 96, "distinct_urls": 61,
+               "avg_removed_ratio": 0.018, "max_removed_ratio": 0.041,
+               "avg_removed_runs": 2.0, "last_at": 1762926745,
+               "suspicious": false, "reasons": [] } ],
+  "hosts_total": 1, "suspicious_count": 0,
+  "thresholds": { "avg_removed_ratio": 0.15, "avg_removed_runs": 4, "min_reports": 5 },
+  "host_limit": 20 }
+```
+
+- 统计窗口 `at >= now - days*86400`；`host` 是小写、去端口/路径的站点域名，
+  **不返回任何 url 原文**；`distinct_urls` 按 `url_hash` 去重。
+- `avg_removed_ratio` / `max_removed_ratio` 是窗口内**逐条** `removed_ms / total_ms`
+  的算术平均 / 最大（`total_ms=0` 的单条按 0 计），不是总时长加权；
+  `avg_removed_runs` 是逐条删除段数的平均。
+- `suspicious=true` 表示该站样本数 ≥ `min_reports` 且
+  `avg_removed_ratio > 0.15` **或** `avg_removed_runs > 4`（阈值随 `thresholds` 一起返回，
+  由 `ADFILTER_HOST_SUSPECT_RATIO` / `_RUNS` / `_MIN_REPORTS` 配置）。疑似站点排最前。
+- **只是标记，不会自动改规则包**：面板「按站点命中分布」里点「加 mode:off 止血」只是把
+  `{"host":"...","mode":"off"}` 追加到编辑框，仍需管理员确认后点「校验并发布」才生效。
+  避免一条脏数据直接改掉全量客户端的过滤行为。
+- 老调用方不传 `limit` / `min_reports` 时，原有的 7 个字段一字未变。
+
 ---
 
 ## 2. 接口总览
@@ -247,7 +277,7 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 | GET | `/api/v1/adfilter/admin/packs/{version}` | **v1.16.0** 指定版本详情（含规则正文） |
 | POST | `/api/v1/adfilter/admin/packs` | **v1.16.0** 发布新版本（body `{rules, channel, note}`，服务端校验越界值） |
 | POST | `/api/v1/adfilter/admin/packs/rollback?version=` | **v1.16.0** 回滚到历史版本（发新版本号 + 旧内容） |
-| GET | `/api/v1/adfilter/admin/stats?days=` | **v1.16.0** 上报量聚合（不含 url） |
+| GET | `/api/v1/adfilter/admin/stats?days=` | **v1.16.0** 上报量聚合（不含 url）；**v1.16.1** 增加 `hosts` 按站点分布与 `suspicious` 判定，见 1.6 |
 | POST | `/api/v1/sources/auto-sync?enabled=&slugs=` | 批量自动同步开关（`slugs=all` 或逗号分隔列表） |
 | GET | `/api/v1/logs?limit=50` | 最近同步日志（跨源站） |
 | POST | `/api/v1/maintenance/recount` | 条数校准（异步执行） |

@@ -14,7 +14,7 @@
 services:
   vodsync:
     # 官方发布镜像（GitHub Actions 自动构建，双架构 amd64/arm64，公开可拉取）
-    # tag 说明（v1.9.3 起每次构建都带版本号；当前版本 1.16.0）：
+    # tag 说明（v1.9.3 起每次构建都带版本号；当前版本 1.16.1）：
     #   latest          最新（生产默认）
     #   1.14.0          版本号；同一版本多次构建时指向最新那次
     #   1.14.0-<sha7>   版本 + 提交，不可变 —— **回滚就用这个**
@@ -95,6 +95,12 @@ services:
       ADFILTER_REPORT_MAX_ITEMS: "50"
       ADFILTER_AT_SKEW_SEC: "604800"
       ADFILTER_PACK_HISTORY: "20"
+      # v1.16.1 按站点统计的误杀判定口径：样本 ≥5 且 (平均删除占比 >0.15 或 平均删除段数 >4)
+      # 只在 /adfilter/admin/stats 里标 suspicious，绝不自动发布 mode:off（由面板人工确认）
+      ADFILTER_HOST_SUSPECT_RATIO: "0.15"
+      ADFILTER_HOST_SUSPECT_RUNS: "4"
+      ADFILTER_HOST_MIN_REPORTS: "5"
+      ADFILTER_HOST_STATS_LIMIT: "20"
       # ---- 能力清单灰度（v1.14.0）----
       # 单独关掉某项能力而不改代码：CAPABILITIES_DISABLE=tag_search
       # CAPABILITIES_DISABLE: ""

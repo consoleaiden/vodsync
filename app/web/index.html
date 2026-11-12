@@ -65,6 +65,9 @@
   .badge.ok { color: var(--ok); background: #ecfdf3; border-color: #c7f0d6; }
   .badge.bad { color: var(--bad); background: #fef2f2; border-color: #fbd5d5; }
   .badge.warn { color: var(--warn); background: #fffbeb; border-color: #fde9b8; }
+  /* v1.16.1：按站点分布表里「疑似规则过激」的行，淡黄底 + 左侧强调线 */
+  tr.ad-suspicious td { background: #fffbeb; }
+  tr.ad-suspicious td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
   .pause-banner {
     background: #fffbeb; border: 1px solid #fde9b8; color: #92400e;
     padding: 9px 16px; border-radius: 10px; margin-bottom: 18px; font-size: 13px;
@@ -431,6 +434,20 @@
         <div class="muted" id="adHint" style="font-size:12px;margin-top:6px"></div>
       </div>
       <div id="adHistory"><div class="empty">展开时加载规则包…</div></div>
+      <div class="body pad" style="border-top:1px solid var(--line)">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">
+          <b style="font-size:13px">按站点命中分布</b>
+          <span class="muted" id="adHostsHint" style="font-size:12px"></span>
+          <span style="flex:1"></span>
+          <button class="sm" id="btnAdHostsReload" title="重新拉取按站点统计（不参与 5 秒轮询）">↻ 刷新分布</button>
+        </div>
+        <div class="muted" style="font-size:12px;line-height:1.7;margin-bottom:8px">
+          全站平均会被正常站点稀释，单站误杀要看分组数据。<code>avg_removed_ratio</code> 是逐条
+          「删除时长 ÷ 原始时长」的算术平均，不是总时长加权。疑似过激只是<b>标记</b>，
+          点「加 mode:off 止血」只会把站点例外追加到上面的编辑框，<b>仍需人工点「校验并发布」</b>才生效。
+        </div>
+        <div id="adHosts"><div class="empty">展开时加载…</div></div>
+      </div>
     </div>
   </section>
 
@@ -1817,16 +1834,91 @@ function renderAdHistory() {
       </td></tr>`).join("")}</tbody></table>`;
 }
 
+const fmtEpoch = (ts) => {
+  if (!ts) return "-";
+  const d = new Date(Number(ts) * 1000);
+  return isNaN(d.getTime()) ? "-" : d.toLocaleString("zh-CN", { hour12: false });
+};
+
+// 按站点分布（v1.16.1）：误杀通常在单个站点上，全局平均会被稀释。
+// 只在展开/手动刷新时拉，不进 5 秒轮询，避免和正在编辑的规则互相干扰。
+function renderAdHosts(st) {
+  const box = $("#adHosts");
+  if (!box) return;
+  const th = st.thresholds || {};
+  const hint = $("#adHostsHint");
+  if (hint) {
+    hint.textContent = `近 ${fmtNum(st.days)} 天 · ${fmtNum(st.hosts_total || 0)} 个站点`
+      + ` · 疑似过激 ${fmtNum(st.suspicious_count || 0)} 个`
+      + ` · 口径：样本 ≥ ${fmtNum(th.min_reports || 0)} 且 平均占比 > ${th.avg_removed_ratio}`
+      + ` 或 平均段数 > ${th.avg_removed_runs}`;
+  }
+  const rows = st.hosts || [];
+  if (!rows.length) {
+    box.innerHTML = `<div class="empty">近 ${fmtNum(st.days)} 天没有按站点上报数据（客户端起播过滤后才会上报）</div>`;
+    return;
+  }
+  box.innerHTML = `<table>
+    <thead><tr><th>站点 host</th><th class="num">上报</th><th class="num">去重地址</th>
+      <th class="num">平均删除占比</th><th class="num">最大</th><th class="num">平均删除段数</th>
+      <th style="width:150px">最近上报</th><th style="width:90px">状态</th><th style="width:150px">操作</th></tr></thead>
+    <tbody>${rows.map((h) => `<tr class="${h.suspicious ? "ad-suspicious" : ""}">
+      <td title="${esc(h.host)}">${esc(h.host)}</td>
+      <td class="num">${fmtNum(h.reports)}</td>
+      <td class="num">${fmtNum(h.distinct_urls)}</td>
+      <td class="num">${(Number(h.avg_removed_ratio || 0) * 100).toFixed(2)}%</td>
+      <td class="num">${(Number(h.max_removed_ratio || 0) * 100).toFixed(2)}%</td>
+      <td class="num">${Number(h.avg_removed_runs || 0).toFixed(2)}</td>
+      <td class="muted">${fmtEpoch(h.last_at)}</td>
+      <td>${h.suspicious
+        ? `<span class="badge warn" title="${esc((h.reasons || []).join("、"))}">疑似过激</span>`
+        : '<span class="badge ok">正常</span>'}</td>
+      <td><button class="sm warn" data-host-act="off" data-host="${esc(h.host)}"
+          title="把该站 mode:off 追加到规则编辑框（不自动发布）">加 mode:off 止血</button></td>
+    </tr>`).join("")}</tbody></table>`;
+}
+
 async function adLoadStats() {
   try {
     const st = await api("/api/v1/adfilter/admin/stats?days=7");
     $("#adStats").textContent = st.available
       ? `近 ${st.days} 天上报 ${fmtNum(st.recent)} 条 · 累计 ${fmtNum(st.total)} 条 · 删除时长占比 ${(Number(st.removed_ratio || 0) * 100).toFixed(2)}%`
       : "上报统计暂不可用";
+    if (st.available) renderAdHosts(st);
+    else {
+      const box = $("#adHosts");
+      if (box) box.innerHTML = '<div class="empty">上报统计暂不可用</div>';
+      const hint = $("#adHostsHint");
+      if (hint) hint.textContent = "";
+    }
   } catch (e) {
     $("#adStats").textContent = "";
   }
 }
+
+// 「止血」只生成建议：改的是本地编辑框，发布必须由人再点一次「校验并发布」。
+$("#adHosts").addEventListener("click", (ev) => {
+  const btn = ev.target.closest('button[data-host-act="off"]');
+  if (!btn) return;
+  const host = btn.dataset.host;
+  let rules;
+  try {
+    rules = JSON.parse($("#adRules").value || "{}");
+  } catch (e) {
+    return toast("当前规则 JSON 无法解析，请先修正或点「↻ 读取当前」", true);
+  }
+  if (!Array.isArray(rules.site_overrides)) rules.site_overrides = [];
+  if (rules.site_overrides.some((x) => x && String(x.host || "").toLowerCase() === host.toLowerCase())) {
+    return toast(`${host} 已在 site_overrides 中，无需重复添加`);
+  }
+  rules.site_overrides.push({ host, mode: "off" });
+  $("#adRules").value = JSON.stringify(rules, null, 2);
+  $("#adHint").textContent = `已把 ${host} 的 mode:"off" 追加到编辑框（尚未发布）。确认后点「校验并发布」，客户端下次拉取规则后生效；如需撤销可点「↻ 读取当前」。`;
+  toast(`已生成止血建议：${host}（需人工发布）`);
+  $("#adRules").scrollIntoView({ behavior: "smooth", block: "center" });
+});
+
+$("#btnAdHostsReload").onclick = () => adLoadStats();
 
 async function adLoad() {
   const ch = ($("#adChannel") && $("#adChannel").value) || "stable";

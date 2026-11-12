@@ -3,7 +3,7 @@
 > **本文档的用途**：把 VodSync 服务作为后端，交由 AI（或 AI 编程助手）开发客户端 App。
 > 文档自包含：只读本文即可完成全部对接，**不需要**阅读服务端源码。
 >
-> 对应服务版本：**v1.16.0** ｜ 文档版本：`2026-11-12` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.16.1** ｜ 文档版本：`2026-11-12` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 **目录**
 
@@ -376,7 +376,7 @@ type PlayLine = {
 | 59 | GET | `/api/v1/adfilter/admin/packs/{version}` | 管理 | **v1.16.0** 指定版本详情（含规则正文） |
 | 60 | POST | `/api/v1/adfilter/admin/packs` | 管理 | **v1.16.0** 发布新版本（服务端校验越界值） |
 | 61 | POST | `/api/v1/adfilter/admin/packs/rollback` | 管理 | **v1.16.0** 回滚到历史版本（发新版本号 + 旧内容） |
-| 62 | GET | `/api/v1/adfilter/admin/stats` | 管理 | **v1.16.0** 上报量聚合（不含 url） |
+| 62 | GET | `/api/v1/adfilter/admin/stats` | 管理 | **v1.16.0** 上报量聚合（不含 url）；**v1.16.1** 增加按 `host` 分布与 `suspicious` 判定 |
 
 > 本表编号 1~62。服务端实际共 **65 个方法+路径**（`openapi.json` 为准，含
 > `POST /api/v1/auth/logout`、`GET /healthz.capabilities` 等未单列的自解释端点）。
@@ -393,7 +393,7 @@ type PlayLine = {
 {
   "status": "ok",
   "db": true,
-  "version": "1.16.0",
+  "version": "1.16.1",
   "build": "<commit sha>",
   "capabilities": ["backfill_play_from", "play_line_filter", "error_codes",
                    "token_scope", "star_tags", "related", "paging_v2", "minor_mode",
@@ -431,7 +431,7 @@ type PlayLine = {
 与 `/healthz` 同级）：
 
 ```json
-{ "status": "ok", "db": true, "version": "1.16.0",
+{ "status": "ok", "db": true, "version": "1.16.1",
   "capabilities": ["backfill_play_from", "...", "minor_mode", "adfilter", "tag_search"], "time": "..." }
 ```
 
@@ -1658,7 +1658,7 @@ m3u8 改写 / ts 反代 / 播放代理**一律不做**（客户端在端上拦�
 | 表 | 关键列 | 说明 |
 |---|---|---|
 | `adfilter_rule_packs` | `channel` + `version`（唯一）、`rules_json`、`note`、`created_at` | 每个渠道内 `version` 严格 +1；历史行**永不修改**（回滚也是加新行） |
-| `adfilter_reports` | `user_id`、`url`、`url_hash`、`rule_version`、`removed_runs`、`removed_ms`、`total_ms`、`at`、`created_at` | `(user_id, url_hash, at)` 唯一索引做幂等；明细只增不改 |
+| `adfilter_reports` | `user_id`、`url`、`url_hash`、`host`（v1.16.1）、`rule_version`、`removed_runs`、`removed_ms`、`total_ms`、`at`、`created_at` | `(user_id, url_hash, at)` 唯一索引做幂等；明细只增不改。`host` 写时从 url 解析（小写、去端口/路径），供读侧直接 `GROUP BY`；空串=待回填，`-`=解析不出域名 |
 
 单租户部署下 `user_id` 用**凭据身份**近似：`0` = 存量单 Token，`>0` = 具名 Token 的 id，
 `-1` = `API_KEY` 环境变量，`-2` = 面板会话，`-4` = 未鉴权（`AUTH_ENABLED=false` 的开放部署）。
@@ -1751,10 +1751,64 @@ m3u8 改写 / ts 反代 / 播放代理**一律不做**（客户端在端上拦�
 | `GET /api/v1/adfilter/admin/packs/{version}?channel=` | 指定版本详情（含规则正文，面板「载入」用） |
 | `POST /api/v1/adfilter/admin/packs` | body `{rules, channel, note}`；校验失败 `400`，并发撞版本 `409` |
 | `POST /api/v1/adfilter/admin/packs/rollback?version=&channel=&note=` | 用旧内容发新版本；版本不存在 `404` |
-| `GET /api/v1/adfilter/admin/stats?days=7` | 总量 / 近 N 天 / 去重地址数 / `removed_ratio`（**不含任何 url**） |
+| `GET /api/v1/adfilter/admin/stats?days=7` | 总量 / 近 N 天 / 去重地址数 / `removed_ratio` + **v1.16.1 按站点 `hosts`**（不含任何 url） |
 
 面板「**去广告规则包**」区块即上述接口的 UI：读当前规则 → 编辑 JSON → 校验并发布；
 历史版本可「载入」（只填编辑框，不发布）或「回滚到此」（直接发新版本）。
+
+#### GET `/api/v1/adfilter/admin/stats` — 按站点分布与误杀判定（v1.16.1）
+
+**为什么必须分组**：全局 `removed_ratio` 是 `sum(removed_ms)/sum(total_ms)`，
+误杀通常只发生在单个站点，只要别的站上报量够大，异常就被稀释到看不出来。
+按 `host` 分组后，管理员不用等用户报障就能在面板上主动发现。
+
+| 参数 | 类型 | 缺省 | 说明 |
+|---|---|---|---|
+| `days` | int | `7` | 统计窗口 `at >= now - days*86400`，`1~90` |
+| `limit` | int | `0` → 服务端 `ADFILTER_HOST_STATS_LIMIT`（默认 20） | `hosts` 返回条数，`0~200`；疑似站点排最前 |
+| `min_reports` | int | `0` → 服务端 `ADFILTER_HOST_MIN_REPORTS`（默认 5） | 参与异常判定的最少样本数，`0~10000` |
+
+响应（`code: 0` 包装；v1.16.0 的 7 个字段**一字未改**）：
+
+```json
+{ "code": 0, "available": true, "total": 96, "recent": 96, "days": 7,
+  "distinct_urls": 61, "removed_ratio": 0.018, "last_at": 1762926745,
+  "hosts": [ { "host": "2609.lbsl2026.com", "reports": 96, "distinct_urls": 61,
+               "avg_removed_ratio": 0.018, "max_removed_ratio": 0.041,
+               "avg_removed_runs": 2.0, "last_at": 1762926745,
+               "suspicious": false, "reasons": [] } ],
+  "hosts_total": 1, "suspicious_count": 0, "host_limit": 20,
+  "thresholds": { "avg_removed_ratio": 0.15, "avg_removed_runs": 4, "min_reports": 5 } }
+```
+
+| `hosts[]` 字段 | 含义 |
+|---|---|
+| `host` | 播放列表 URL 的 hostname，小写、去端口 / userinfo / 路径；**不含 url 原文** |
+| `reports` | 窗口内该站上报条数 |
+| `distinct_urls` | 该站去重后的地址数（按 `url_hash`） |
+| `avg_removed_ratio` / `max_removed_ratio` | 窗口内**逐条** `removed_ms/total_ms` 的算术平均 / 最大，4 位小数；`total_ms=0` 的单条按 0 计 |
+| `avg_removed_runs` | 逐条删除广告段数的算术平均，2 位小数 |
+| `last_at` | 该站最近一次上报时刻（epoch 秒） |
+| `suspicious` / `reasons` | 是否疑似规则过激 / 命中了哪条口径（便于面板提示，不代表已止血） |
+
+**判定口径**（服务端统一计算，阈值随响应一起返回，前端不硬编码）：
+
+```
+suspicious = reports >= min_reports
+             AND (avg_removed_ratio > ADFILTER_HOST_SUSPECT_RATIO   # 默认 0.15
+                  OR avg_removed_runs  > ADFILTER_HOST_SUSPECT_RUNS) # 默认 4
+```
+
+`min_reports` 是必要的护栏：一条脏上报就能让 `avg_removed_ratio` 冲到 0.9，
+没有样本量门槛会把正常站误标。排序：疑似在前，其次 `avg_removed_ratio` 降序、
+`reports` 降序、`host` 升序（结果稳定可复现）；`hosts_total` 是窗口内站点总数，
+可能大于 `hosts` 长度。`available:false` 表示统计查询失败，此时只有这一个键。
+
+**止血是人工动作**：服务端**不会自动发布规则包**。面板对 `suspicious` 行提供
+「加 mode:off 止血」按钮，只把 `{"host":"...","mode":"off"}` 追加到编辑框的
+`site_overrides`，仍需管理员确认后点「校验并发布」（走既有 publish 接口，版本号 +1）。
+理由：阈值是运营启发式，误判会直接让该站对全部客户端停止过滤；自动改生产规则
+的故障半径远大于人工多点一次。
 
 #### 兼容、灰度与回滚
 
