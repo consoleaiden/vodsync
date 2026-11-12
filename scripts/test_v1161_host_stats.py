@@ -11,7 +11,7 @@ v1.16.1「adfilter 按站点分布统计 / 误杀主动发现」回归测试。
   E. 异常判定阈值与 min_reports 护栏、严格大于边界、服务端阈值可配置
   F. limit / days 窗口、参数越界 400
   G. 隐私：不含 url 原文；既有字段一字未改
-  H. 老行回填（含「已有规则包时 ensure_seed 仍回填」）、幂等
+  H. 老行回填（含「已有规则包时 ensure_seed 仍回填」）、幂等、分批日志文案
   I. 面板与文档契约同步
   J. 既有接口零回归
 
@@ -249,8 +249,14 @@ def main():
             user_id=7, url="/just/a/path.m3u8", url_hash="x" * 64, host="",
             removed_runs=1, removed_ms=1, total_ms=100, at=NOW - 5,
         ))
-    n = adfilter._backfill_hosts()
+    from unittest.mock import patch
+
+    with patch.object(adfilter.log, "info") as info:
+        n = adfilter._backfill_hosts()
     check("H1 回填返回受影响行数", n == 7, n)
+    s0 = info.call_args.args[2] if info.call_args else ""
+    check("H1a 少量回填不再误报「下次启动继续」",
+          "已全部补齐" in s0 and "下次启动继续" not in s0, s0)
     with database.engine.connect() as conn:
         pending = conn.execute(tbl.select().where(tbl.c.host == "")).all()
         unknown = conn.execute(tbl.select().where(tbl.c.host == adfilter.HOST_UNKNOWN)).all()
@@ -265,6 +271,27 @@ def main():
     check("H5 ensure_seed 在已有版本时仍回填", not left, len(left))
     check("H6 回填后 bad 站统计恢复 6 条",
           by_host(jget(client, "/api/v1/adfilter/admin/stats?days=7")[1], "bad.example.com")["reports"] == 6)
+
+    # 分批触顶 / 最后一轮的日志文案：前者要提示继续，后者要明确已补齐
+    with database.write_txn() as conn:
+        for i in range(3):
+            conn.execute(tbl.insert().values(
+                user_id=9, url=f"https://batch{i}.example.com/x.m3u8",
+                url_hash=("batch%d" % i).ljust(64, "0"), host="",
+                removed_runs=1, removed_ms=1, total_ms=100, at=NOW - 20 - i,
+            ))
+    with patch.object(adfilter.log, "info") as info2:
+        n1 = adfilter._backfill_hosts(limit=2)
+    s1 = info2.call_args.args[2] if info2.call_args else ""
+    check("H7 触顶批次仍提示下次启动继续",
+          n1 == 2 and "下次启动继续" in s1, (n1, s1))
+    with patch.object(adfilter.log, "info") as info3:
+        n2 = adfilter._backfill_hosts(limit=2)
+    s2 = info3.call_args.args[2] if info3.call_args else ""
+    check("H8 最后一轮提示已全部补齐",
+          n2 == 1 and "已全部补齐" in s2 and "下次启动继续" not in s2, (n2, s2))
+    with database.write_txn() as conn:
+        conn.execute(tbl.delete().where(tbl.c.url_hash.like("batch%")))
 
     print("\nI. 面板与文档同步")
     html = open(os.path.join(ROOT, "app", "web", "index.html"), encoding="utf-8").read()

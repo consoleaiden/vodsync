@@ -113,8 +113,12 @@ def _backfill_hosts(limit: int = 5000) -> int:
                     .where(adfilter_reports.c.id == rid)
                     .values(host=host_of(url))
                 )
-        log.info("[adfilter] 已回填 %d 条上报的 host（分批，下次启动继续）", len(rows))
-        return len(rows)
+        n = len(rows)
+        # 只有触到本轮上限才可能有下一批；否则「下次启动继续」会让人误以为
+        # 回填永远补不完（线上只回填 4 条时也这么打印过）。
+        suffix = "（已达本轮上限，下次启动继续）" if n >= limit else "（已全部补齐）"
+        log.info("[adfilter] 已回填 %d 条上报的 host%s", n, suffix)
+        return n
     except Exception as e:  # noqa: BLE001
         log.warning("[adfilter] host 回填失败（不影响服务）: %s", str(e)[:160])
         return 0
