@@ -17,11 +17,13 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from sqlalchemy import bindparam, func, select, text
+from sqlalchemy.exc import IntegrityError
 
-from .. import __version__, apiresp, auth, config, database, minor_mode
+from .. import __version__, adfilter, apiresp, auth, config, database, minor_mode
 from ..models import build_vod_table, sources, sync_logs
 from ..syncer import (
     delete_custom_source,
@@ -980,6 +982,207 @@ def bulk_set_source_adult(
         "updated": n,
         "is_adult": enabled,
     }
+
+
+# ---------------------------------------------------------------------------
+# 智能去广告（adfilter，v1.16.0）
+#
+# 控制面两条接口 + 一组管理端：
+#   GET  /api/v1/adfilter/rules          客户端拉规则包（四态：首次/已最新/降级/不可用）
+#   POST /api/v1/adfilter/report         客户端上报命中明细（幂等、限流、逐条丢弃）
+#   GET  /api/v1/adfilter/admin/packs    版本清单 + 当前规则（面板用）
+#   GET  /api/v1/adfilter/admin/packs/{v} 指定版本详情
+#   POST /api/v1/adfilter/admin/packs     发布新版本（服务端校验）
+#   POST /api/v1/adfilter/admin/packs/rollback 回滚（新版本号 + 旧内容）
+#   GET  /api/v1/adfilter/admin/stats     上报量聚合（不含 url）
+#
+# 注意：这组路径都是 /api/v1/adfilter/... 两段以上，不会被 /api/v1/{slug}
+# 那条 MacCMS 通配路由吃掉；仍放在它之前，避免以后改路由形态时踩坑。
+# 响应刻意**不带** code 包装：契约文档 §2.1/§2.2 就是这么写的，客户端按
+# changed/version/rules 与 accepted 解析，多包一层反而增加对不齐的风险。
+# ---------------------------------------------------------------------------
+@router.get("/api/v1/adfilter/rules", summary="去广告规则包拉取（v1.16.0）")
+def adfilter_rules(
+    response: Response,
+    version: int = Query(0, ge=0, description="客户端当前持有的规则包版本号，缺省 0"),
+    channel: Optional[str] = Query(
+        None, description="规则渠道：stable（缺省）/ beta；未知值按 stable 处理，不报错"
+    ),
+):
+    """
+    下发规则包。四态语义（客户端只认这三种响应形态）：
+
+    1. 首次（version=0 或缺省）→ `{changed:true, version:N, rules:{...}}`
+    2. 已最新（version == 服务端版本）→ `{changed:false, version:N}`，**不带 rules**
+    3. 客户端版本高于服务端（服务端刚回滚过）→ `changed:false` + 服务端当前版本，
+       客户端继续用本地较新的包，无副作用
+    4. 规则包读不到（库暂不可用 / 从未发布）→ 返回内置默认规则 + version 0，
+       同样走上面三条判定，绝不 500 —— 客户端拿不到新规则就用自己内置的，
+       控制面故障不该影响播放
+
+    不带 `adfilter` 能力的客户端不会调用本接口；调了也没关系（只读、无副作用）。
+    """
+    # 规则随时可能被面板改，别让中间层缓存住（客户端自己有 30min TTL）
+    response.headers["Cache-Control"] = "no-store"
+    if not config.ADFILTER_ENABLED:
+        raise HTTPException(status_code=404, detail="adfilter 未启用（ADFILTER_ENABLED=false）")
+
+    state = adfilter.current(channel or adfilter.DEFAULT_CHANNEL)
+    if int(version) == state["version"]:
+        return {"changed": False, "version": state["version"]}
+    if int(version) > state["version"]:
+        # 服务端版本更低（回滚过）：不给 rules，让客户端继续持用本地较新的包
+        return {"changed": False, "version": state["version"]}
+    return {"changed": True, "version": state["version"], "rules": state["rules"]}
+
+
+@router.post("/api/v1/adfilter/report", summary="去广告命中上报（v1.16.0）")
+def adfilter_report(payload: dict = None, request: Request = None):
+    """
+    批量接收过滤命中明细（客户端本地攒批：≥5 条或规则拉取成功时发，单批 ≤50）。
+
+    防护（这是公网可写端点，四道闸一个都不能少）：
+      1. 鉴权必选：匿名 401（走 main.py 的统一鉴权中间件）；
+      2. 限流：默认 60 请求/小时/凭据，超限 429 + Retry-After；
+      3. 结构校验：items 必须是数组且 ≤50，否则整批 400（客户端会拆小批重试）；
+      4. 单条校验：类型错/为负/removed_ms>total_ms/时间偏差>7天/url>2048 → 丢该条。
+
+    **幂等**：按 (user_id, url, at) 去重，重复上报返回 accepted=0，不产生重复行。
+    响应里的 dropped（数据不合规）与 duplicates（重复）分开计数，便于排查
+    「客户端一直在重试」还是「数据本身有问题」。
+    """
+    if not config.ADFILTER_ENABLED:
+        raise HTTPException(status_code=404, detail="adfilter 未启用（ADFILTER_ENABLED=false）")
+
+    body = payload if isinstance(payload, dict) else {}
+    items = body.get("items")
+    if items is None:
+        items = []
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail="items 必须是数组")
+    limit = max(1, config.ADFILTER_REPORT_MAX_ITEMS)
+    if len(items) > limit:
+        # 整批拒绝而不是静默截断：客户端会按较小批次重试，不会死循环；
+        # 截断则会让客户端误以为前 N 条已入库，直接丢掉后一半数据。
+        raise HTTPException(
+            status_code=400,
+            detail=f"items 单批最多 {limit} 条，当前 {len(items)} 条",
+        )
+
+    user_id = auth.request_identity(request)
+    wait = adfilter.check_rate(user_id)
+    if wait:
+        raise HTTPException(
+            status_code=429,
+            detail=f"上报过于频繁，请 {wait} 秒后重试",
+            headers={"Retry-After": str(wait)},
+        )
+
+    result = adfilter.ingest(items, user_id)
+    return {
+        "accepted": result["accepted"],
+        "dropped": result["dropped"],
+        "duplicates": result["duplicates"],
+    }
+
+
+@router.get("/api/v1/adfilter/admin/packs", summary="规则包版本清单（管理端）")
+def adfilter_admin_packs(
+    channel: str = Query("stable", description="规则渠道：stable / beta"),
+    limit: int = Query(0, ge=0, le=200, description="返回的版本条数，0=用默认保留数"),
+):
+    """
+    当前生效规则 + 历史版本清单（历史项只给版本号/备注/时间/字节数，不含正文）。
+
+    面板「去广告规则包」区块用它一次性画出状态：当前版本、规则 JSON、历史。
+    """
+    ch = adfilter.normalize_channel(channel)
+    state = adfilter.current(ch)
+    return {
+        "code": SUCCESS_CODE,
+        "channel": ch,
+        "current": state["version"],
+        "rules": state["rules"],
+        "packs": adfilter.list_versions(ch, limit or config.ADFILTER_PACK_HISTORY),
+        "channels": list(adfilter.CHANNELS),
+    }
+
+
+@router.get("/api/v1/adfilter/admin/packs/{version}", summary="规则包指定版本详情（管理端）")
+def adfilter_admin_pack(version: int, channel: str = Query("stable")):
+    row = adfilter.get(version, channel)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"渠道 {channel} 不存在版本 {version}")
+    return {"code": SUCCESS_CODE, **row}
+
+
+@router.post("/api/v1/adfilter/admin/packs", summary="发布规则包新版本（管理端）")
+def adfilter_admin_publish(payload: dict = None):
+    """
+    发布新版本：服务端先校验再入库，版本号在本渠道内严格 +1。
+
+    校验是硬性的 —— 客户端对越界包的处理是「整体丢弃回退内置规则」，
+    不是「按钳制后的值跑」。所以这里挡住越界值，等于替客户端兜住发布事故。
+
+    body：`{"rules": {...}, "channel": "stable", "note": "止血：xxx 站误杀"}`
+
+    返回里 `warnings` 是「不拒收但该看一眼」的提示（例如 url_patterns 里放了
+    /shop/ 这类商业语义词，容易误杀正常影视目录）。
+    """
+    body = payload if isinstance(payload, dict) else {}
+    rules = body.get("rules")
+    if rules is None:
+        rules = {}
+    try:
+        result = adfilter.publish(
+            rules,
+            body.get("channel") or adfilter.DEFAULT_CHANNEL,
+            body.get("note") or "",
+        )
+    except adfilter.RuleError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except IntegrityError:
+        # 两个人同时点发布，后一个撞唯一索引：明确告诉他是版本冲突，不是代码坏了
+        raise HTTPException(status_code=409, detail="版本号冲突（有并发发布），请重试一次")
+    return {
+        "code": SUCCESS_CODE,
+        "msg": f"已发布 v{result['version']}",
+        **result,
+    }
+
+
+@router.post("/api/v1/adfilter/admin/packs/rollback", summary="回滚规则包（管理端）")
+def adfilter_admin_rollback(
+    version: int = Query(..., ge=1, description="要回滚到的历史版本号"),
+    channel: str = Query("stable"),
+    note: str = Query("", description="回滚备注，缺省写「回滚至 vN」"),
+):
+    """
+    回滚 = 用旧版本内容发一个**新版本**（version+1），不改历史行。
+
+    这样客户端永远只需处理「版本变大」，不需要「版本变小」的分支；
+    回滚本身也可以被再次回滚（历史都在）。
+    """
+    try:
+        result = adfilter.rollback(version, channel, note)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {
+        "code": SUCCESS_CODE,
+        "msg": f"已回滚至 v{version} 的内容，发布为 v{result['version']}",
+        **result,
+    }
+
+
+@router.get("/api/v1/adfilter/admin/stats", summary="去广告上报统计（管理端）")
+def adfilter_admin_stats(days: int = Query(7, ge=1, le=90)):
+    """
+    上报量聚合：总量 / 近 N 天 / 去重地址数 / 删除时长占比。
+
+    `removed_ratio`（删除时长 ÷ 原始总时长）突增 = 规则可能过激；
+    **不返回任何 url** —— 播放地址属于用户隐私，契约明确要求不得进对外接口。
+    """
+    return {"code": SUCCESS_CODE, **adfilter.stats(days)}
 
 
 def _tag_stats_brief() -> dict:

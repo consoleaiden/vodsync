@@ -21,6 +21,7 @@ import re
 import threading
 
 from sqlalchemy import (
+    BigInteger,
     Column,
     DateTime,
     Index,
@@ -251,6 +252,70 @@ api_tokens = Table(
     Column("last_used_at", DateTime),
     Column("revoked", Integer, default=0, server_default="0"),
 )
+
+# ---------------------------------------------------------------------------
+# 智能去广告：规则包（v1.16.0）
+#
+# 客户端在端上做 m3u8 过滤（结构指纹），后端只做控制面下发：算法阈值、高置信
+# URL 模式、站点级例外可以不发版就更新。规则包按 channel 分开存（stable/beta），
+# 每个 channel 内 version 单调递增 —— 客户端只做「服务端版本 == 我的版本？」的
+# 比较，两个渠道各发各的号互不干扰，比全局共享一个版本号简单且不会互相顶号。
+#
+# 回滚不修改历史行：新增一个 version（内容取旧版），保证版本号永远单调，
+# 客户端「服务端版本更高就换」的逻辑无需特殊分支。
+#
+# 为什么不存成列：字段会随算法迭代增删（thresholds 里加一个键就是一次发版），
+# 存 JSON 全文 + 服务端发布前校验才是可持续的做法；读取侧只做整体下发。
+# ---------------------------------------------------------------------------
+adfilter_rule_packs = Table(
+    "adfilter_rule_packs",
+    META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("channel", String(16), nullable=False, server_default="stable"),  # stable / beta
+    Column("version", Integer, nullable=False),          # 同一 channel 内严格 +1
+    Column("rules_json", Text, nullable=False),          # 已规范化的规则 JSON（sort_keys）
+    Column("note", String(255), default=""),             # 发布备注 / 回滚来源
+    Column("created_at", DateTime, server_default=func.now()),
+)
+# 同一渠道内版本唯一：并发发布时靠它兜底（重复即 409，不会出现两个 v3）
+Index("uq_adfilter_pack_ver", adfilter_rule_packs.c.channel,
+      adfilter_rule_packs.c.version, unique=True)
+
+# ---------------------------------------------------------------------------
+# 智能去广告：命中上报明细（v1.16.0）
+#
+# Phase 2「按 (源站, vod_id) 聚合已知广告区间」的原始数据源，**只增不改**：
+# 聚合是读侧的事，明细保留才能回溯误报。
+#
+# user_id：本服务是单租户自托管（没有多用户表），这里用「Token 身份」近似：
+#   0 = 存量单 Token，>0 = api_tokens.id，-1 = API_KEY 环境变量，
+#   -2 = 面板会话，-3 = 未知凭据，-4 = 未鉴权（AUTH_ENABLED=false 的开放部署）。
+#   契约里的「按用户隔离」在单租户下即「按 Token 隔离」，见 auth.request_identity()。
+#
+# url_hash：去重键用 (user_id, url_hash, at) 而不是 (user_id, url, at)。
+#   url 允许到 2048 字符（UTF-8 最多 6KB），直接进 PG 唯一索引会撞 btree 单条
+#   上限（约 2704 字节）导致插入失败 —— 换 sha256 定长摘要，去重语义完全相同。
+# ---------------------------------------------------------------------------
+adfilter_reports = Table(
+    "adfilter_reports",
+    META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, nullable=False, server_default="0"),
+    Column("url", String(2048), nullable=False),          # 原始播放列表地址（不对外暴露）
+    Column("url_hash", String(64), nullable=False),       # sha256(url) 十六进制，去重用
+    Column("rule_version", Integer, default=0, server_default="0"),
+    Column("removed_runs", Integer, default=0, server_default="0"),
+    # 时长用 BIGINT：毫秒级数值本身不大，但（a）总时长可能来自多集拼片，
+    # （b）`at` 是 epoch 秒，2038 年会溢出 INTEGER —— 一次定义到位，别留隐患。
+    Column("removed_ms", BigInteger, default=0, server_default="0"),
+    Column("total_ms", BigInteger, default=0, server_default="0"),   # 过滤前总时长
+    Column("at", BigInteger, nullable=False),             # 过滤时刻，epoch 秒
+    Column("created_at", DateTime, server_default=func.now()),
+)
+Index("uq_adfilter_report_dedup", adfilter_reports.c.user_id,
+      adfilter_reports.c.url_hash, adfilter_reports.c.at, unique=True)
+# 聚合与统计按时间倒序取最近数据
+Index("idx_adfilter_report_at", adfilter_reports.c.at)
 
 # ---------------------------------------------------------------------------
 # vod_{slug} 动态表缓存：避免重复构建 Table 对象

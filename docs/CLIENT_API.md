@@ -5,7 +5,7 @@
 > 本文档面向「调用 VodSync 服务的客户端 App」（原生 App / H5 / 小程序 / 播放器 / 采集器均可）。
 > 目标：一个 AI 客户端开发者（或 AI 编程助手）拿这份文档即可完成全部对接，无需阅读服务端代码。
 >
-> 对应服务版本：**v1.15.1** ｜ 文档版本：`2026-11-11` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.16.0** ｜ 文档版本：`2026-11-12` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 ---
 
@@ -154,6 +154,57 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 
 ---
 
+### 1.6 智能去广告（adfilter，v1.16.0）
+
+后端只做**控制面**：下发规则包、接收命中上报。**不做任何播放流量代理**
+（m3u8 改写 / ts 反代都没有），过滤在客户端执行，服务端零带宽。
+
+先看能力：`/healthz` 的 `capabilities` 含 `adfilter` 才调这两个接口，**不含就一次都别调**。
+
+#### 拉规则：`GET /api/v1/adfilter/rules?version=<本地版本>`
+
+```json
+// 有更新
+{ "changed": true, "version": 3,
+  "rules": { "thresholds": { "relative_max_ratio": 0.5, "absolute_max_sec": 300, "safety_floor": 0.8 },
+             "url_patterns": ["/ad/", "/ads/", "ad.m3u8"],
+             "site_overrides": [ { "host": "some-site.com", "mode": "off" } ] } }
+
+// 已最新，或本地版本高于服务端（服务端刚回滚）：都不带 rules
+{ "changed": false, "version": 3 }
+```
+
+- 参数 `version` 缺省 `0`；另支持 `channel=stable|beta`（缺省 stable，**未知值按 stable**，不会 4xx）；
+- 响应**不带 `code` 包装**，只读 `changed` / `version` / `rules`；
+- 规则里字段可缺省（缺省 = 用你内置的默认值）；未知字段忽略；
+- 服务端**从不 5xx**：读不到规则包时返回内置默认规则 + `version: 0`，按「版本相同」处理即可；
+- 客户端建议 30 分钟 TTL + 每次起播触发一次；本接口带 `Cache-Control: no-store`。
+
+区间约束（服务端发布时已按此校验，正常不会越界）：`relative_max_ratio` 0.05~0.95、
+`absolute_max_sec` 10~1800、`safety_floor` 0.5~1.0、`url_patterns` 1~64 条、`site_overrides` ≤256 条。
+
+#### 上报命中：`POST /api/v1/adfilter/report`
+
+```json
+{ "items": [ { "url": "https://x/20261110/abc/index.m3u8", "rule_version": 3,
+               "removed_runs": 2, "removed_ms": 51600, "total_ms": 13379900,
+               "at": 1762926745 } ] }
+```
+
+响应 `{ "accepted": 2, "dropped": 0, "duplicates": 0 }`（客户端不需要解析）。
+
+- `items` ≤50，超了整批 `400`；单批正常就按你现有的「≥5 条或拉规则成功时发」；
+- 幂等：`(凭据, url, at)` 去重，重复上报 `accepted: 0`，可以放心重试；
+- 限流：默认 60 请求/小时/凭据，超限 `429` + `Retry-After`；
+- 单条被丢弃的情况（计入 `dropped`，不影响同批其它条）：`url` 空或 >2048、
+  数值字段缺失/为负、`removed_ms > total_ms`、`at` 与服务端偏差 >7 天；
+- 鉴权与其它接口一致：read 级 Token 即可（这是客户端行为，不需要 admin）。
+
+> 广告过滤本身在端上完成，所以即使这两个接口全挂，播放与本地过滤也照常工作 ——
+> 拉不到新规则就用内置规则，上报失败就按你的队列重试/滚动丢弃。
+
+---
+
 ## 2. 接口总览
 
 ### A. 数据接口（客户端核心使用）
@@ -169,6 +220,8 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 | GET | `/api/v1/star/related` | 明星维度推荐（详情页「全部/按明星」Tab） |
 | GET | `/api/v1/star/works` | 按明星查作品（**v1.9.2** 明星 Tab 完整作品列表） |
 | GET | `/api/v1/minor-mode` | **v1.15.0** 未成年模式状态（是否生效 / 被标记的 18+ 源站） |
+| GET | `/api/v1/adfilter/rules?version=` | **v1.16.0** 拉取去广告规则包（`changed`/`version`/`rules`，见 1.6） |
+| POST | `/api/v1/adfilter/report` | **v1.16.0** 上报过滤命中明细（幂等 + 限流，read Token 可用，见 1.6） |
 | GET | `/api/v1/{slug}?ac=list\|detail` | 苹果 CMS(MacCMS) 兼容接口，现有播放器可直接对接 |
 
 ### B. 管理接口（管理端 App / 面板功能）
@@ -190,6 +243,11 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 | POST | `/api/v1/sources/{slug}/auto-sync?enabled=` | 单源站自动同步开关（是否参与定时任务/全站同步） |
 | POST | `/api/v1/sources/{slug}/adult?enabled=` | **v1.15.0** 单源站「是否含 18+ 内容」标记（面板源站管理表格调用） |
 | POST | `/api/v1/sources/adult?enabled=&slugs=` | **v1.15.1** 批量设置 18+ 标记（`slugs=all` 或逗号分隔；面板勾选多行后一次改完） |
+| GET | `/api/v1/adfilter/admin/packs?channel=` | **v1.16.0** 去广告规则包：当前版本 + 当前规则 + 历史清单（面板「去广告规则包」区块） |
+| GET | `/api/v1/adfilter/admin/packs/{version}` | **v1.16.0** 指定版本详情（含规则正文） |
+| POST | `/api/v1/adfilter/admin/packs` | **v1.16.0** 发布新版本（body `{rules, channel, note}`，服务端校验越界值） |
+| POST | `/api/v1/adfilter/admin/packs/rollback?version=` | **v1.16.0** 回滚到历史版本（发新版本号 + 旧内容） |
+| GET | `/api/v1/adfilter/admin/stats?days=` | **v1.16.0** 上报量聚合（不含 url） |
 | POST | `/api/v1/sources/auto-sync?enabled=&slugs=` | 批量自动同步开关（`slugs=all` 或逗号分隔列表） |
 | GET | `/api/v1/logs?limit=50` | 最近同步日志（跨源站） |
 | POST | `/api/v1/maintenance/recount` | 条数校准（异步执行） |
@@ -199,7 +257,7 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 > 管理接口全部为**异步受理**模式：POST 立即返回 `{"code":0,"msg":"...已受理"}`
 > （v1.14.1 纠偏：v1.14.0 起成功码统一为 0，原文档示例仍是旧的 1，已过时），实际进度通过轮询 `/api/v1/sources`（看 `syncing`/`progress` 字段）与 `/api/v1/logs` 获取。
 >
-> 上表只列客户端最常用的管理接口。**完整清单（共 57 个，方法+路径）见
+> 上表只列客户端最常用的管理接口。**完整清单（共 65 个，方法+路径）见
 > [`API_SPEC_FOR_AI.md` 4.0 接口总表](./API_SPEC_FOR_AI.md)** —— 其中鉴权（`/api/v1/auth/*`）、
 > 自定义源站（`/api/v1/sources/custom` 等）、明星词库维护（`/api/v1/star-terms*`）、
 > 明星 Tag 重建（`/api/v1/maintenance/star-tags`）本文未展开。

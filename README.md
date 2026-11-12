@@ -45,6 +45,14 @@
   可做服务端强制管控。v1.15.1 起面板可勾选多行批量标记/取消（`POST /api/v1/sources/adult`），
   且 5 秒轮询不再打断正在操作的表格。详见 [CLIENT_API 1.5](docs/CLIENT_API.md) 与
   [API_SPEC 4.27](docs/API_SPEC_FOR_AI.md)
+- **智能去广告控制面**（v1.16.0）：客户端在端上做 m3u8 广告过滤（结构指纹），后端**只做
+  控制面、不代理任何播放流量**——`GET /api/v1/adfilter/rules` 下发规则包（阈值 / 高置信
+  URL 模式 / 站点级例外，不发版即可调参、可一键回滚），`POST /api/v1/adfilter/report`
+  收命中明细（幂等去重 + 限流 + 逐条校验）给后续「站点级广告指纹库」攒数据。
+  发布前服务端按客户端钳制区间硬校验（越界直接拒），面板「去广告规则包」可编辑 JSON、
+  发布、回滚、看上报量。能力清单含 `adfilter` 时客户端才调用，老客户端零请求、
+  行为与 v1.15.1 完全一致。详见 [CLIENT_API 1.6](docs/CLIENT_API.md) 与
+  [API_SPEC 4.28](docs/API_SPEC_FOR_AI.md)
 
 > 文档入口：[`docs/README.md`](docs/README.md)（按用途索引全部文档）
 

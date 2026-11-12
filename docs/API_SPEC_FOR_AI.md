@@ -3,7 +3,7 @@
 > **本文档的用途**：把 VodSync 服务作为后端，交由 AI（或 AI 编程助手）开发客户端 App。
 > 文档自包含：只读本文即可完成全部对接，**不需要**阅读服务端源码。
 >
-> 对应服务版本：**v1.15.1** ｜ 文档版本：`2026-11-11` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
+> 对应服务版本：**v1.16.0** ｜ 文档版本：`2026-11-12` ｜ 机器可读规范：[`openapi.json`](./openapi.json)
 
 **目录**
 
@@ -13,7 +13,7 @@
 | [1](#1-服务能提供什么) | 服务能力概览 |
 | [2](#2-通用约定) | 鉴权 / 响应格式 / 错误码 / 分页 / 编码 |
 | [3](#3-数据模型字段字典) | 数据模型与字段字典 |
-| [4](#4-接口参考) | 接口逐一说明（54 个编号条目，含 4.27 未成年模式） |
+| [4](#4-接口参考) | 接口逐一说明（62 个编号条目，含 4.27 未成年模式、4.28 智能去广告） |
 | [5](#5-状态语义与推荐-ui最容易做错的部分) | 状态语义与推荐 UI（running / syncing / paused / auto_sync） |
 | [6](#6-端到端流程可直接交给-ai-实现) | 端到端流程（观影 App / 管理 App） |
 | [7](#7-客户端代码骨架) | 客户端代码骨架（TS / Kotlin / Flutter / Swift） |
@@ -370,8 +370,15 @@ type PlayLine = {
 | 53 | POST | `/api/v1/sources/{slug}/adult` | 管理 | **v1.15.0** 设置单源站「是否含 18+ 内容」标记（详见 4.27） |
 | 54 | GET | `/api/v1/minor-mode` | 业务 | **v1.15.0** 未成年模式状态（是否生效 / 18+ 源站清单，详见 4.27） |
 | 55 | POST | `/api/v1/sources/adult` | 管理 | **v1.15.1** 批量设置多站 18+ 标记（面板多选一次改完，详见 4.27） |
+| 56 | GET | `/api/v1/adfilter/rules` | 业务 | **v1.16.0** 拉取去广告规则包（四态语义，详见 4.28） |
+| 57 | POST | `/api/v1/adfilter/report` | 业务 | **v1.16.0** 上报过滤命中明细（幂等 + 限流，**read Token 可用**） |
+| 58 | GET | `/api/v1/adfilter/admin/packs` | 管理 | **v1.16.0** 规则包版本清单 + 当前规则 |
+| 59 | GET | `/api/v1/adfilter/admin/packs/{version}` | 管理 | **v1.16.0** 指定版本详情（含规则正文） |
+| 60 | POST | `/api/v1/adfilter/admin/packs` | 管理 | **v1.16.0** 发布新版本（服务端校验越界值） |
+| 61 | POST | `/api/v1/adfilter/admin/packs/rollback` | 管理 | **v1.16.0** 回滚到历史版本（发新版本号 + 旧内容） |
+| 62 | GET | `/api/v1/adfilter/admin/stats` | 管理 | **v1.16.0** 上报量聚合（不含 url） |
 
-> 本表编号 1~55。服务端实际共 **58 个方法+路径**（`openapi.json` 为准，含
+> 本表编号 1~62。服务端实际共 **65 个方法+路径**（`openapi.json` 为准，含
 > `POST /api/v1/auth/logout`、`GET /healthz.capabilities` 等未单列的自解释端点）。
 > 标「管理」的主要供管理面板使用，客户端 App 只需一枚 Token（见 2.1）即可调用「数据」「业务」类接口。
 > 鉴权类中 `/api/v1/auth/login` 与 `/api/v1/auth/state` **免鉴权**，其余需登录会话 cookie（`POST /api/v1/auth/password` 等也可用 Token 访问）。
@@ -386,10 +393,11 @@ type PlayLine = {
 {
   "status": "ok",
   "db": true,
-  "version": "1.15.1",
+  "version": "1.16.0",
   "build": "<commit sha>",
   "capabilities": ["backfill_play_from", "play_line_filter", "error_codes",
-                   "token_scope", "star_tags", "related", "paging_v2", "minor_mode", "tag_search"],
+                   "token_scope", "star_tags", "related", "paging_v2", "minor_mode",
+                   "adfilter", "tag_search"],
   "time": "2026-11-09T09:07:31.882914"
 }
 ```
@@ -414,6 +422,7 @@ type PlayLine = {
 | `related` | 服务端预计算的相关推荐可用 | 详情页推荐栏 |
 | `paging_v2` | `pagecount` 恒以 `page_size` 为基准，缺省 18 | 按 `pagecount` 判定翻页到底 |
 | `minor_mode` | **v1.15.0**：请求带 `X-Minor-Mode` / `minor_mode` 时服务端屏蔽 18+ 源站 | 有未成年模式开关的 App 才下发该开关；没有则降级为本地隐藏入口（详见 4.27） |
+| `adfilter` | **v1.16.0**：`/adfilter/rules` 可拉规则包、`/adfilter/report` 可上报命中 | **清单里没有就一次都别调**（零请求）；有则起播前拉规则，按本地攒批上报（详见 4.28） |
 
 形态：**数组**（推荐）。也接受对象形态 `{"tag_search": true, ...}`（加 `?detail=1` 时返回，
 给人看的，客户端不用）。
@@ -422,8 +431,8 @@ type PlayLine = {
 与 `/healthz` 同级）：
 
 ```json
-{ "status": "ok", "db": true, "version": "1.15.1",
-  "capabilities": ["backfill_play_from", "...", "minor_mode", "tag_search"], "time": "..." }
+{ "status": "ok", "db": true, "version": "1.16.0",
+  "capabilities": ["backfill_play_from", "...", "minor_mode", "adfilter", "tag_search"], "time": "..." }
 ```
 
 v1.14.0 文档中的 `/healthz.capabilities` 本意是「/healthz 响应里的 capabilities 字段」
@@ -1632,6 +1641,139 @@ App 显示「暂无内容」即可。这是刻意的：屏蔽 ≠ 报错，不�
    这是设计取舍 —— 上游 `vod_tag` 缺失率极高，逐条判定不可靠。
 3. `GET /api/v1/admin/tables/{name}/rows` 是需管理员会话的数据表浏览接口，
    按「原有管理操作不受影响」保持可见；它不在 App 的普通 Token 可达范围内。
+
+---
+
+### 4.28 智能去广告（adfilter，v1.16.0）
+
+**定位**：后端只做**控制面**，两件事 —— 下发规则包、接收命中上报。
+m3u8 改写 / ts 反代 / 播放代理**一律不做**（客户端在端上拦截播放列表响应体、原位重写、
+分片仍直连 CDN），所以本服务零带宽成本，也不承担播放故障。
+
+能力开关：`/healthz` 的 `capabilities` 含 `adfilter` 才调下面两个接口；**不含就一次都别调**。
+老客户端（不认识该能力）不调用、行为与升级前完全一致。
+
+#### 数据模型
+
+| 表 | 关键列 | 说明 |
+|---|---|---|
+| `adfilter_rule_packs` | `channel` + `version`（唯一）、`rules_json`、`note`、`created_at` | 每个渠道内 `version` 严格 +1；历史行**永不修改**（回滚也是加新行） |
+| `adfilter_reports` | `user_id`、`url`、`url_hash`、`rule_version`、`removed_runs`、`removed_ms`、`total_ms`、`at`、`created_at` | `(user_id, url_hash, at)` 唯一索引做幂等；明细只增不改 |
+
+单租户部署下 `user_id` 用**凭据身份**近似：`0` = 存量单 Token，`>0` = 具名 Token 的 id，
+`-1` = `API_KEY` 环境变量，`-2` = 面板会话，`-4` = 未鉴权（`AUTH_ENABLED=false` 的开放部署）。
+
+去重键用 `url_hash`（sha256）而不是 `url` 本身：`url` 允许到 2048 字符，UTF-8 下最长可达
+6KB，直接进 PG 唯一索引会超过 btree 单条上限（约 2704 字节）导致插入失败；摘要定长，
+去重语义完全相同。
+
+#### GET `/api/v1/adfilter/rules` — 规则包拉取
+
+| 参数 | 位置 | 必填 | 说明 |
+|---|---|---|---|
+| `version` | query | 否 | 客户端当前持有的规则包版本，缺省 `0` |
+| `channel` | query | 否 | `stable`（缺省）/ `beta`；**未知值按 stable 处理，不报错**（v1.16.0 预留，客户端后续加「参与内测」开关时传） |
+
+四种响应形态（客户端只需认这三种判断）：
+
+```json
+// ① 有更新（version 小于服务端）
+{ "changed": true, "version": 3,
+  "rules": { "thresholds": { "relative_max_ratio": 0.5, "absolute_max_sec": 300, "safety_floor": 0.8 },
+             "url_patterns": ["/ad/", "/ads/", "/gg/", "ad.m3u8"],
+             "site_overrides": [ { "host": "some-ad-heavy-site.com", "mode": "off" } ] } }
+
+// ② 已是最新 / ③ 客户端版本高于服务端（服务端刚回滚）：都不带 rules
+{ "changed": false, "version": 3 }
+```
+
+- **服务端从不返回 5xx**：规则包读不到（库暂不可用 / 从未发布）时降级为内置默认规则 +
+  `version: 0`，客户端按「版本相同」继续用自己的内置包。控制面故障不影响播放。
+- 响应带 `Cache-Control: no-store`（客户端自己有 30 分钟 TTL，中间层不能缓存）。
+- 本接口响应**不带 `code` 包装**，与契约文档一致：只读 `changed` / `version` / `rules`。
+
+**规则字段与校验区间**（服务端发布时按此硬校验；客户端对越界包是「整体丢弃回退内置规则」，
+不是「按钳制值跑」，所以服务端必须自己挡住）：
+
+| 字段 | 类型 | 默认 | 允许区间 | 语义 |
+|---|---|---|---|---|
+| `thresholds.relative_max_ratio` | number | 0.5 | `[0.05, 0.95]` | 组时长 < 比例 × 最长源组时长 才判广告 |
+| `thresholds.absolute_max_sec` | int | 300 | `[10, 1800]` | 广告组绝对时长上限（秒），防多段拼片正片被误杀 |
+| `thresholds.safety_floor` | number | 0.8 | `[0.5, 1.0]` | 过滤后总时长 < 原始 × 该值 → 客户端整体放弃本次过滤 |
+| `url_patterns` | string[] | 内置 8 项 | 1~64 条，每项 ≤64 字符 | 高置信 URL 子串（服务端统一转小写），命中且组时长 ≤ `absolute_max_sec` 才删 |
+| `site_overrides[].host` | string | — | ≤256 条，≤253 字符 | 站点域名（小写精确匹配播放地址 host） |
+| `site_overrides[].mode` | string | — | 目前仅 `off` | `off` = 该站整体不过滤（误报止血） |
+
+- 字段**缺省** = 客户端用自己的内置默认值；未知键静默忽略（向前兼容）。
+- `url_patterns` **不接受空数组**（语义上容易和「缺省回退内置 8 条」混淆）；
+  要关掉 URL 匹配，填一个永不命中的占位串，如 `/__none__/`。
+- 发布时若 `url_patterns` 含 `/shop/` `/sale/` `/brand/` `/buy/` `/cart/` 这类商业语义词，
+  服务端**不拒收但返回 `warnings`** —— 正常影视目录常带这些片段，容易误杀。
+
+#### POST `/api/v1/adfilter/report` — 命中上报
+
+请求体（批量，`items` ≤50）：
+
+```json
+{ "items": [ { "url": "https://x/20261110/abc/index.m3u8", "rule_version": 3,
+               "removed_runs": 2, "removed_ms": 51600, "total_ms": 13379900,
+               "at": 1762926745 } ] }
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `url` | string | 实际拉取的 m3u8 地址（可含查询串），≤2048 字符 |
+| `rule_version` | int | 上报时生效的规则包版本（0 = 仅内置规则） |
+| `removed_runs` | int | 删除的广告 run 数 |
+| `removed_ms` | int | 删除的广告总时长（毫秒） |
+| `total_ms` | int | 过滤前列表总时长（毫秒） |
+| `at` | int | 过滤发生时刻，epoch **秒** |
+
+响应：`{ "accepted": 2, "dropped": 0, "duplicates": 0 }`
+（客户端不解析内容；`accepted` = 去重后真正入库条数）
+
+**四道防护**（公网可写端点）：
+
+1. 鉴权必选，匿名 `401 / 40101`；**read 级 Token 也能调**（这是客户端行为，不是管理操作）；
+2. 限流：默认 60 请求/小时/凭据，超限 `429 / 42901` + `Retry-After`（`ADFILTER_REPORT_RATE_PER_HOUR`）；
+3. 结构：`items` 必须是数组且 ≤50，否则整批 `400`（客户端会拆小批重试，截断则会静默丢数据）；
+4. 单条：类型错 / 为负 / `removed_ms > total_ms` / `at` 偏差 >7 天 / `url` 超 2048 → **丢该条**，
+   在 `dropped` 里计数（稳定口径，不随批次变化）。未知字段忽略。
+
+**幂等**：`(user_id, url_hash, at)` 唯一，重复上报返回 `accepted: 0` + `duplicates: N`，
+不产生重复行。客户端「失败重试 + 队列滚动丢弃」的行为因此是安全的。
+
+#### 管理端（需 admin）
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/v1/adfilter/admin/packs?channel=&limit=` | 当前版本 + 当前规则 + 历史清单（历史项不含正文） |
+| `GET /api/v1/adfilter/admin/packs/{version}?channel=` | 指定版本详情（含规则正文，面板「载入」用） |
+| `POST /api/v1/adfilter/admin/packs` | body `{rules, channel, note}`；校验失败 `400`，并发撞版本 `409` |
+| `POST /api/v1/adfilter/admin/packs/rollback?version=&channel=&note=` | 用旧内容发新版本；版本不存在 `404` |
+| `GET /api/v1/adfilter/admin/stats?days=7` | 总量 / 近 N 天 / 去重地址数 / `removed_ratio`（**不含任何 url**） |
+
+面板「**去广告规则包**」区块即上述接口的 UI：读当前规则 → 编辑 JSON → 校验并发布；
+历史版本可「载入」（只填编辑框，不发布）或「回滚到此」（直接发新版本）。
+
+#### 兼容、灰度与回滚
+
+- **纯新增**：没有改任何既有接口/字段；不带 `adfilter` 能力的客户端零请求、零影响。
+- 灰度：`ADFILTER_ENABLED=false` 重启后 `/healthz` 不再声明该能力（两个接口返回 404），
+  已升级的客户端会静默停止调用、继续用本地内置规则 —— 相当于「只关控制面，不关功能」。
+- 回滚规则：`POST /api/v1/adfilter/admin/packs/rollback?version=<旧版本>`。
+  止血链：单站误杀 → 加 `site_overrides{host, mode:"off"}` 发新版（分钟级生效）；
+  整体误杀 → 回滚版本。客户端自身还有「过滤后时长 <80% 放弃」与「解析失败原样放行」兜底，
+  规则再差也不会导致播放失败，最多退化为「不过滤」。
+- 回滚代码版本：镜像退回 1.15.x 即可，两张新表对旧代码无影响（旧代码不读它们）。
+
+#### 已知限制
+
+1. 限流计数在**进程内存**里，多副本部署时按副本各自计数（自托管单容器场景够用）。
+2. `beta` 渠道没有单独发布过版本时版本为 0，客户端拿到的 `changed=false`，
+   会继续持用本地包 —— 与 stable 的版本号互不干扰是刻意设计（各渠道各发各的号）。
+3. 上报明细只增不改，**没有自动清理**：需要控制磁盘时按 `created_at` 手工归档，
+   或后续用 housekeeping 加保留期；当前量级（日活 × 2 批/会话）不构成压力。
 
 ---
 

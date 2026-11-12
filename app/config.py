@@ -237,6 +237,28 @@ CAPABILITIES_EXTRA = [
 ]
 
 # ---------------------------------------------------------------------------
+# 智能去广告（adfilter，v1.16.0）
+#
+# 后端只做控制面：下发规则包 + 接收命中上报，**不做任何播放流量代理**
+# （m3u8 改写、ts 反代都不在本服务范围内，过滤在客户端完成，零带宽成本）。
+#
+# ADFILTER_ENABLED 只影响**能力声明**与两个接口是否可用，不影响已有任何接口：
+# 设成 false 后 /healthz 不再声明 adfilter，客户端据此完全不调这两个接口。
+# ---------------------------------------------------------------------------
+ADFILTER_ENABLED = os.environ.get("ADFILTER_ENABLED", "true").lower() == "true"
+
+# 上报限流：每个 Token 每小时允许的请求数（App 正常 ≈ 每会话 1~2 次）。
+# 计数在进程内存里，多副本部署时按副本各自计数（自托管单容器场景够用）。
+ADFILTER_REPORT_RATE_PER_HOUR = int(os.environ.get("ADFILTER_REPORT_RATE_PER_HOUR", "60"))
+# 单批上报条数上限：客户端自己就按 ≤50 攒批，这里只是兜住异常客户端
+ADFILTER_REPORT_MAX_ITEMS = int(os.environ.get("ADFILTER_REPORT_MAX_ITEMS", "50"))
+# 上报时间戳与服务端时钟的最大允许偏差（秒）。超过即丢弃该条 ——
+# 手机时钟错乱会产生「未来数据」，直接污染按时间聚合的统计。
+ADFILTER_AT_SKEW_SEC = int(os.environ.get("ADFILTER_AT_SKEW_SEC", str(7 * 86400)))
+# 管理端历史版本保留条数（面板只展示最近这么多，更老的仍留在库里供回滚）
+ADFILTER_PACK_HISTORY = int(os.environ.get("ADFILTER_PACK_HISTORY", "20"))
+
+# ---------------------------------------------------------------------------
 # 标签精确检索（v1.14.0 / B-01）
 #
 # 详情页的标签胶囊点击后，按「分词后精确匹配 vod_tag」检索，而不是把标签

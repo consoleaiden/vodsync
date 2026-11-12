@@ -14,7 +14,7 @@
 services:
   vodsync:
     # 官方发布镜像（GitHub Actions 自动构建，双架构 amd64/arm64，公开可拉取）
-    # tag 说明（v1.9.3 起每次构建都带版本号；当前版本 1.15.1）：
+    # tag 说明（v1.9.3 起每次构建都带版本号；当前版本 1.16.0）：
     #   latest          最新（生产默认）
     #   1.14.0          版本号；同一版本多次构建时指向最新那次
     #   1.14.0-<sha7>   版本 + 提交，不可变 —— **回滚就用这个**
@@ -85,6 +85,16 @@ services:
       #   sources.is_adult=1 的源站；不带开关的现有调用行为完全不变。
       # 设 true：服务端对所有请求强制生效，客户端无法通过不带头绕过（家长统一管控）。
       MINOR_MODE_FORCE: "false"
+      # ---- 智能去广告控制面（v1.16.0）----
+      # 只做规则下发与命中上报，不代理任何播放流量（过滤在客户端执行）。
+      # 设 false = 能力清单不再声明 adfilter，两个接口 404，已升级客户端静默停止调用。
+      ADFILTER_ENABLED: "true"
+      # 上报限流：每个凭据每小时允许的请求数（App 正常 ≈ 每会话 1~2 次）
+      ADFILTER_REPORT_RATE_PER_HOUR: "60"
+      # 单批上限 / 时间戳最大偏差（秒）/ 面板历史版本保留条数
+      ADFILTER_REPORT_MAX_ITEMS: "50"
+      ADFILTER_AT_SKEW_SEC: "604800"
+      ADFILTER_PACK_HISTORY: "20"
       # ---- 能力清单灰度（v1.14.0）----
       # 单独关掉某项能力而不改代码：CAPABILITIES_DISABLE=tag_search
       # CAPABILITIES_DISABLE: ""

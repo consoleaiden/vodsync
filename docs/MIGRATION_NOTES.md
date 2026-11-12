@@ -1,7 +1,8 @@
-# 数据迁移说明（v1.14.0 ~ v1.15.0，MIGRATION_NOTES）
+# 数据迁移说明（v1.14.0 ~ v1.16.0，MIGRATION_NOTES）
 
-> 对应需求：`BACKEND_UPGRADE_REQUIREMENTS_2026-11-09.md`（B-01 / B-08 / B-09 / B-10 / B-11）与 v1.15.0「源站 18+ 标记与未成年模式」
-> 影响面：**新增 3 张表 + 2 个追加列**，不改任何现有列、不重命名任何字段。
+> 对应需求：`BACKEND_UPGRADE_REQUIREMENTS_2026-11-09.md`（B-01 / B-08 / B-09 / B-10 / B-11）、
+> v1.15.0「源站 18+ 标记与未成年模式」、v1.16.0「智能去广告规则下发与命中上报」
+> 影响面：**新增 5 张表 + 2 个追加列**，不改任何现有列、不重命名任何字段。
 > 升级方式：拉新镜像重启即可，`init_db()` 会自动建表补列，无需手工 SQL。
 
 ---
@@ -13,6 +14,9 @@
 | `video_tags` | 新表（标签倒排） | 自动建表 | `DROP TABLE video_tags` |
 | `tag_index_state` | 新表（回填进度） | 自动建表 | `DROP TABLE tag_index_state` |
 | `api_tokens` | 新表（具名 Token） | 自动建表 | `DROP TABLE api_tokens`（存量单 Token 不受影响） |
+| `sources.is_adult` | 追加列（18+ 标记） | 自动 `ALTER` | 保留无害（旧代码不读） |
+| `adfilter_rule_packs` | 新表（v1.16.0 去广告规则包） | 自动建表 + 启动播种 v1 | `DROP TABLE adfilter_rule_packs` |
+| `adfilter_reports` | 新表（v1.16.0 命中上报明细） | 自动建表 | `DROP TABLE adfilter_reports`（只影响统计，不影响播放） |
 | `settings.api_token_scope` | 新增一条配置行 | 启动时自动写入 `admin` | 删行即可（等价 admin） |
 
 **没有**改动的：`vod_{slug}` 表结构、`sources` 表、任何响应字段名、`list` / `detail` / `pagecount` /
@@ -125,6 +129,76 @@ curl -s http://<host>:8181/healthz | grep -o '"version":"[^"]*"'   # 期望 1.15
 ```
 
 服务端强制管控（可选，默认关）：compose 里设 `MINOR_MODE_FORCE: "true"`。
+
+---
+
+## 2.3 v1.16.0 新增两张表：去广告规则包与命中上报（2026-11-12）
+
+**自动建表 + 启动播种**，无需手工执行。等价 DDL：
+
+```sql
+-- 规则包：每个 channel 内 version 严格 +1，历史行永不修改（回滚 = 新增一行）
+CREATE TABLE IF NOT EXISTS adfilter_rule_packs (
+    id         SERIAL PRIMARY KEY,
+    channel    VARCHAR(16) NOT NULL DEFAULT 'stable',   -- stable / beta
+    version    INTEGER     NOT NULL,
+    rules_json TEXT        NOT NULL,                    -- 已规范化（键排序）的规则 JSON
+    note       VARCHAR(255) DEFAULT '',
+    created_at TIMESTAMP    DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_adfilter_pack_ver
+    ON adfilter_rule_packs (channel, version);
+
+-- 命中上报明细：只增不改，Phase 2「广告指纹库」的原始数据源
+CREATE TABLE IF NOT EXISTS adfilter_reports (
+    id           SERIAL PRIMARY KEY,
+    user_id      INTEGER      NOT NULL DEFAULT 0,       -- 凭据身份（见下）
+    url          VARCHAR(2048) NOT NULL,                -- 播放列表地址（不对外暴露）
+    url_hash     VARCHAR(64)  NOT NULL,                 -- sha256(url)，去重键
+    rule_version INTEGER      DEFAULT 0,
+    removed_runs INTEGER      DEFAULT 0,
+    removed_ms   BIGINT       DEFAULT 0,
+    total_ms     BIGINT       DEFAULT 0,                -- 过滤前总时长
+    at           BIGINT       NOT NULL,                 -- epoch 秒（用 BIGINT 避开 2038）
+    created_at   TIMESTAMP    DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_adfilter_report_dedup
+    ON adfilter_reports (user_id, url_hash, at);
+CREATE INDEX IF NOT EXISTS idx_adfilter_report_at ON adfilter_reports (at);
+```
+
+两处刻意的设计取舍（与需求文档的「建议 DDL」不完全相同，语义等价且更安全）：
+
+1. **主键用 `(channel, version)` 唯一索引**，不是单列 `version PK`。stable 与 beta 各自从
+   v1 开始发号，客户端只比较同一渠道内的大小；单列主键会让 beta 的发版把 stable 的号顶掉。
+2. **去重键用 `url_hash` 而非 `url`**。`url` 允许 2048 字符（UTF-8 最长约 6KB），直接进 PG
+   唯一索引会超过 btree 单条上限（约 2704 字节）导致插入失败；sha256 定长，去重语义不变。
+   原始 `url` 仍然完整保存，供 Phase 2 聚合用。
+
+`user_id` 在本服务（单租户自托管，没有多用户表）里用**凭据身份**近似：
+`0` = 存量单 Token，`>0` = `api_tokens.id`，`-1` = `API_KEY` 环境变量，
+`-2` = 面板会话，`-4` = 未鉴权（`AUTH_ENABLED=false` 的开放部署）。契约要求
+「按用户隔离、不得跨用户可见」，落到这里就是「按 Token 隔离」，且明细本身没有任何
+对外接口暴露（`/adfilter/admin/stats` 只给聚合数字，**不含 url**）。
+
+启动时会在 stable 渠道播种 v1（内置默认规则），因此面板「去广告规则包」首次打开
+就能看到 `stable v1`，而不是 `v0`（`v0` 会让管理员误以为功能没生效）。
+
+升级自检：
+
+```bash
+curl -s http://<host>:8181/healthz | grep -o '"version":"[^"]*"'   # 期望 1.16.0
+# capabilities 里应含 adfilter
+curl -s -H "Authorization: Bearer <token>" \
+  "http://<host>:8181/api/v1/adfilter/rules?version=0"
+# 期望：{"changed":true,"version":1,"rules":{...}}（重复带 version=1 → changed:false 且无 rules）
+```
+
+关闭控制面（保留客户端本地过滤）：compose 里设 `ADFILTER_ENABLED: "false"`，
+`/healthz` 不再声明 `adfilter`，两个接口返回 404，已升级的客户端会静默停止调用。
+
+回滚到 1.15.x 不需要删表（旧代码不读这两张表）；模型里的表定义不会影响
+`select(sources)` 等既有查询。
 
 ## 3. 回填（把存量数据灌进 `video_tags`）
 

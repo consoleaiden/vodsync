@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.15.1"
+    "version": "1.16.0"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -586,6 +586,346 @@
               "title": "Slugs"
             },
             "description": "逗号分隔的源站 slug；all 或留空=全部源站"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adfilter/rules": {
+      "get": {
+        "summary": "去广告规则包拉取（v1.16.0）",
+        "description": "下发规则包。四态语义（客户端只认这三种响应形态）：\n\n1. 首次（version=0 或缺省）→ `{changed:true, version:N, rules:{...}}`\n2. 已最新（version == 服务端版本）→ `{changed:false, version:N}`，**不带 rules**\n3. 客户端版本高于服务端（服务端刚回滚过）→ `changed:false` + 服务端当前版本，\n   客户端继续用本地较新的包，无副作用\n4. 规则包读不到（库暂不可用 / 从未发布）→ 返回内置默认规则 + version 0，\n   同样走上面三条判定，绝不 500 —— 客户端拿不到新规则就用自己内置的，\n   控制面故障不该影响播放\n\n不带 `adfilter` 能力的客户端不会调用本接口；调了也没关系（只读、无副作用）。",
+        "operationId": "adfilter_rules_api_v1_adfilter_rules_get",
+        "parameters": [
+          {
+            "name": "version",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "客户端当前持有的规则包版本号，缺省 0",
+              "default": 0,
+              "title": "Version"
+            },
+            "description": "客户端当前持有的规则包版本号，缺省 0"
+          },
+          {
+            "name": "channel",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "规则渠道：stable（缺省）/ beta；未知值按 stable 处理，不报错",
+              "title": "Channel"
+            },
+            "description": "规则渠道：stable（缺省）/ beta；未知值按 stable 处理，不报错"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adfilter/report": {
+      "post": {
+        "summary": "去广告命中上报（v1.16.0）",
+        "description": "批量接收过滤命中明细（客户端本地攒批：≥5 条或规则拉取成功时发，单批 ≤50）。\n\n防护（这是公网可写端点，四道闸一个都不能少）：\n  1. 鉴权必选：匿名 401（走 main.py 的统一鉴权中间件）；\n  2. 限流：默认 60 请求/小时/凭据，超限 429 + Retry-After；\n  3. 结构校验：items 必须是数组且 ≤50，否则整批 400（客户端会拆小批重试）；\n  4. 单条校验：类型错/为负/removed_ms>total_ms/时间偏差>7天/url>2048 → 丢该条。\n\n**幂等**：按 (user_id, url, at) 去重，重复上报返回 accepted=0，不产生重复行。\n响应里的 dropped（数据不合规）与 duplicates（重复）分开计数，便于排查\n「客户端一直在重试」还是「数据本身有问题」。",
+        "operationId": "adfilter_report_api_v1_adfilter_report_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adfilter/admin/packs": {
+      "get": {
+        "summary": "规则包版本清单（管理端）",
+        "description": "当前生效规则 + 历史版本清单（历史项只给版本号/备注/时间/字节数，不含正文）。\n\n面板「去广告规则包」区块用它一次性画出状态：当前版本、规则 JSON、历史。",
+        "operationId": "adfilter_admin_packs_api_v1_adfilter_admin_packs_get",
+        "parameters": [
+          {
+            "name": "channel",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "规则渠道：stable / beta",
+              "default": "stable",
+              "title": "Channel"
+            },
+            "description": "规则渠道：stable / beta"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 0,
+              "description": "返回的版本条数，0=用默认保留数",
+              "default": 0,
+              "title": "Limit"
+            },
+            "description": "返回的版本条数，0=用默认保留数"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "发布规则包新版本（管理端）",
+        "description": "发布新版本：服务端先校验再入库，版本号在本渠道内严格 +1。\n\n校验是硬性的 —— 客户端对越界包的处理是「整体丢弃回退内置规则」，\n不是「按钳制后的值跑」。所以这里挡住越界值，等于替客户端兜住发布事故。\n\nbody：`{\"rules\": {...}, \"channel\": \"stable\", \"note\": \"止血：xxx 站误杀\"}`\n\n返回里 `warnings` 是「不拒收但该看一眼」的提示（例如 url_patterns 里放了\n/shop/ 这类商业语义词，容易误杀正常影视目录）。",
+        "operationId": "adfilter_admin_publish_api_v1_adfilter_admin_packs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adfilter/admin/packs/{version}": {
+      "get": {
+        "summary": "规则包指定版本详情（管理端）",
+        "operationId": "adfilter_admin_pack_api_v1_adfilter_admin_packs__version__get",
+        "parameters": [
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Version"
+            }
+          },
+          {
+            "name": "channel",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "stable",
+              "title": "Channel"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adfilter/admin/packs/rollback": {
+      "post": {
+        "summary": "回滚规则包（管理端）",
+        "description": "回滚 = 用旧版本内容发一个**新版本**（version+1），不改历史行。\n\n这样客户端永远只需处理「版本变大」，不需要「版本变小」的分支；\n回滚本身也可以被再次回滚（历史都在）。",
+        "operationId": "adfilter_admin_rollback_api_v1_adfilter_admin_packs_rollback_post",
+        "parameters": [
+          {
+            "name": "version",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "要回滚到的历史版本号",
+              "title": "Version"
+            },
+            "description": "要回滚到的历史版本号"
+          },
+          {
+            "name": "channel",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "stable",
+              "title": "Channel"
+            }
+          },
+          {
+            "name": "note",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "回滚备注，缺省写「回滚至 vN」",
+              "default": "",
+              "title": "Note"
+            },
+            "description": "回滚备注，缺省写「回滚至 vN」"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adfilter/admin/stats": {
+      "get": {
+        "summary": "去广告上报统计（管理端）",
+        "description": "上报量聚合：总量 / 近 N 天 / 去重地址数 / 删除时长占比。\n\n`removed_ratio`（删除时长 ÷ 原始总时长）突增 = 规则可能过激；\n**不返回任何 url** —— 播放地址属于用户隐私，契约明确要求不得进对外接口。",
+        "operationId": "adfilter_admin_stats_api_v1_adfilter_admin_stats_get",
+        "parameters": [
+          {
+            "name": "days",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 90,
+              "minimum": 1,
+              "default": 7,
+              "title": "Days"
+            }
           }
         ],
         "responses": {

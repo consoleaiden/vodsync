@@ -399,6 +399,41 @@
     </div>
   </section>
 
+  <!-- 去广告规则包（v1.16.0，控制面：下发规则 + 命中统计） -->
+  <section class="panel" id="adfilterPanel">
+    <div class="head">
+      <h2>去广告规则包</h2>
+      <span class="hint">客户端 m3u8 广告过滤的阈值与 URL 模式 · 过滤在端上执行，服务端只下发规则与收上报</span>
+      <span style="flex:1"></span>
+      <span class="badge" id="adVersion">-</span>
+      <span class="muted" id="adStats" style="font-size:12px"></span>
+      <button class="sm" id="adfilterToggle" title="折叠 / 展开本区块（首次展开才加载数据）">展开 ▾</button>
+    </div>
+    <div id="adfilterWrap" style="display:none">
+      <div class="body pad">
+        <div class="muted" style="font-size:12px;line-height:1.75;margin-bottom:8px">
+          发布前服务端按客户端钳制区间校验，越界直接拒绝（客户端对越界包的处理是<b>整体丢弃回退内置规则</b>，不会「按钳制值跑」）：
+          <code>relative_max_ratio</code> 0.05~0.95 · <code>absolute_max_sec</code> 10~1800 · <code>safety_floor</code> 0.5~1.0 ·
+          <code>url_patterns</code> ≤64 条（每项 ≤64 字符）· <code>site_overrides</code> ≤256 条（<code>mode</code> 目前只支持 <code>off</code>）。
+          字段缺省 = 客户端用自己的内置默认值。
+        </div>
+        <textarea id="adRules" rows="11" class="star-input" spellcheck="false"
+          placeholder='{ "thresholds": { "relative_max_ratio": 0.5, "absolute_max_sec": 300, "safety_floor": 0.8 },&#10;  "url_patterns": ["/ad/", "/ads/"],&#10;  "site_overrides": [ { "host": "some-ad-heavy-site.com", "mode": "off" } ] }'></textarea>
+        <div class="row" style="margin-top:8px">
+          <select class="tbSel" id="adChannel" title="规则渠道：stable=全量，beta=内测（客户端传入 channel 才用）">
+            <option value="stable">stable</option>
+            <option value="beta">beta</option>
+          </select>
+          <input id="adNote" placeholder="发布备注（可选，如：某站误杀止血）" style="flex:1;min-width:180px">
+          <button class="primary" id="btnAdPublish">校验并发布</button>
+          <button id="btnAdReload" title="放弃编辑，重新读取服务端当前规则">↻ 读取当前</button>
+        </div>
+        <div class="muted" id="adHint" style="font-size:12px;margin-top:6px"></div>
+      </div>
+      <div id="adHistory"><div class="empty">展开时加载规则包…</div></div>
+    </div>
+  </section>
+
   <!-- 同步日志 -->
   <section class="panel">
     <div class="head">
@@ -1756,7 +1791,122 @@ $("#btnLogout").addEventListener("click", async () => {
   location.href = authState.enabled ? "/login" : "/";
 });
 
-// ---------------- 刷新循环 ----------------
+// ---------------- 去广告规则包（v1.16.0） ----------------
+// 只做控制面：读当前规则 / 编辑后发布 / 回滚 / 看上报量。过滤本身在客户端执行。
+let adState = { channel: "stable", current: 0, packs: [] };
+
+function renderAdHistory() {
+  const rows = adState.packs || [];
+  const box = $("#adHistory");
+  if (!box) return;
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">暂无历史版本（服务端会在启动时播种 v1）</div>';
+    return;
+  }
+  box.innerHTML = `<table>
+    <thead><tr><th style="width:110px">版本</th><th>备注</th><th style="width:150px">发布时间</th>
+      <th style="width:90px">大小</th><th style="width:150px">操作</th></tr></thead>
+    <tbody>${rows.map((r) => `<tr>
+      <td>v${r.version}${r.version === adState.current ? ' <span class="badge ok">生效中</span>' : ""}</td>
+      <td>${esc(r.note) || "-"}</td>
+      <td class="muted">${fmtTime(r.created_at)}</td>
+      <td class="muted">${fmtNum(r.size)} B</td>
+      <td style="white-space:nowrap">
+        <button class="sm" data-ad-act="load" data-ver="${r.version}">载入</button>
+        <button class="sm warn" data-ad-act="rollback" data-ver="${r.version}">回滚到此</button>
+      </td></tr>`).join("")}</tbody></table>`;
+}
+
+async function adLoadStats() {
+  try {
+    const st = await api("/api/v1/adfilter/admin/stats?days=7");
+    $("#adStats").textContent = st.available
+      ? `近 ${st.days} 天上报 ${fmtNum(st.recent)} 条 · 累计 ${fmtNum(st.total)} 条 · 删除时长占比 ${(Number(st.removed_ratio || 0) * 100).toFixed(2)}%`
+      : "上报统计暂不可用";
+  } catch (e) {
+    $("#adStats").textContent = "";
+  }
+}
+
+async function adLoad() {
+  const ch = ($("#adChannel") && $("#adChannel").value) || "stable";
+  $("#adHint").textContent = "";
+  try {
+    const data = await api(`/api/v1/adfilter/admin/packs?channel=${encodeURIComponent(ch)}`);
+    adState = { channel: data.channel, current: Number(data.current || 0), packs: data.packs || [] };
+    $("#adVersion").textContent = `${data.channel} v${data.current}`;
+    $("#adVersion").className = "badge " + (Number(data.current) > 0 ? "ok" : "mute");
+    $("#adRules").value = JSON.stringify(data.rules || {}, null, 2);
+    renderAdHistory();
+    adLoadStats();
+  } catch (e) {
+    $("#adHistory").innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+$("#btnAdReload").onclick = () => adLoad();
+$("#adChannel").onchange = () => adLoad();
+
+$("#btnAdPublish").onclick = async () => {
+  let rules;
+  try {
+    rules = JSON.parse($("#adRules").value || "{}");
+  } catch (e) {
+    $("#adHint").textContent = "";
+    return toast("规则 JSON 解析失败：" + e.message, true);
+  }
+  const btn = $("#btnAdPublish");
+  btn.disabled = true;
+  try {
+    const res = await api("/api/v1/adfilter/admin/packs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        rules,
+        channel: $("#adChannel").value || "stable",
+        note: $("#adNote").value || "",
+      }),
+    });
+    $("#adNote").value = "";
+    toast(res.msg || `已发布 v${res.version}`);
+    // 告警不阻断发布（只是「容易误杀」的提示），但必须让人看见
+    if (res.warnings && res.warnings.length) {
+      toast("发布告警：" + res.warnings.join("；"), true);
+    }
+    await adLoad();
+  } catch (e) {
+    toast("发布失败：" + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+// 历史版本行内的两个操作：载入（只填到编辑框，不发布）/ 回滚（直接发新版本）
+$("#adHistory").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-ad-act]");
+  if (!btn) return;
+  const ver = Number(btn.dataset.ver);
+  const ch = encodeURIComponent(adState.channel || "stable");
+  if (btn.dataset.adAct === "load") {
+    try {
+      const d = await api(`/api/v1/adfilter/admin/packs/${ver}?channel=${ch}`);
+      $("#adRules").value = JSON.stringify(d.rules || {}, null, 2);
+      $("#adHint").textContent = `已载入 v${ver} 的内容到编辑框（尚未发布，点「校验并发布」才生效）`;
+    } catch (e) {
+      toast("读取版本失败：" + e.message, true);
+    }
+    return;
+  }
+  if (!confirm(`确认把 v${ver} 的内容发布为新版本（版本号 +1）？\n客户端下次拉取后生效（TTL 30 分钟，起播也会触发）。`)) return;
+  try {
+    const res = await api(`/api/v1/adfilter/admin/packs/rollback?version=${ver}&channel=${ch}`, { method: "POST" });
+    toast(res.msg || "已回滚");
+    await adLoad();
+  } catch (e) {
+    toast("回滚失败：" + e.message, true);
+  }
+});
+
 // 可折叠区块（v1.14.1）：默认收起、首次展开才加载数据，缩短管理面板首屏时间。
 // - tables / stars：加载一次，不进轮询（编辑/翻页状态不能被覆盖，与之前行为一致）
 // - sources / logs：展开期间跟随 5 秒轮询；收起时不请求（这就是省流的关键）
@@ -1770,6 +1920,8 @@ const SEC_DEFS = {
   stars:   { btn: "#starsToggle",   wrap: "#starsWrap",   load: () => loadStarTerms() },
   sources: { btn: "#sourcesToggle", wrap: "#sourcesWrap", load: () => loadSources() },
   logs:    { btn: "#logsToggle",    wrap: "#logsWrap",    load: () => loadLogs() },
+  // v1.16.0：规则包不进轮询（编辑到一半被刷新顶掉最烦），只在展开时加载一次
+  adfilter: { btn: "#adfilterToggle", wrap: "#adfilterWrap", load: () => adLoad() },
 };
 
 function secPaint(key) {
@@ -1806,6 +1958,7 @@ function secLoadOpen() {
   });
 }
 
+// ---------------- 刷新循环 ----------------
 let timer = null;
 async function refreshAll() {
   // 概览与暂停开关是全页面共用的轻接口，恒刷新；

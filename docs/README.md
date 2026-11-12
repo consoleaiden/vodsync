@@ -1,6 +1,6 @@
 # 文档索引
 
-> 本目录共 12 份文档（含本索引）+ 1 份机器可读规范。**当前服务版本：v1.15.1**。
+> 本目录共 12 份文档（含本索引）+ 1 份机器可读规范。**当前服务版本：v1.16.0**。
 > 阅读顺序建议：先按「我要做什么」找到对应文档，不必通读。
 
 ---
@@ -12,6 +12,7 @@
 | 让 AI 把 VodSync 当后端写客户端 App | **[API_SPEC_FOR_AI.md](./API_SPEC_FOR_AI.md)** ★ | AI / 客户端开发 |
 | 人肉速查接口（不想读长文） | [CLIENT_API.md](./CLIENT_API.md) | 客户端开发 |
 | 对接 18+ 标记与未成年模式（v1.15.0） | [CLIENT_API 1.5](./CLIENT_API.md) / [API_SPEC 4.27](./API_SPEC_FOR_AI.md) | 客户端开发 + 运维 |
+| 对接 m3u8 去广告规则下发与命中上报（v1.16.0） | [CLIENT_API 1.6](./CLIENT_API.md) / [API_SPEC 4.28](./API_SPEC_FOR_AI.md) | 客户端开发 + 运维 |
 | 给**已有 App** 加 API Token（要改代码的施工单） | [APP_TOKEN_UPGRADE.md](./APP_TOKEN_UPGRADE.md) | AI / 客户端开发 |
 | 从 v1.9.3 升到 v1.10.x，确认前端要不要改 | [UPGRADE_2026-11-07_v1.10.x.md](./UPGRADE_2026-11-07_v1.10.x.md) | 前端 + 运维 |
 | 从 v1.10.x 升到 v1.11.0（播放线路过滤） | [UPGRADE_2026-11-07_v1.11.0.md](./UPGRADE_2026-11-07_v1.11.0.md) | 前端 + 运维 |
@@ -31,13 +32,13 @@
 
 | 文档 | 类型 | 时效 | 对应版本 | 说明 |
 |---|---|---|---|---|
-| [API_SPEC_FOR_AI.md](./API_SPEC_FOR_AI.md) | **现行** | 随版本更新 | v1.15.0 | 唯一权威接口文档：字段字典、状态语义、代码骨架、排查表。4.27 节为未成年模式契约 |
-| [CLIENT_API.md](./CLIENT_API.md) | **现行** | 随版本更新 | v1.15.0 | 同一份接口的简明版，适合人读；与 API_SPEC 冲突时以 API_SPEC 为准。1.5 节为未成年模式 |
-| [openapi.json](./openapi.json) | **现行** | 随版本重新生成 | v1.15.0 | 由 `app.openapi()` 导出，**不要手改** |
+| [API_SPEC_FOR_AI.md](./API_SPEC_FOR_AI.md) | **现行** | 随版本更新 | v1.16.0 | 唯一权威接口文档：字段字典、状态语义、代码骨架、排查表。4.27 未成年模式、4.28 智能去广告 |
+| [CLIENT_API.md](./CLIENT_API.md) | **现行** | 随版本更新 | v1.16.0 | 同一份接口的简明版，适合人读；与 API_SPEC 冲突时以 API_SPEC 为准。1.5 未成年模式、1.6 智能去广告 |
+| [openapi.json](./openapi.json) | **现行** | 随版本重新生成 | v1.16.0 | 由 `app.openapi()` 导出，**不要手改** |
 | [deploy-synology.md](./deploy-synology.md) | **现行** | 按需更新 | 与版本无关 | 群晖 Container Manager 部署步骤 |
 | [APP_TOKEN_UPGRADE.md](./APP_TOKEN_UPGRADE.md) | **现行**（一次性施工单） | 鉴权逻辑至今未变 | 起草于 v1.5.1 | 施工步骤对 v1.13.0 仍适用；只有分页默认值受 v1.5.2 影响 |
 | [UPGRADE_2026-11-09_v1.14.0.md](./UPGRADE_2026-11-09_v1.14.0.md) | **升级报告** | 固定快照 | v1.13.0 → v1.14.0 | 能力清单、错误码收紧、`?tag=` 精确检索、Token 权限：前端要改什么、灰度怎么放、怎么回滚 |
-| [MIGRATION_NOTES.md](./MIGRATION_NOTES.md) | **现行** | 随结构变更 | v1.15.0 | 新增 3 张表的 DDL、回填脚本用法与耗时、灰度/回滚开关、升级自检命令（v1.14.1 追加列见 2.1 节；v1.15.0 `sources.is_adult` 见 2.2 节） |
+| [MIGRATION_NOTES.md](./MIGRATION_NOTES.md) | **现行** | 随结构变更 | v1.16.0 | 新增 5 张表的 DDL、回填脚本用法与耗时、灰度/回滚开关、升级自检命令（v1.14.1 追加列见 2.1；v1.15.0 `sources.is_adult` 见 2.2；v1.16.0 去广告两表见 2.3） |
 | [DEPLOY_HTTPS.md](./DEPLOY_HTTPS.md) | **现行** | 按需更新 | 与版本无关 | HTTPS 双栈上线顺序、必须检查的 5 个点、验收命令、群晖图形界面要点 |
 | [UPGRADE_2026-11-07_v1.11.0.md](./UPGRADE_2026-11-07_v1.11.0.md) | **升级报告** | 固定快照 | v1.10.x → v1.11.0 | 播放线路识别/过滤/排序：前端要看的字段、行为变化、回填与观测 |
 | [UPGRADE_2026-11-07_v1.10.x.md](./UPGRADE_2026-11-07_v1.10.x.md) | **升级报告** | 固定快照 | v1.9.3 → v1.10.x | 前端对接清单（第 1~3 节）+ 部署/回滚/观察（第 5~8 节）。v1.10.1 见第 8.5 节 |

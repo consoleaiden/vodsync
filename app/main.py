@@ -245,6 +245,13 @@ def on_startup():
 
     pause.load_state()   # 恢复持久化的同步暂停状态（重启不丢）
 
+    # 去广告规则包播种（v1.16.0）：stable 渠道没有任何版本时写一版内置默认。
+    # 不做的话客户端 version=0 拉到的服务端版本也是 0，面板上「当前版本」永远
+    # 显示 0，管理员会以为功能没生效。内部已吞异常，失败不影响启动。
+    from . import adfilter
+
+    adfilter.ensure_seed()
+
     from . import syncer
 
     # 断电 / 崩溃 / docker restart 后，上一次留下的 running 日志永远不会自己结束，

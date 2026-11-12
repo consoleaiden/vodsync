@@ -322,8 +322,62 @@ def request_scope(request: Request) -> str:
     return resolve_scope(extract_token(request))
 
 
+def request_identity(request: Request) -> int:
+    """
+    本请求的身份标识（用于按「用户」隔离与去重，v1.16.0）。
+
+    本服务是单租户自托管，没有多用户表 —— 契约里的 `user_id` 用「Token 身份」
+    近似，语义是**按凭据隔离**，不会跨 Token 互相看到彼此的上报（明细本身也
+    不对外暴露，只有聚合数字）。
+
+      0    存量单 Token（settings.api_token，面板「设置」里那枚）
+      >0   具名 Token 的 api_tokens.id
+      -1   API_KEY 环境变量
+      -2   管理面板会话 cookie
+      -3   无法识别的凭据（理论上到不了这里，鉴权中间件已经放行过）
+      -4   未鉴权（AUTH_ENABLED=false 的开放部署，所有匿名上报归入同一个桶）
+    """
+    if not is_enabled():
+        return -4
+    if has_session(request):
+        return -2
+    supplied = extract_token(request)
+    if not supplied:
+        return -4
+    legacy = get_token()
+    if legacy and hmac.compare_digest(supplied, legacy):
+        return 0
+    if config.API_KEY and hmac.compare_digest(supplied, config.API_KEY):
+        return -1
+    from .models import api_tokens
+
+    try:
+        with database.engine.connect() as conn:
+            row = conn.execute(
+                api_tokens.select().where(
+                    api_tokens.c.token_hash == _hash(supplied),
+                    api_tokens.c.revoked == 0,
+                )
+            ).mappings().first()
+    except Exception:  # noqa: BLE001
+        return -3
+    return int(row["id"]) if row else -3
+
+
 # 需要 admin 的路径前缀（读接口不在此列：列表/详情/搜索/分类/统计/暂停状态）
-_ADMIN_PREFIXES = ("/api/v1/auth/", "/api/v1/admin/", "/api/v1/maintenance/")
+_ADMIN_PREFIXES = (
+    "/api/v1/auth/",
+    "/api/v1/admin/",
+    "/api/v1/maintenance/",
+    # v1.16.0：去广告规则包的**管理端**（发布/回滚/版本详情/统计）属于写操作域，
+    # 但对外下发的 GET /api/v1/adfilter/rules 不在此前缀下，read Token 照常可用。
+    "/api/v1/adfilter/admin/",
+)
+
+# 显式放行「非 GET 但只读 Token 也该能用」的路径（精确匹配）。
+# 上报是客户端（read Token）的正常行为，不是管理操作 —— 若按默认规则要求
+# admin，打开 TOKEN_SCOPE_ENFORCE 后所有 App 上报都会 403，功能静默失效。
+_READ_SCOPE_WRITES = frozenset({"/api/v1/adfilter/report"})
 
 
 def requires_admin(method: str, path: str) -> bool:
@@ -332,10 +386,11 @@ def requires_admin(method: str, path: str) -> bool:
 
     规则刻意简单（可解释、可审计）：
       - 非 GET/HEAD（任何写操作、同步触发、词库 CRUD）-> admin
-      - /auth/*  /admin/*  /maintenance/*  -> admin（即使 GET，也含敏感信息）
+      - /auth/*  /admin/*  /maintenance/*  /adfilter/admin/*  -> admin（即使 GET）
       - /healthz 永远免鉴权（在 PUBLIC_PATHS 里，走不到这里）
-    单条例外：/api/v1/star/tags/status、/related/status 这类**只读统计**保留给
-    read —— 它们只返回覆盖率数字，不含任何写入口。
+    例外：
+      - /api/v1/star/tags/status、/related/status 这类**只读统计**保留给 read；
+      - /api/v1/adfilter/report 是客户端上报（见 _READ_SCOPE_WRITES）。
     """
     if method in ("GET", "HEAD", "OPTIONS"):
         if path in ("/api/v1/related/status", "/api/v1/star/tags/status"):
@@ -343,6 +398,8 @@ def requires_admin(method: str, path: str) -> bool:
         return any(path.startswith(p) for p in _ADMIN_PREFIXES)
     # 登录/登出本身就是未登录时的入口，不能要求 admin
     if path in ("/api/v1/auth/login", "/api/v1/auth/logout"):
+        return False
+    if path in _READ_SCOPE_WRITES:
         return False
     return True
 

@@ -107,7 +107,9 @@ def main():
 
     print("\nA. 数据兼容与版本")
     before = setup()
-    check("A1 版本号 1.15.1", __version__ == "1.15.1", __version__)
+    # 版本号只增不减：断言「≥ 1.15.0」而不是锁死补丁号，后续升级不用改这条
+    _ver = tuple(int(x) for x in __version__.split(".")[:3])
+    check("A1 版本号 ≥ 1.15.0", _ver >= (1, 15, 0), __version__)
     check("A2 capabilities 声明 minor_mode",
           "minor_mode" in caps.snapshot(db_ok=True), caps.snapshot(db_ok=True))
     check("A3 sources 表存在 is_adult 列", "is_adult" in {c.name for c in models.sources.c}, "")
@@ -355,7 +357,7 @@ def main():
     for p in ("openapi.json", os.path.join("docs", "openapi.json")):
         spec = json.load(open(os.path.join(ROOT, p), encoding="utf-8"))
         check(f"J2 {p} 版本与新增端点",
-              spec["info"]["version"] == "1.15.1"
+              tuple(int(x) for x in spec["info"]["version"].split(".")[:3]) >= (1, 15, 0)
               and "/api/v1/minor-mode" in spec["paths"]
               and "/api/v1/sources/{slug}/adult" in spec["paths"]
               and "/api/v1/sources/adult" in spec["paths"], "")

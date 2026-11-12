@@ -30,7 +30,7 @@ def _static() -> list:
     每项都对应一个已实现的接口/参数，注释里写清「客户端据此做什么」，
     避免有人只加名字不实现，把客户端带进沟里。
     """
-    return [
+    caps = [
         # mode=backfill_play_from（v1.11.0）：回填上游 vod_play_from，
         # 客户端控制台的「回填线路」按钮据此决定是否显示
         "backfill_play_from",
@@ -52,12 +52,22 @@ def _static() -> list:
         # 服务端屏蔽 is_adult=1 的源站及其全部内容；源站清单每项带 is_adult。
         # 静态项：声明的是「服务端已实现这套过滤」，不依赖库里有没有标记。
         "minor_mode",
+        # 智能去广告（v1.16.0）：/adfilter/rules 下发规则包、/adfilter/report 收上报。
+        # 客户端判定：清单不含本项 -> 两个接口一次都不调（零请求）。
+        # 过滤本身在端上做，服务端不代理任何播放流量，所以这里是纯静态能力。
+        "adfilter",
     ]
+    if not config.ADFILTER_ENABLED:
+        caps = [c for c in caps if c != "adfilter"]
+    return caps
 
 
 # 需要查库才能兑现的能力：数据库不可用时必须从清单里摘掉，否则客户端会
 # 去调用一个必然 500 的接口。其余静态项（错误码、分页语义、路由形态）
 # 跟库没关系，降级时照常声明 —— 它们描述的是「服务端行为契约」，不是数据。
+# adfilter 特意**不**在此列：规则包读不到时 /adfilter/rules 会退回内置默认
+# 规则（version=0）而不是 500，能力仍然成立；上报接口失败时客户端本来就会
+# 静默重试，不需要靠能力声明来关掉。
 _DB_DEPENDENT = frozenset({"star_tags", "related", "tag_search"})
 
 
