@@ -417,11 +417,13 @@
         <div class="muted" style="font-size:12px;line-height:1.75;margin-bottom:8px">
           发布前服务端按客户端钳制区间校验，越界直接拒绝（客户端对越界包的处理是<b>整体丢弃回退内置规则</b>，不会「按钳制值跑」）：
           <code>relative_max_ratio</code> 0.05~0.95 · <code>absolute_max_sec</code> 10~1800 · <code>safety_floor</code> 0.5~1.0 ·
+          <code>safety_floor_high_confidence</code> 0.4~1.0（v1.5.169 高置信安全钳）·
+          <code>duplicate_max_ratio</code> 0.3~0.9（v1.5.169 重复插入上限）·
           <code>url_patterns</code> ≤64 条（每项 ≤64 字符）· <code>site_overrides</code> ≤256 条（<code>mode</code> 目前只支持 <code>off</code>）。
           字段缺省 = 客户端用自己的内置默认值。
         </div>
         <textarea id="adRules" rows="11" class="star-input" spellcheck="false"
-          placeholder='{ "thresholds": { "relative_max_ratio": 0.5, "absolute_max_sec": 300, "safety_floor": 0.8 },&#10;  "url_patterns": ["/ad/", "/ads/"],&#10;  "site_overrides": [ { "host": "some-ad-heavy-site.com", "mode": "off" } ] }'></textarea>
+          placeholder='{ "thresholds": { "relative_max_ratio": 0.5, "absolute_max_sec": 300, "safety_floor": 0.8, "safety_floor_high_confidence": 0.5, "duplicate_max_ratio": 0.8 },&#10;  "url_patterns": ["/ad/", "/ads/"],&#10;  "site_overrides": [ { "host": "some-ad-heavy-site.com", "mode": "off" } ] }'></textarea>
         <div class="row" style="margin-top:8px">
           <select class="tbSel" id="adChannel" title="规则渠道：stable=全量，beta=内测（客户端传入 channel 才用）">
             <option value="stable">stable</option>
@@ -1848,10 +1850,15 @@ function renderAdHosts(st) {
   const th = st.thresholds || {};
   const hint = $("#adHostsHint");
   if (hint) {
+    // v1.16.3：用户手动举报的漏判样本单独展示，与「疑似过激」互补
+    // （一个是删多了、一个是没删到），不混进上面的按站聚合。
+    const missTop = (st.miss_hosts || []).slice(0, 3)
+      .map((h) => `${esc(h.host)} ×${fmtNum(h.reports)}`).join("、");
     hint.textContent = `近 ${fmtNum(st.days)} 天 · ${fmtNum(st.hosts_total || 0)} 个站点`
       + ` · 疑似过激 ${fmtNum(st.suspicious_count || 0)} 个`
       + ` · 口径：样本 ≥ ${fmtNum(th.min_reports || 0)} 且 平均占比 > ${th.avg_removed_ratio}`
-      + ` 或 平均段数 > ${th.avg_removed_runs}`;
+      + ` 或 平均段数 > ${th.avg_removed_runs}`
+      + (st.miss_reports ? ` · 漏判举报 ${fmtNum(st.miss_reports)} 条（${missTop}）` : "");
   }
   const rows = st.hosts || [];
   if (!rows.length) {

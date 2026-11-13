@@ -1778,18 +1778,32 @@ m3u8 改写 / ts 反代 / 播放代理**一律不做**（客户端在端上拦�
                "avg_removed_runs": 2.0, "last_at": 1762926745,
                "suspicious": false, "reasons": [] } ],
   "hosts_total": 1, "suspicious_count": 0, "host_limit": 20,
-  "thresholds": { "avg_removed_ratio": 0.15, "avg_removed_runs": 4, "min_reports": 5 } }
+  "thresholds": { "avg_removed_ratio": 0.15, "avg_removed_runs": 4, "min_reports": 5 },
+  "miss_reports": 2,
+  "miss_hosts": [ { "host": "2609.lbsl2026.com", "reports": 2, "last_at": 1762926745 } ] }
 ```
 
 | `hosts[]` 字段 | 含义 |
 |---|---|
 | `host` | 播放列表 URL 的 hostname，小写、去端口 / userinfo / 路径；**不含 url 原文** |
-| `reports` | 窗口内该站上报条数 |
+| `reports` | 窗口内该站**有效过滤样本**条数（v1.16.3 起只统计 `removed_runs > 0`） |
 | `distinct_urls` | 该站去重后的地址数（按 `url_hash`） |
 | `avg_removed_ratio` / `max_removed_ratio` | 窗口内**逐条** `removed_ms/total_ms` 的算术平均 / 最大，4 位小数；`total_ms=0` 的单条按 0 计 |
 | `avg_removed_runs` | 逐条删除广告段数的算术平均，2 位小数 |
 | `last_at` | 该站最近一次上报时刻（epoch 秒） |
 | `suspicious` / `reasons` | 是否疑似规则过激 / 命中了哪条口径（便于面板提示，不代表已止血） |
+
+**v1.16.3：漏判样本视图**（前端 spec v1.1 §2.2 / §4.4）：播放页「有广告」按钮会投递
+`removed_runs=0, removed_ms=0, total_ms=0` 的**用户手动举报**记录。这类行 ratio 恒 0、
+runs 恒 0，混进 `hosts` 会把 `avg_removed_ratio` / `avg_removed_runs` 拉低，抵消
+「按站点发现误杀」的作用。因此：
+
+- `hosts` 聚合只统计 `removed_runs > 0` 的有效样本，**既有字段名与语义不变**；
+- 举报样本单独返回 `miss_reports`（总数）与 `miss_hosts`（按 host 分组，最多 `limit` 条，
+  每项 `host` / `reports` / `last_at`），与 `suspicious`（删多了）互补，表示「没删到」；
+- 两者同源，只统计 host 可解析的样本；**不返回任何 url 原文** —— spec §2.2 建议列 url
+  与 §4.4「url 不得进入对外接口」冲突，按隐私条款从严；
+- `total` / `recent` / `removed_ratio` 等全局字段口径不变（0/0/0 对分子分母均无贡献）。
 
 **判定口径**（服务端统一计算，阈值随响应一起返回，前端不硬编码）：
 

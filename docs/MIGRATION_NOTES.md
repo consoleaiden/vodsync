@@ -1,8 +1,9 @@
-# 数据迁移说明（v1.14.0 ~ v1.16.2，MIGRATION_NOTES）
+# 数据迁移说明（v1.14.0 ~ v1.16.3，MIGRATION_NOTES）
 
 > 对应需求：`BACKEND_UPGRADE_REQUIREMENTS_2026-11-09.md`（B-01 / B-08 / B-09 / B-10 / B-11）、
 > v1.15.0「源站 18+ 标记与未成年模式」、v1.16.0「智能去广告规则下发与命中上报」、
-> v1.16.1「按站点分布统计」、v1.16.2「标题词库回填修复」
+> v1.16.1「按站点分布统计」、v1.16.2「标题词库回填修复」、
+> v1.16.3「adfilter 新阈值登记 + 漏判样本隔离（无数据库变更）」
 > 影响面：**新增 6 张表 + 3 个追加列**，不改任何现有列、不重命名任何字段。
 > 升级方式：拉新镜像重启即可，`init_db()` 会自动建表补列，无需手工 SQL。
 
@@ -240,6 +241,42 @@ curl -s -H "Authorization: Bearer <token>" \
 
 回滚到 1.16.0 不需要删列（旧代码不读 `host`，INSERT 时该列走 `DEFAULT ''`）；
 旧版 stats 只给全局字段，面板退回显示一行概览。
+
+## 2.5 v1.16.3：adfilter 新阈值登记 + 漏判样本隔离（2026-11-13）
+
+**数据库变更：无**。不建表、不加列、不改索引、不回填历史数据，拉镜像重启即可生效。
+回滚直接切回 v1.16.2 镜像：旧代码不读 `miss_reports` / `miss_hosts`，也不认识
+`safety_floor_high_confidence` / `duplicate_max_ratio`，会按既有「未知键静默丢弃」
+处理，不会产生坏数据。
+
+代码变更：
+
+1. `adfilter._THRESHOLDS` 登记客户端 v1.5.169 新增的两个阈值：
+   `safety_floor_high_confidence` (0.4~1.0) / `duplicate_max_ratio` (0.3~0.9)，
+   区间与 `AdFilterRules.java` 的 `clamp` 完全一致。`default_rules()` **保持 3 项不动**
+   —— 字段缺省即客户端用内置默认（0.5 / 0.8），既有规则包响应逐字不变。
+2. `/api/v1/adfilter/admin/stats` 的 `hosts` 聚合排除 `removed_runs = 0` 的
+   用户手动举报样本（0/0/0），避免它们把 `avg_removed_ratio` / `avg_removed_runs`
+   拉低而稀释误杀判定；这些样本改为单独返回 `miss_reports` / `miss_hosts`，
+   只含 host + 数量 + 时间，**不含 url 原文**。
+
+升级验收：
+
+```bash
+curl -s http://<host>:8181/healthz | grep -o '"version":"[^"]*"'   # 期望 1.16.3
+# 发布一版带两个新阈值的规则包，回显里应原样保留这两个字段
+curl -s -X POST -H "Authorization: Bearer <token>" -H 'Content-Type: application/json' \
+  -d '{"rules":{"thresholds":{"safety_floor_high_confidence":0.45,"duplicate_max_ratio":0.75}}}' \
+  "http://<host>:8181/api/v1/adfilter/admin/packs"
+# stats 响应新增 miss_reports / miss_hosts，且 hosts[].reports 不再被举报样本稀释
+curl -s -H "Authorization: Bearer <token>" \
+  "http://<host>:8181/api/v1/adfilter/admin/stats?days=7"
+```
+
+**兼容性**：接口路径、参数、鉴权、幂等键一律未改；老客户端收不到新字段时走内置
+默认值，行为不变。新增字段是**追加**，老调用方按字段名取值不受影响。
+
+---
 
 ## 3. 回填（把存量数据灌进 `video_tags`）
 

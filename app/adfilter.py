@@ -56,6 +56,15 @@ _THRESHOLDS = {
     "relative_max_ratio": (0.05, 0.95, False),
     "absolute_max_sec": (10, 1800, True),
     "safety_floor": (0.5, 1.0, False),
+    # v1.16.3：客户端 v1.5.169「同一批分片被贴两遍」判据新增的两个阈值。
+    # 区间必须与 AdFilterRules.java 的 clamp 完全一致：服务端放行的值客户端
+    # 不会再修正，越界包会被整体丢弃回退内置规则。
+    # 不登记不会出事（客户端有内置默认 0.5 / 0.8），但 normalize() 是白名单
+    # 遍历，面板填了会被静默丢掉，运营侧就失去动态调参能力。
+    # default_rules() 刻意不补这两项：字段缺省 = 客户端用内置默认，
+    # 也让「服务端从未发过规则」的默认包保持与既有契约逐字一致。
+    "safety_floor_high_confidence": (0.4, 1.0, False),
+    "duplicate_max_ratio": (0.3, 0.9, False),
 }
 
 # 语义化商业词：放进 url_patterns 会把「/shop/ 目录下的正片」当广告删掉。
@@ -661,7 +670,14 @@ def stats(days: int = 7, limit: int = 0, min_reports: int = 0) -> dict:
       - avg_removed_ratio / max_removed_ratio = 窗口内**逐条 ratio 的算术平均 / 最大**
         （不是 sum(removed_ms)/sum(total_ms)，后者会让长片压过短片，与 max 也不同源）；
       - 窗口 = `at >= now - days*86400`（与既有 recent 一致，按客户端上报时刻）；
-      - distinct_urls 按 url_hash 去重，不返回任何 url 原文。
+      - distinct_urls 按 url_hash 去重，不返回任何 url 原文；
+      - v1.16.3：hosts 聚合只统计 `removed_runs > 0` 的有效过滤样本。
+        `removed_runs = 0` 是播放页「有广告」按钮投递的**用户手动举报 /
+        漏判样本**（0/0/0，见前端 spec §2.2：客户端 record() 仅在过滤结果
+        非 null 时调用，至少删 1 段）。这类行 ratio 恒 0、runs 恒 0，混进
+        按站聚合会把 avg 拉低，正好抵消「按站点发现误杀」的作用。它们不参与
+        判定，改为单独返回 `miss_reports` / `miss_hosts`；两者同源，只统计
+        host 可解析的样本，且不含任何 url 原文（spec §4.4 隐私条款）。
 
     异常判定（只**标记**，绝不自动改规则包）：样本数 >= min_reports 且
     avg_removed_ratio > ADFILTER_HOST_SUSPECT_RATIO 或
@@ -710,6 +726,27 @@ def stats(days: int = 7, limit: int = 0, min_reports: int = 0) -> dict:
                     adfilter_reports.c.at >= since,
                     adfilter_reports.c.host != "",          # 待回填的老行
                     adfilter_reports.c.host != HOST_UNKNOWN,  # 解析不出域名的行
+                    # v1.16.3：只看真正删过广告的样本。用户手动举报的 0/0/0
+                    # 不参与「规则是否过激」的统计（见 docstring）。
+                    adfilter_reports.c.removed_runs > 0,
+                )
+                .group_by(adfilter_reports.c.host)
+            ).all()
+
+            # 举报样本单独成视图：与 suspicious（删多了）互补，表示
+            # 「用户说有广告、算法没删」。只给 host / 数量 / 时间，不给 url。
+            missed = conn.execute(
+                select(
+                    adfilter_reports.c.host,
+                    func.count().label("reports"),
+                    func.max(adfilter_reports.c.at).label("last_at"),
+                )
+                .select_from(adfilter_reports)
+                .where(
+                    adfilter_reports.c.at >= since,
+                    adfilter_reports.c.removed_runs == 0,
+                    adfilter_reports.c.host != "",
+                    adfilter_reports.c.host != HOST_UNKNOWN,
                 )
                 .group_by(adfilter_reports.c.host)
             ).all()
@@ -746,6 +783,13 @@ def stats(days: int = 7, limit: int = 0, min_reports: int = 0) -> dict:
     hosts_all.sort(key=lambda h: (
         not h["suspicious"], -h["avg_removed_ratio"], -h["reports"], h["host"],
     ))
+    # v1.16.3：漏判样本按举报数降序、同值按 host，保证结果稳定可复现。
+    miss_hosts_all = [{
+        "host": r._mapping["host"],
+        "reports": int(r._mapping["reports"] or 0),
+        "last_at": int(r._mapping["last_at"]) if r._mapping["last_at"] else None,
+    } for r in missed]
+    miss_hosts_all.sort(key=lambda h: (-h["reports"], h["host"]))
     return {
         # ↓ 以下是 v1.16.0 既有字段，一个都没改；老调用方零影响
         "available": True,
@@ -765,4 +809,9 @@ def stats(days: int = 7, limit: int = 0, min_reports: int = 0) -> dict:
             "min_reports": min_reports,
         },
         "host_limit": limit,
+        # ↓ v1.16.3 新增：用户手动举报的漏判样本（removed_runs=0），已从
+        #   hosts 聚合中排除；只给 host + 数量 + 时间，不含任何 url 原文。
+        #   miss_reports 与 miss_hosts 同源，只统计 host 可解析的样本。
+        "miss_reports": sum(h["reports"] for h in miss_hosts_all),
+        "miss_hosts": miss_hosts_all[:limit],
     }
