@@ -1,9 +1,10 @@
-# 数据迁移说明（v1.14.0 ~ v1.16.3，MIGRATION_NOTES）
+# 数据迁移说明（v1.14.0 ~ v1.16.4，MIGRATION_NOTES）
 
 > 对应需求：`BACKEND_UPGRADE_REQUIREMENTS_2026-11-09.md`（B-01 / B-08 / B-09 / B-10 / B-11）、
 > v1.15.0「源站 18+ 标记与未成年模式」、v1.16.0「智能去广告规则下发与命中上报」、
 > v1.16.1「按站点分布统计」、v1.16.2「标题词库回填修复」、
-> v1.16.3「adfilter 新阈值登记 + 漏判样本隔离（无数据库变更）」
+> v1.16.3「adfilter 新阈值登记 + 漏判样本隔离（无数据库变更）」、
+> v1.16.4「管理面板性能与批量管理（无数据库变更，仅 settings 增加一个 key）」
 > 影响面：**新增 6 张表 + 3 个追加列**，不改任何现有列、不重命名任何字段。
 > 升级方式：拉新镜像重启即可，`init_db()` 会自动建表补列，无需手工 SQL。
 
@@ -275,6 +276,62 @@ curl -s -H "Authorization: Bearer <token>" \
 
 **兼容性**：接口路径、参数、鉴权、幂等键一律未改；老客户端收不到新字段时走内置
 默认值，行为不变。新增字段是**追加**，老调用方按字段名取值不受影响。
+
+## 2.6 v1.16.4：管理面板性能与批量管理（2026-11-13）
+
+**数据库变更：无**。不建表、不加列、不改索引、不回填。唯一落库的写入是 `settings`
+表里新增一个 key `panel_blocked_sources`（JSON，记录面板屏蔽的 slug 与屏蔽前的暂停位）：
+
+```json
+{"s35192781f1": {"paused_before": 0, "at": "2026-11-13T16:40:12"}}
+```
+
+`settings` 表早已存在（存密码哈希 / Token 等），本 key 与它们同级，**不参与任何业务
+读取**。回滚到 v1.16.3 时该 key 变成无人读取的孤立行，无害；若想彻底清掉：
+
+```sql
+DELETE FROM settings WHERE key = 'panel_blocked_sources';
+```
+
+代码变更（全部只影响管理面，客户端接口一行未改）：
+
+1. `GET /api/v1/star-terms` 新增**可选**分页与筛选（`page` / `page_size` /
+   `q` / `ids_only`）。不传 `page_size` 时行为与升级前完全一致（一次返回全部 +
+   原有字段），老调用方与既有回归用例零影响；面板固定传 `page_size=50`。
+   新增字段全部是附加的：`total` / `enabled_total` / `page` / `page_size` / `pages` / `q`。
+2. 新增 `POST /api/v1/star-terms/batch`：批量 `delete` / `enable` / `disable`。
+   语义与逐条 `DELETE` / `PATCH` 完全一致（同样不自动重算 `star_map` / `video_tags`），
+   只是把 N 次往返 + N 次词库正则重载收敛成 1 次。上限 20000 个 id。
+3. 新增 `GET /api/v1/admin/overview`：把面板 5 秒轮询的 4 个请求（stats / pause /
+   sources / logs）合并成 1 次往返。内部**直接复用原 handler**，字段与口径逐字不变；
+   老接口全部保留，前端在合并接口不可用时自动降级回落。
+4. 新增 `GET|POST /api/v1/admin/source-blocks`：面板屏蔽名单。屏蔽 = 记入上面的
+   settings key + 复用既有 `set_source_paused(slug, True)`，因此定时任务/全站同步会
+   跳过该站；**不改** `enabled` / `auto_sync` / `is_adult`，客户端可见的源站集合不变。
+   取消屏蔽只清「因屏蔽而暂停」的位，用户自己暂停过的站保持暂停。
+5. 三个慢读接口在**路由层**加进程内快照缓存（底层计算函数一行未改）：
+   `admin/tables` 60 秒、`star/tags/status` 与 `related/status` 各 120 秒，
+   均支持 `refresh=1` 强制实时重算（面板对应「↻ 强制刷新」按钮）。
+
+为什么需要第 5 条：线上实测（群晖 DS + 12GB 库）`/admin/tables` 48 秒、
+`/star/tags/status` 23 秒、`/related/status` 6 秒，瓶颈是**逐站 `COUNT(*)` 扫大表**
+（磁盘 IO），不是网络（同链路 `/healthz` 首字节 0.2 秒）。这些数字是给人看的核对值，
+秒级新鲜度没有意义，因此缓存几分钟是安全的；需要精确值时按钮会带 `refresh=1`。
+
+升级验收：
+
+```bash
+curl -s http://<host>:8181/healthz | grep -o '"version":"[^"]*"'   # 期望 1.16.4
+# 分页：total 与旧行为一致，list 长度按 page_size 收敛
+curl -s -H "X-API-Key: <token>" "http://<host>:8181/api/v1/star-terms?page=1&page_size=50"
+# 合并接口：stats / pause / sources / logs / blocks 五段齐全
+curl -s -H "X-API-Key: <token>" "http://<host>:8181/api/v1/admin/overview"
+# 慢接口第二次起应命中缓存（cache_age_s > 0）
+curl -s -H "X-API-Key: <token>" "http://<host>:8181/api/v1/admin/tables"
+```
+
+**兼容性**：4 个新端点纯新增；`star-terms` 老参数语义不变；屏蔽只动 `paused`
+标记与 settings，客户端 App 无需改动。
 
 ---
 

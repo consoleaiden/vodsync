@@ -8,6 +8,7 @@
 """
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -20,7 +21,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from sqlalchemy import bindparam, func, select, text
+from sqlalchemy import bindparam, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 
 from .. import __version__, adfilter, apiresp, auth, config, database, minor_mode
@@ -1816,14 +1817,126 @@ def recent_logs(limit: int = Query(50, ge=1, le=200)):
 # 「标识符进 SQL」的位置，改这里之前先读那个模块的安全边界说明。
 # ---------------------------------------------------------------------------
 @router.get("/api/v1/admin/tables")
-def admin_list_tables():
+def admin_list_tables(
+    refresh: bool = Query(False, description="跳过 60 秒快照缓存，强制重算（表清单按钮用）"),
+):
     """
     可浏览的表清单（含列元信息与行数）。settings 表有意不在列表里 ——
     它存密码哈希 / 会话密钥，只读浏览不该把它们端出来。
-    """
-    from .. import tablebrowse
 
-    return {"code": SUCCESS_CODE, "tables": tablebrowse.list_browsable()}
+    v1.16.4：结果做 60 秒进程内快照缓存。表结构只在升级/新加源站时变化，
+    面板每次展开都要重扫一遍 catalog + 大表行数没有意义。点「↻ 表清单」
+    会带 `refresh=1` 强制重算，语义与升级前完全一致。
+    """
+    from .. import panel, tablebrowse
+
+    tables, age = panel.cached("admin.tables", 60.0, tablebrowse.list_browsable,
+                               refresh=refresh)
+    return {"code": SUCCESS_CODE, "tables": tables, "cache_age_s": age}
+
+
+# ---------------------------------------------------------------------------
+# 面板轮询合并接口 + 源站屏蔽（v1.16.4，纯管理面能力）
+#
+# 合并接口不新增任何计算：直接复用下面的既有 handler，把 4 次 HTTP 往返
+# 收敛成 1 次。源站屏蔽只写 settings + 既有的 sources.paused 标记，
+# 不碰 syncer / scheduler 的一行逻辑。
+# ---------------------------------------------------------------------------
+@router.get("/api/v1/admin/overview", summary="面板轮询合并只读接口（管理端）")
+def admin_overview(
+    request: Request,
+    sections: str = Query("stats,pause,sources,logs",
+                          description="逗号分隔：stats / pause / sources / logs"),
+):
+    """
+    一次往返取回面板 5 秒轮询需要的全部数据。
+
+    旧面板每轮并发发 4 个请求（stats / pause / sources / logs），在 Tailscale
+    中继链路上光建连就要 4 × RTT。这里复用完全相同的 handler 组包，字段、口径、
+    鉴权一概不变；老接口全部保留，`refreshAll()` 在合并接口不可用时自动降级。
+    `blocks` 恒返回（一次小查询），面板据此过滤已屏蔽源站。
+    """
+    from .. import panel
+
+    want = {x.strip() for x in (sections or "").split(",") if x.strip()}
+    out = {"code": SUCCESS_CODE}
+    if "stats" in want:
+        out["stats"] = stats()
+    if "pause" in want:
+        out["pause"] = pause_status()
+    if "sources" in want:
+        out["sources"] = list_sources(request)
+    if "logs" in want:
+        out["logs"] = recent_logs(20)
+    out["blocks"] = {"blocked": panel.blocked_slugs()}
+    return out
+
+
+@router.get("/api/v1/admin/source-blocks", summary="已屏蔽源站清单（管理端）")
+def admin_source_blocks():
+    """返回被面板屏蔽的 slug 列表（持久化在 settings，刷新/重启不丢）。"""
+    from .. import panel
+
+    return {"code": SUCCESS_CODE, "blocked": panel.blocked_slugs()}
+
+
+@router.post("/api/v1/admin/source-blocks", summary="屏蔽 / 取消屏蔽源站（管理端）")
+def admin_set_source_blocks(payload: dict):
+    """
+    屏蔽 = 从面板列表隐藏 + 复用既有「单源站暂停」标记让定时任务/全站同步跳过。
+
+    - 不改变 `enabled` / `auto_sync` / `is_adult` 等任何业务标记，客户端接口
+      （`/source`、`/api/v1/videos` 等）看到的源站集合完全不变。
+    - 屏蔽前若该站本来就被手动暂停，取消屏蔽会**还原**成暂停，不会误开启。
+    - 取消屏蔽只清暂停标记，**不触发** `resume_source()` 的自动同步（那些站
+      往往就是访问不了才被屏蔽的，不该一取消就又去抓一遍）。
+    - 手动单站同步入口不受影响，随时可以单独试某个站是否恢复了。
+    """
+    from .. import panel
+    from ..syncer import set_source_paused
+
+    body = payload or {}
+    blocked = bool(body.get("blocked"))
+    if body.get("blocked") is None:
+        raise HTTPException(status_code=400, detail="必须提供 blocked=true 或 blocked=false")
+    raw = body.get("slugs")
+    if isinstance(raw, str):
+        raw = [x.strip() for x in raw.split(",") if x.strip()]
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(status_code=400, detail="slugs 不能为空")
+    slugs = list(dict.fromkeys(str(x).strip() for x in raw if str(x).strip()))[:200]
+
+    with database.engine.connect() as conn:
+        known = {r[0]: bool(r[1]) for r in conn.execute(
+            select(sources.c.slug, sources.c.paused)
+            .where(sources.c.slug.in_(slugs))
+        ).all()}
+    slugs = [s for s in slugs if s in known]
+    if not slugs:
+        raise HTTPException(status_code=404, detail="没有匹配的源站")
+
+    mapping = panel.get_blocks()
+    if blocked:
+        for s in slugs:
+            if s not in mapping:
+                mapping[s] = {"paused_before": 1 if known.get(s) else 0,
+                              "at": datetime.now().isoformat(timespec="seconds")}
+            set_source_paused(s, True)
+    else:
+        for s in slugs:
+            before = mapping.pop(s, {})
+            # 只把「因屏蔽而暂停」的位清掉；用户自己暂停过的保持暂停
+            if not int(before.get("paused_before") or 0):
+                set_source_paused(s, False)
+    panel.set_blocks(mapping)
+    final = panel.blocked_slugs()
+    return {
+        "code": SUCCESS_CODE,
+        "blocked": final,
+        "changed": slugs,
+        "msg": f"已{'屏蔽' if blocked else '取消屏蔽'} {len(slugs)} 个源站"
+               f"（当前共屏蔽 {len(final)} 个）",
+    }
 
 
 @router.get("/api/v1/admin/tables/{name}/rows")
@@ -2446,25 +2559,84 @@ def _parse_star_terms_input(raw) -> list:
     return out
 
 
+# 面板可选的分页档位：50（默认）/ 100 / 200 / 500。
+STAR_PAGE_SIZES = (50, 100, 200, 500)
+# 「全选 / 反选」需要拉全量 id，防止有人把整库 id 一次性塞进请求体。
+STAR_IDS_MAX = 20000
+
+
+def _star_like_pattern(raw: str) -> str:
+    """LIKE 通配符转义（与 tablebrowse 同口径），避免用户输入 % _ 变成通配。"""
+    kw = (raw or "").strip()[:64]
+    return "%" + kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _star_terms_cond(q: str) -> list:
+    if not (q or "").strip():
+        return []
+    pat = _star_like_pattern(q)
+    from ..models import star_terms
+
+    return [or_(star_terms.c.term.ilike(pat, escape="\\"),
+                star_terms.c.aliases.ilike(pat, escape="\\"),
+                star_terms.c.note.ilike(pat, escape="\\"))]
+
+
 @router.get("/api/v1/star-terms")
-def star_terms_list():
+def star_terms_list(
+    page: int = Query(1, ge=1, description="页码（仅 page_size>0 时生效）"),
+    page_size: int = Query(0, ge=0, le=500,
+                           description="每页 50/100/200/500；0 或不传 = 旧行为（返回全部）"),
+    q: str = Query("", max_length=64, description="按词条 / 别名 / 备注模糊过滤"),
+    ids_only: int = Query(0, ge=0, le=1,
+                          description="1 = 只返回当前筛选下全部 id（面板全选 / 反选用）"),
+):
     """
     词库清单（含停用条目，便于面板管理）。
 
-    v1.10.0：`active` 改为返回**进程内当前生效的启用条数**（不再每次请求都
-    重新编译词库正则）。刚写完词库时增删改接口会立即 reload，因此 `active`
-    在一次写请求之后就是新值；多副本部署时其他实例最迟在下次重启/定时任务后一致。
+    v1.10.0：`active` 返回**进程内当前生效的启用条数**（读接口不重编译词库正则）。
+    v1.16.4：新增可选分页与筛选。**不传 page_size 时仍是旧行为**（返回全部 +
+    原有字段），老客户端与既有回归用例零影响；面板固定传 `page_size=50`。
+    新增字段全部是附加的：`total / enabled_total / page / page_size / pages / q`。
     """
     from ..models import star_terms
 
+    cond = _star_terms_cond(q)
     with database.engine.connect() as conn:
-        rows = conn.execute(
-            select(star_terms).order_by(star_terms.c.id.desc())
-        ).mappings().all()
+        if ids_only:
+            ids = [r[0] for r in conn.execute(
+                select(star_terms.c.id).where(*cond)
+                .order_by(star_terms.c.id.desc()).limit(STAR_IDS_MAX)
+            ).all()]
+            return {"code": SUCCESS_CODE, "ids": ids, "total": len(ids), "q": q}
+
+        total = int(conn.execute(
+            select(func.count()).select_from(star_terms).where(*cond)
+        ).scalar() or 0)
+        enabled_total = int(conn.execute(
+            select(func.count()).select_from(star_terms)
+            .where(*cond, star_terms.c.enabled == 1)
+        ).scalar() or 0)
+
+        if page_size == 0:
+            size = 0                                   # 旧行为：一次返回全部
+        elif page_size in STAR_PAGE_SIZES:
+            size = page_size
+        else:
+            size = min(STAR_PAGE_SIZES, key=lambda x: abs(x - page_size))
+        if size:
+            pages = max(1, math.ceil(total / size))
+            cur = min(page, pages)
+            stmt = (select(star_terms).where(*cond)
+                    .order_by(star_terms.c.id.desc())
+                    .limit(size).offset((cur - 1) * size))
+        else:
+            pages, cur = 1, 1
+            stmt = select(star_terms).where(*cond).order_by(star_terms.c.id.desc())
+        rows = conn.execute(stmt).mappings().all()
+
     from .. import related
 
-    # v1.10.0 / P11：读接口不再重新加载+编译词库正则（万级词库约 10ms 且抖动内存），
-    # 直接返回进程内已生效的条数；写接口（增删改）才 reload。
     return {
         "code": SUCCESS_CODE,
         "infer_mode": config.RELATED_STAR_INFER_MODE,
@@ -2479,6 +2651,59 @@ def star_terms_list():
             }
             for r in rows
         ],
+        # 以下为 v1.16.4 附加字段：面板分页 / 全库计数用，老客户端忽略即可
+        "total": total,
+        "enabled_total": enabled_total,
+        "page": cur,
+        "page_size": size or total,
+        "pages": pages,
+        "q": q,
+    }
+
+
+@router.post("/api/v1/star-terms/batch", summary="批量删除 / 启用 / 停用词库词条（管理端）")
+def star_terms_batch(payload: dict):
+    """
+    面板多选后的批量管理：一次事务、一次词库正则重载。
+
+    与逐条 DELETE / PATCH 的语义完全一致（都不自动重算 star_map / video_tags，
+    需要用户点「重算推荐」），只是把 N 次往返 + N 次 regex 编译收敛成 1 次。
+    批量删除上限 20000 个 id，避免一次误操作把整个词库连带请求体拖垮。
+    """
+    from .. import related
+    from ..models import star_terms
+
+    body = payload or {}
+    action = str(body.get("action") or "delete")
+    if action not in ("delete", "enable", "disable"):
+        raise HTTPException(status_code=400, detail="action 只能是 delete / enable / disable")
+    raw = body.get("ids")
+    if isinstance(raw, str):
+        raw = [x for x in re.split(r"[,\s]+", raw) if x]
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+    try:
+        ids = list(dict.fromkeys(int(x) for x in raw))[:STAR_IDS_MAX]
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="ids 必须是整数数组") from None
+
+    with database.write_txn() as conn:
+        if action == "delete":
+            res = conn.execute(star_terms.delete().where(star_terms.c.id.in_(ids)))
+        else:
+            res = conn.execute(
+                star_terms.update().where(star_terms.c.id.in_(ids))
+                .values(enabled=1 if action == "enable" else 0)
+            )
+        affected = res.rowcount or 0
+    active = related.reload_star_terms()
+    label = {"delete": "删除", "enable": "启用", "disable": "停用"}[action]
+    return {
+        "code": SUCCESS_CODE,
+        "action": action,
+        "affected": affected,
+        "active": active,
+        "msg": f"已批量{label} {affected} 个词条（点「重算推荐」生效）",
     }
 
 
@@ -2710,19 +2935,35 @@ def star_tags_rebuild(
 
 
 @router.get("/api/v1/star/tags/status")
-def star_tags_status():
-    """各源站明星 Tag 覆盖情况：总视频数 / 缺演员视频数 / 已映射明星条数。"""
-    from .. import star_tags
+def star_tags_status(
+    refresh: bool = Query(False, description="跳过 2 分钟快照缓存，重新逐站实时 count"),
+):
+    """
+    各源站明星 Tag 覆盖情况：总视频数 / 缺演员视频数 / 已映射明星条数。
 
-    return {"code": SUCCESS_CODE, "list": star_tags.status_all()}
+    v1.16.4：这个核对接口逐站对 vod_* 大表做 `COUNT(*) FILTER`，线上实测
+    23~50 秒。底层 `star_tags.status_all()` 的数字口径一字未改（仍用真实
+    count，不用估算），只在路由层加 2 分钟快照；面板显示「统计于 N 秒前」，
+    另有「强制刷新」按钮带 `refresh=1` 拿实时值。
+    """
+    from .. import panel, star_tags
+
+    data, age = panel.cached("star.tags.status", 120.0, star_tags.status_all,
+                             refresh=refresh)
+    return {"code": SUCCESS_CODE, "list": data, "cache_age_s": age}
 
 
 @router.get("/api/v1/related/status")
-def related_status():
+def related_status(
+    refresh: bool = Query(False, description="跳过 2 分钟快照缓存，重新 GROUP BY 实时统计"),
+):
     """各源站相关推荐覆盖率（管理/验收核对：videos / computed / coverage%）。"""
-    from .. import related
+    from .. import panel, related
 
-    return {"code": SUCCESS_CODE, "algo_version": config.RELATED_ALGO_VERSION, "list": related.coverage_all()}
+    data, age = panel.cached("related.status", 120.0, related.coverage_all,
+                             refresh=refresh)
+    return {"code": SUCCESS_CODE, "algo_version": config.RELATED_ALGO_VERSION,
+            "list": data, "cache_age_s": age}
 
 
 # ---------------------------------------------------------------------------

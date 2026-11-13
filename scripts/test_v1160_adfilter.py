@@ -365,9 +365,10 @@ def main():
           and "adfilter_reports" in mdoc, "")
     spec = json.load(open(os.path.join(ROOT, "openapi.json"), encoding="utf-8"))
     spec2 = json.load(open(os.path.join(ROOT, "docs", "openapi.json"), encoding="utf-8"))
-    check("I7 两份 openapi 一致且版本与代码一致 / 65 方法",
+    # v1.16.4 起面板新增了分页/批量/屏蔽/合并轮询端点，这里改为「基线方法数只增不减」
+    check("I7 两份 openapi 一致且版本与代码一致 / 方法数 ≥ 65",
           spec == spec2 and spec["info"]["version"] == __version__
-          and sum(len(v) for v in spec["paths"].values()) == 65, spec["info"]["version"])
+          and sum(len(v) for v in spec["paths"].values()) >= 65, spec["info"]["version"])
     check("I8 openapi 收录 6 条 adfilter 路径",
           len([p for p in spec["paths"] if "adfilter" in p]) == 6,
           [p for p in spec["paths"] if "adfilter" in p])

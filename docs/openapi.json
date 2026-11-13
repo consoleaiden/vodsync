@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.16.3"
+    "version": "1.16.4"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -1743,14 +1743,133 @@
     "/api/v1/admin/tables": {
       "get": {
         "summary": "Admin List Tables",
-        "description": "可浏览的表清单（含列元信息与行数）。settings 表有意不在列表里 ——\n它存密码哈希 / 会话密钥，只读浏览不该把它们端出来。",
+        "description": "可浏览的表清单（含列元信息与行数）。settings 表有意不在列表里 ——\n它存密码哈希 / 会话密钥，只读浏览不该把它们端出来。\n\nv1.16.4：结果做 60 秒进程内快照缓存。表结构只在升级/新加源站时变化，\n面板每次展开都要重扫一遍 catalog + 大表行数没有意义。点「↻ 表清单」\n会带 `refresh=1` 强制重算，语义与升级前完全一致。",
         "operationId": "admin_list_tables_api_v1_admin_tables_get",
+        "parameters": [
+          {
+            "name": "refresh",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "跳过 60 秒快照缓存，强制重算（表清单按钮用）",
+              "default": false,
+              "title": "Refresh"
+            },
+            "description": "跳过 60 秒快照缓存，强制重算（表清单按钮用）"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/overview": {
+      "get": {
+        "summary": "面板轮询合并只读接口（管理端）",
+        "description": "一次往返取回面板 5 秒轮询需要的全部数据。\n\n旧面板每轮并发发 4 个请求（stats / pause / sources / logs），在 Tailscale\n中继链路上光建连就要 4 × RTT。这里复用完全相同的 handler 组包，字段、口径、\n鉴权一概不变；老接口全部保留，`refreshAll()` 在合并接口不可用时自动降级。\n`blocks` 恒返回（一次小查询），面板据此过滤已屏蔽源站。",
+        "operationId": "admin_overview_api_v1_admin_overview_get",
+        "parameters": [
+          {
+            "name": "sections",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "逗号分隔：stats / pause / sources / logs",
+              "default": "stats,pause,sources,logs",
+              "title": "Sections"
+            },
+            "description": "逗号分隔：stats / pause / sources / logs"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/source-blocks": {
+      "get": {
+        "summary": "已屏蔽源站清单（管理端）",
+        "description": "返回被面板屏蔽的 slug 列表（持久化在 settings，刷新/重启不丢）。",
+        "operationId": "admin_source_blocks_api_v1_admin_source_blocks_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "屏蔽 / 取消屏蔽源站（管理端）",
+        "description": "屏蔽 = 从面板列表隐藏 + 复用既有「单源站暂停」标记让定时任务/全站同步跳过。\n\n- 不改变 `enabled` / `auto_sync` / `is_adult` 等任何业务标记，客户端接口\n  （`/source`、`/api/v1/videos` 等）看到的源站集合完全不变。\n- 屏蔽前若该站本来就被手动暂停，取消屏蔽会**还原**成暂停，不会误开启。\n- 取消屏蔽只清暂停标记，**不触发** `resume_source()` 的自动同步（那些站\n  往往就是访问不了才被屏蔽的，不该一取消就又去抓一遍）。\n- 手动单站同步入口不受影响，随时可以单独试某个站是否恢复了。",
+        "operationId": "admin_set_source_blocks_api_v1_admin_source_blocks_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
               }
             }
           }
@@ -2250,14 +2369,80 @@
     "/api/v1/star-terms": {
       "get": {
         "summary": "Star Terms List",
-        "description": "词库清单（含停用条目，便于面板管理）。\n\nv1.10.0：`active` 改为返回**进程内当前生效的启用条数**（不再每次请求都\n重新编译词库正则）。刚写完词库时增删改接口会立即 reload，因此 `active`\n在一次写请求之后就是新值；多副本部署时其他实例最迟在下次重启/定时任务后一致。",
+        "description": "词库清单（含停用条目，便于面板管理）。\n\nv1.10.0：`active` 返回**进程内当前生效的启用条数**（读接口不重编译词库正则）。\nv1.16.4：新增可选分页与筛选。**不传 page_size 时仍是旧行为**（返回全部 +\n原有字段），老客户端与既有回归用例零影响；面板固定传 `page_size=50`。\n新增字段全部是附加的：`total / enabled_total / page / page_size / pages / q`。",
         "operationId": "star_terms_list_api_v1_star_terms_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "页码（仅 page_size>0 时生效）",
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "页码（仅 page_size>0 时生效）"
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 0,
+              "description": "每页 50/100/200/500；0 或不传 = 旧行为（返回全部）",
+              "default": 0,
+              "title": "Page Size"
+            },
+            "description": "每页 50/100/200/500；0 或不传 = 旧行为（返回全部）"
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "按词条 / 别名 / 备注模糊过滤",
+              "default": "",
+              "title": "Q"
+            },
+            "description": "按词条 / 别名 / 备注模糊过滤"
+          },
+          {
+            "name": "ids_only",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1,
+              "minimum": 0,
+              "description": "1 = 只返回当前筛选下全部 id（面板全选 / 反选用）",
+              "default": 0,
+              "title": "Ids Only"
+            },
+            "description": "1 = 只返回当前筛选下全部 id（面板全选 / 反选用）"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
               }
             }
           }
@@ -2267,6 +2452,45 @@
         "summary": "Star Terms Add",
         "description": "批量添加词条。输入格式自动识别：\n  JSON 数组 / 带引号的 JSON 片段（\"名字\", 一行一个）/\n  逗号、全角逗号、顿号、竖线、换行分隔的纯文本 —— 一次粘贴大量名字即可。\n已存在的名字自动跳过（幂等）。返回 (added, skipped)。",
         "operationId": "star_terms_add_api_v1_star_terms_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/star-terms/batch": {
+      "post": {
+        "summary": "批量删除 / 启用 / 停用词库词条（管理端）",
+        "description": "面板多选后的批量管理：一次事务、一次词库正则重载。\n\n与逐条 DELETE / PATCH 的语义完全一致（都不自动重算 star_map / video_tags，\n需要用户点「重算推荐」），只是把 N 次往返 + N 次 regex 编译收敛成 1 次。\n批量删除上限 20000 个 id，避免一次误操作把整个词库连带请求体拖垮。",
+        "operationId": "star_terms_batch_api_v1_star_terms_batch_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -2671,14 +2895,38 @@
     "/api/v1/star/tags/status": {
       "get": {
         "summary": "Star Tags Status",
-        "description": "各源站明星 Tag 覆盖情况：总视频数 / 缺演员视频数 / 已映射明星条数。",
+        "description": "各源站明星 Tag 覆盖情况：总视频数 / 缺演员视频数 / 已映射明星条数。\n\nv1.16.4：这个核对接口逐站对 vod_* 大表做 `COUNT(*) FILTER`，线上实测\n23~50 秒。底层 `star_tags.status_all()` 的数字口径一字未改（仍用真实\ncount，不用估算），只在路由层加 2 分钟快照；面板显示「统计于 N 秒前」，\n另有「强制刷新」按钮带 `refresh=1` 拿实时值。",
         "operationId": "star_tags_status_api_v1_star_tags_status_get",
+        "parameters": [
+          {
+            "name": "refresh",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "跳过 2 分钟快照缓存，重新逐站实时 count",
+              "default": false,
+              "title": "Refresh"
+            },
+            "description": "跳过 2 分钟快照缓存，重新逐站实时 count"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
               }
             }
           }
@@ -2690,12 +2938,36 @@
         "summary": "Related Status",
         "description": "各源站相关推荐覆盖率（管理/验收核对：videos / computed / coverage%）。",
         "operationId": "related_status_api_v1_related_status_get",
+        "parameters": [
+          {
+            "name": "refresh",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "跳过 2 分钟快照缓存，重新 GROUP BY 实时统计",
+              "default": false,
+              "title": "Refresh"
+            },
+            "description": "跳过 2 分钟快照缓存，重新 GROUP BY 实时统计"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
               }
             }
           }

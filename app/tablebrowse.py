@@ -19,7 +19,8 @@
 
 性能说明（为什么敢对百万级大表这么做）：
 - 列表接口的行数对 vod_* 表用 sources.total_videos（recount 维护的缓存值），
-  不做实时 count；对 5 张系统表实时 count（都很小，vod_related 走主键索引扫）。
+  不做实时 count；系统表里的小表实时 count，大表（v1.16.4 起）用
+  pg_class.reltuples 估算，避免展开一次下拉就全表扫 6.9M 行的 vod_related。
 - 按字段搜索：文本列直接 ILIKE（name 列能吃到 pg_trgm GIN 索引）；数字/时间列
   cast 成字符串再比（cast 后必然顺序扫描 —— 面板场景可接受，不加 hint）。
 - 全表搜索（不选字段）：OR 所有列，大表上就是全表扫，页面有文案提示。
@@ -27,17 +28,19 @@
 """
 import math
 
-from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy import String, cast, func, or_, select, text
 
 from . import database
 from .apiresp import SUCCESS_CODE
 from .models import (
+    build_vod_table,
     star_map,
     star_terms,
     sync_logs,
     sources,
     vod_related,
 )
+from .utils import SAFE_SLUG
 
 # 内置可浏览表（不含动态 vod_{slug}）。顺序即面板下拉顺序。
 BUILTIN_TABLES = {
@@ -97,7 +100,31 @@ def _column_infos(table) -> list:
 
 
 def _system_count(table) -> int:
-    """系统表实时行数（都很小；vod_related 走主键索引扫描）。"""
+    """
+    系统表行数（面板下拉里的显示辅助值）。
+
+    v1.16.4 性能修复：PG 上对大表改用 `pg_class.reltuples` 统计估算（1~2ms），
+    不再每次展开「数据表浏览」都 COUNT(*) 全表扫 6.9M 行的 vod_related ——
+    实测那一次扫描冷盘 6.7s / 热盘 1.3s，叠上后台同步抢 IO 时整个接口 48s。
+
+    口径没变：vod_* 表的行数本来就取自 `sources.total_videos` 缓存值，不是实时
+    count。小表（估算 < 10 万行）仍走精确 COUNT(*)，SQLite 一律精确 COUNT(*)
+    —— 本地测试库都是小表，既有回归断言不受影响。
+    """
+    if not database.is_sqlite():
+        try:
+            with database.engine.connect() as conn:
+                est = conn.execute(
+                    text("SELECT c.reltuples::bigint FROM pg_class c "
+                         "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                         "WHERE c.relkind = 'r' AND n.nspname = current_schema() "
+                         "AND c.relname = :n"),
+                    {"n": table.name},
+                ).scalar()
+            if est is not None and int(est) >= 100_000:
+                return max(0, int(est))
+        except Exception:  # noqa: BLE001 - 估算拿不到就回落到精确 count
+            pass
     try:
         with database.engine.connect() as conn:
             return int(conn.execute(select(func.count()).select_from(table)).scalar() or 0)
@@ -147,10 +174,14 @@ def list_browsable() -> list:
     for name in sorted(existing):
         if not name.startswith("vod_") or name == "vod_related":
             continue
-        tbl = resolve_table(name)
-        if tbl is None:
-            continue
         slug = name[4:]
+        # v1.16.4：`existing` 本身就是刚从 catalog 取回的真实表名集合，再对
+        # 每张表调 resolve_table() -> database.table_exists() 等于 65 次额外的
+        # information_schema 往返。表名来自 catalog、不来自用户输入，仍过一遍
+        # SAFE_SLUG 保持原有的白名单边界，然后直接用元数据构造 Table。
+        if not SAFE_SLUG.match(slug):
+            continue
+        tbl = build_vod_table(slug)
         meta = vod_meta.get(slug) or {}
         vod_items.append({
             "name": name,

@@ -96,8 +96,9 @@ def main():
     spec2 = json.load(open(os.path.join(ROOT, "docs", "openapi.json"), encoding="utf-8"))
     check("A3 两份 openapi 一致且版本与代码一致", spec == spec2
           and spec["info"]["version"] == __version__, spec["info"]["version"])
-    check("A4 仍是 58 paths / 65 methods（无新增端点）",
-          len(spec["paths"]) == 58 and sum(len(v) for v in spec["paths"].values()) == 65,
+    # v1.16.4 起面板新增了分页/批量/屏蔽/合并轮询端点，基线集合只增不减
+    check("A4 基线端点仍在（paths ≥ 58 / methods ≥ 65）",
+          len(spec["paths"]) >= 58 and sum(len(v) for v in spec["paths"].values()) >= 65,
           (len(spec["paths"]), sum(len(v) for v in spec["paths"].values())))
     params = {p["name"] for p in spec["paths"]["/api/v1/adfilter/admin/stats"]["get"]["parameters"]}
     check("A5 stats 新增 limit / min_reports 参数",

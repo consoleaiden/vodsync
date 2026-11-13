@@ -377,8 +377,12 @@ type PlayLine = {
 | 60 | POST | `/api/v1/adfilter/admin/packs` | 管理 | **v1.16.0** 发布新版本（服务端校验越界值） |
 | 61 | POST | `/api/v1/adfilter/admin/packs/rollback` | 管理 | **v1.16.0** 回滚到历史版本（发新版本号 + 旧内容） |
 | 62 | GET | `/api/v1/adfilter/admin/stats` | 管理 | **v1.16.0** 上报量聚合（不含 url）；**v1.16.1** 增加按 `host` 分布与 `suspicious` 判定 |
+| 63 | GET | `/api/v1/admin/overview` | 管理 | **v1.16.4** 面板轮询合并接口：一次取回 stats/pause/sources/logs/blocks |
+| 64 | GET | `/api/v1/admin/source-blocks` | 管理 | **v1.16.4** 已屏蔽源站清单 |
+| 65 | POST | `/api/v1/admin/source-blocks` | 管理 | **v1.16.4** 屏蔽 / 取消屏蔽源站（只影响面板与定时同步，客户端无感） |
+| 66 | POST | `/api/v1/star-terms/batch` | 管理 | **v1.16.4** 批量删除 / 启用 / 停用词条（上限 20000 个 id） |
 
-> 本表编号 1~62。服务端实际共 **65 个方法+路径**（`openapi.json` 为准，含
+> 本表编号 1~66。服务端实际共 **61 paths / 69 个方法+路径**（`openapi.json` 为准，含
 > `POST /api/v1/auth/logout`、`GET /healthz.capabilities` 等未单列的自解释端点）。
 > 标「管理」的主要供管理面板使用，客户端 App 只需一枚 Token（见 2.1）即可调用「数据」「业务」类接口。
 > 鉴权类中 `/api/v1/auth/login` 与 `/api/v1/auth/state` **免鉴权**，其余需登录会话 cookie（`POST /api/v1/auth/password` 等也可用 Token 访问）。
@@ -393,7 +397,7 @@ type PlayLine = {
 {
   "status": "ok",
   "db": true,
-  "version": "1.16.1",
+  "version": "1.16.4",
   "build": "<commit sha>",
   "capabilities": ["backfill_play_from", "play_line_filter", "error_codes",
                    "token_scope", "star_tags", "related", "paging_v2", "minor_mode",
@@ -431,7 +435,7 @@ type PlayLine = {
 与 `/healthz` 同级）：
 
 ```json
-{ "status": "ok", "db": true, "version": "1.16.1",
+{ "status": "ok", "db": true, "version": "1.16.4",
   "capabilities": ["backfill_play_from", "...", "minor_mode", "adfilter", "tag_search"], "time": "..." }
 ```
 
@@ -1279,10 +1283,11 @@ GET /api/v1/related?slug=jkun&id=134369&limit=8
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| GET | `/api/v1/star-terms` | 词库清单 + `infer_mode`/`factor`/`active` 生效数 |
+| GET | `/api/v1/star-terms` | 词库清单 + `infer_mode`/`factor`/`active` 生效数。**v1.16.4** 支持可选分页：`page` / `page_size`（50/100/200/500，不传=旧行为返回全部）/ `q` 模糊过滤 / `ids_only=1` 只取 id；附加返回 `total`/`enabled_total`/`page`/`pages` |
 | POST | `/api/v1/star-terms` | 批量添加。`{"terms": "..."}` **格式自动识别**：JSON 数组 / 带引号片段 `"名字",` / 逗号、全角逗号、顿号、竖线、换行分隔 |
 | PATCH | `/api/v1/star-terms/{term_id}` | 改名/备注/启停：`{"term": "...", "note": "...", "enabled": false}` |
 | DELETE | `/api/v1/star-terms/{term_id}` | 删除词条 |
+| POST | `/api/v1/star-terms/batch` | **v1.16.4** 批量管理：`{"ids":[...], "action":"delete\|enable\|disable"}`（一次事务 + 一次正则重载，上限 20000 个 id；不自动重算 `star_map`） |
 | POST | `/api/v1/star-terms/recompute` | 词库变更后对全部源站重算推荐（后台） |
 | POST | `/api/v1/maintenance/related-recompute?slug=all` | 手动重算指定/全部源站推荐 |
 
@@ -1579,7 +1584,7 @@ App 显示「暂无内容」即可。这是刻意的：屏蔽 ≠ 报错，不�
 **不受影响的接口**（管理操作与其它业务）：`/api/v1/stats`、`/logs`、`/pause`、`/resume`、
 `/sync*`、`/sources/refresh`、`/sources/custom*`、`/sources/{slug}/auto-sync`、
 `/sources/{slug}/pause|resume|play-line-policy|adult`、`/sources/adult`（批量）、`/star-terms*`、`/auth/*`、
-`/admin/tables*`、`/maintenance/*`、`/tag/status`、`/related/status`、`/star/tags/status`、
+`/admin/tables*`、`/admin/source-blocks*`、`/maintenance/*`、`/tag/status`、`/related/status`、`/star/tags/status`、
 `/healthz*`。管理面板不带开关，因此始终能看到并编辑全部源站。
 
 #### 管理端点
@@ -1842,6 +1847,43 @@ suspicious = reports >= min_reports
    会继续持用本地包 —— 与 stable 的版本号互不干扰是刻意设计（各渠道各发各的号）。
 3. 上报明细只增不改，**没有自动清理**：需要控制磁盘时按 `created_at` 手工归档，
    或后续用 housekeeping 加保留期；当前量级（日活 × 2 批/会话）不构成压力。
+
+---
+
+### 4.29 管理面板性能与屏蔽（v1.16.4，管理面板专用）
+
+四个新端点全部是**追加**，客户端 App 一个都不用调；既有业务接口字段、参数、鉴权未改。
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| GET | `/api/v1/admin/overview` | 把面板 5 秒轮询的 4 个请求合并成 1 次：`?sections=stats,pause,sources,logs` |
+| GET | `/api/v1/admin/source-blocks` | 已屏蔽源站清单 `{"blocked": ["slug", ...]}` |
+| POST | `/api/v1/admin/source-blocks` | 屏蔽 / 取消屏蔽：`{"blocked": true\|false, "slugs": ["..."]}` |
+
+**合并接口**返回 `{"code":0, "stats":{...}, "pause":{...}, "sources":{...}, "logs":{...}, "blocks":{"blocked":[...]}}`，
+每一段的字段与对应老接口**逐字相同**（内部直接复用同一 handler，不是另一套口径）。
+`blocks` 恒返回。老接口全部保留，前端在合并接口不可用（404/网络失败）时自动降级回落。
+
+**屏蔽语义**（只影响管理面与调度，不影响客户端）：
+
+- 落库：`settings` 表 key `panel_blocked_sources`，记录 `{slug: {paused_before, at}}`。
+- 屏蔽 = 记名单 + 复用既有 `set_source_paused(slug, True)`，定时任务 / 全站同步会跳过它；
+  **不改** `enabled` / `auto_sync` / `is_adult`，`/source`、`/api/v1/videos` 等客户端
+  接口看到的源站集合完全不变。
+- 取消屏蔽：只把「因屏蔽而暂停」的位清掉；用户自己手动暂停过的站**保持暂停**。
+  并且**不会**触发 `resume_source()` 的自动同步（那些站往往就是访问不了才被屏蔽的）。
+- 单站「立即同步」按钮不受影响，随时可以单独试某站是否恢复。
+
+**只读快照缓存**（`admin/tables` 60 秒；`star/tags/status`、`related/status` 各 120 秒）：
+
+- 命中时响应多一个 `cache_age_s`（`0` = 本次现场算出）。
+- 三个接口都支持 `refresh=1` 跳过缓存强制重算，数字口径与升级前完全一致。
+- 缓存只在**进程内**，重启即空；不落库、不影响任何对客户端开放的接口。
+- 缓存按 key 加锁合并并发请求，避免两个人同时点「覆盖统计」把全表扫跑两遍。
+
+**为什么缓存**：线上实测 `admin/tables` 48 秒、`star/tags/status` 23 秒、
+`related/status` 6 秒，瓶颈是逐站 `COUNT(*)` 扫 12GB 大表（磁盘 IO），
+同链路 `/healthz` 首字节仅 0.2 秒。这些是人工核对用的数字，秒级新鲜度没有意义。
 
 ---
 
@@ -2179,7 +2221,8 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.14.1（当前） | **修复**：`/api/v1/tag/status` 的 `progress` 由 `cursor/total` 改为 `processed/total`（两者同量纲），修复上游 `vod_id` 稀疏导致进度显示 147%、172% 的 bug；新增 `processed` 字段；管理面板列名改为「已处理 / 总条数」，`cursor` 降为 tooltip。**纯展示层修复，接口字段只增不改，客户端无感**。**热修（2026-11-10，线上三问题）**：① `GET /healthz.capabilities` 成为**真实端点**（免鉴权；此前只是文档里的字段路径写法，App 真调会 401）；② tag 检索响应新增 `tag_found`（标签词不在倒排表时 false，客户端应回退 `wd=`）；③ 标签回填时序修复：「表还不存在」的源站不再标 `done`（改 `no_table`），存量错误行续跑自愈重扫。**审计配合（2026-11-10，API_SYNC_AUDIT）**：④ `POST /api/v1/auth/settings` 响应补 `code` 字段（M3）；⑤ `wd`/`tag` 超 64 字符**自动截断**、不再 422（M2 后端配合，前端可不发版）；⑥ 标签索引「假 done」自愈放宽为 `done 且 processed=0 且 total>0`，启动引导在 `ready()` 之外也检查 `needs_repair()`（M5：线上 41 站全 done 但 processed=0、索引仅 3.3% 覆盖的历史行，升级后启动自动重扫补齐）；⑦ openapi.json 两份统一重新导出，55 条方法+路径含 `/healthz.capabilities`（M4/D3）。**同步一致性修复（2026-11-11）**：`upsert_batch` 维护标签倒排时改用「主表最终 `vod_tag`」构造 payload（上游 tag 为空时沿用主表已有的明星Tag），修复全量/增量同步把该站明星标签倒排行删光的问题（`index_rows` 是先删后插，原实现直传上游原始 rows）。字段回填/夜间全量不再导致 `video_tags` 覆盖率下降；接口字段无变化。**审查修订**：`POST /api/v1/auth/tokens` 非法 `scope` 的行为文档勘误——实际返回 `400/40001`（原文档误写「按 read 处理」，实现一直是 400，接口行为无变化）；面板 Token 清单补「吊销」操作列；补充 `TOKEN_SCOPE_ENFORCE=false` 期间 read Token 可读取 admin 明文的安全提示。**倒排一致性修订（2026-11-11）**：⑧ `star_tags` 夜间明星词库回填改为**同事务维护 `video_tags`**（此前只 UPDATE 主表，线上两站共 81,290 条已回填标签在倒排表里 0 行，既搜不到也不计入 `tag/status` 的 `rows`）；⑨ 新增 `tags.sync_source_tags()` / `sync_all_sources()` 定点修补存量，只扫有标签行（全量 force 重扫线上约 10 小时），升级后需执行一次，命令见 MIGRATION_NOTES 3.1。**接口字段与能力声明均无变化**；注意 `rows` / 「覆盖率」是标签行数占比，不是索引完成度，完成度只看 `processed/total` |
+| v1.16.4（当前） | **管理面板性能与批量管理（客户端零改动）**：`GET /api/v1/star-terms` 新增可选分页/筛选（`page` / `page_size`=50/100/200/500 / `q` / `ids_only`），**不传 `page_size` 仍是旧行为**，新增字段全部是附加的；新增 `POST /api/v1/star-terms/batch`（`delete`/`enable`/`disable`，上限 20000 id，语义与逐条操作一致）；新增 `GET /api/v1/admin/overview`（4 次轮询合并成 1 次往返，内部复用原 handler，老接口保留并可降级）；新增 `GET\|POST /api/v1/admin/source-blocks`（面板屏蔽名单存 `settings.panel_blocked_sources`，复用既有单站暂停，不改 `enabled`/`auto_sync`/`is_adult`，客户端可见源站集合不变）；`admin/tables`（60s）、`star/tags/status`（120s）、`related/status`（120s）加进程内快照缓存 + `refresh=1` 强制实时。数据库无变更。详见 `MIGRATION_NOTES.md` 2.6 |
+| v1.14.1 | **修复**：`/api/v1/tag/status` 的 `progress` 由 `cursor/total` 改为 `processed/total`（两者同量纲），修复上游 `vod_id` 稀疏导致进度显示 147%、172% 的 bug；新增 `processed` 字段；管理面板列名改为「已处理 / 总条数」，`cursor` 降为 tooltip。**纯展示层修复，接口字段只增不改，客户端无感**。**热修（2026-11-10，线上三问题）**：① `GET /healthz.capabilities` 成为**真实端点**（免鉴权；此前只是文档里的字段路径写法，App 真调会 401）；② tag 检索响应新增 `tag_found`（标签词不在倒排表时 false，客户端应回退 `wd=`）；③ 标签回填时序修复：「表还不存在」的源站不再标 `done`（改 `no_table`），存量错误行续跑自愈重扫。**审计配合（2026-11-10，API_SYNC_AUDIT）**：④ `POST /api/v1/auth/settings` 响应补 `code` 字段（M3）；⑤ `wd`/`tag` 超 64 字符**自动截断**、不再 422（M2 后端配合，前端可不发版）；⑥ 标签索引「假 done」自愈放宽为 `done 且 processed=0 且 total>0`，启动引导在 `ready()` 之外也检查 `needs_repair()`（M5：线上 41 站全 done 但 processed=0、索引仅 3.3% 覆盖的历史行，升级后启动自动重扫补齐）；⑦ openapi.json 两份统一重新导出，55 条方法+路径含 `/healthz.capabilities`（M4/D3）。**同步一致性修复（2026-11-11）**：`upsert_batch` 维护标签倒排时改用「主表最终 `vod_tag`」构造 payload（上游 tag 为空时沿用主表已有的明星Tag），修复全量/增量同步把该站明星标签倒排行删光的问题（`index_rows` 是先删后插，原实现直传上游原始 rows）。字段回填/夜间全量不再导致 `video_tags` 覆盖率下降；接口字段无变化。**审查修订**：`POST /api/v1/auth/tokens` 非法 `scope` 的行为文档勘误——实际返回 `400/40001`（原文档误写「按 read 处理」，实现一直是 400，接口行为无变化）；面板 Token 清单补「吊销」操作列；补充 `TOKEN_SCOPE_ENFORCE=false` 期间 read Token 可读取 admin 明文的安全提示。**倒排一致性修订（2026-11-11）**：⑧ `star_tags` 夜间明星词库回填改为**同事务维护 `video_tags`**（此前只 UPDATE 主表，线上两站共 81,290 条已回填标签在倒排表里 0 行，既搜不到也不计入 `tag/status` 的 `rows`）；⑨ 新增 `tags.sync_source_tags()` / `sync_all_sources()` 定点修补存量，只扫有标签行（全量 force 重扫线上约 10 小时），升级后需执行一次，命令见 MIGRATION_NOTES 3.1。**接口字段与能力声明均无变化**；注意 `rows` / 「覆盖率」是标签行数占比，不是索引完成度，完成度只看 `processed/total` |
 | v1.14.0 | **后端契约升级（B-01/B-02/B-03/B-04/B-05/B-06/B-08/B-09/B-10/B-11）**：`/healthz` 新增 `capabilities` 能力清单（`tag_search` / `error_codes` / `token_scope` …，DB 降级时自动收缩）；错误码统一为「非 2xx + `{code, error, detail, message}`」（`40001`/`40101`/`40301`/`40401`，参数校验由 422 改 400 并带 `field`）；**成功码默认 0**（`API_SUCCESS_CODE` 可退回 1，MacCMS 兼容接口恒 1）；`/api/v1/search` 与 `/api/v1/videos` 新增 `?tag=` 标签精确检索（倒排表 `video_tags`，索引就绪才声明能力）；列表新增 `remarks` / `vod_area` / `vod_year`，详情新增 `play_lines` / `tag` 同值别名，剧集新增 `from`/`type`/`playable`；`total_approximate` 恒出现；`page_size` 缺省改 18；新增 `GET /api/v1/tag/status`、`POST /api/v1/maintenance/tag-index`、`GET\|POST /api/v1/auth/tokens`、`DELETE /api/v1/auth/tokens/{id}`（read/admin 两档权限，默认宽权限放行）。详见 `MIGRATION_NOTES.md` |
 | v1.13.0 | **面板布局调整 + 管理能力补齐（无接口变更）**：「明星词库」从设置弹层移到主面板独立区块；`main` 去掉 1280px 限宽改为全屏自适应；面板新增此前只有 API 的 5 个维护能力入口 —— 明星 Tag 覆盖统计（`/star/tags/status`）、高频词建议（`/star/tags/untracked`，支持一键加入词库）、重建明星 Tag（`/maintenance/star-tags`）、推荐覆盖率（`/related/status`）、按源站重算推荐（`/maintenance/related-recompute`），以及源站行的「回填线路」（`/sync/{slug}?mode=backfill_play_from`） |
 | v1.12.2 | **修复数据表浏览「查询没有数据」**：面板把 `/rows` 返回的列名（字符串数组）当对象取 `.name`，导致表头空白、每格渲染成 `-`；改由 `tbCols()` 归一化后再渲染。接口无变化，纯前端修复 |

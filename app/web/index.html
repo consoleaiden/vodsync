@@ -180,6 +180,15 @@
   .star-row .alias { color: var(--muted); white-space: nowrap; }
   .star-row .note { color: var(--muted); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .star-row .acts { display: flex; gap: 6px; flex: none; }
+  .star-row[data-sel="1"] { border-color: var(--accent); background: #f2f7ff; }
+  .star-row .starCheck { flex: none; width: 15px; height: 15px; margin: 0; cursor: pointer; }
+  /* v1.16.4：分页 / 批量管理工具栏 */
+  .star-toolbar { border-top: 1px solid var(--line); background: #fbfcfe; }
+  .star-toolbar .row { gap: 8px; }
+  .star-toolbar input[type=search] { min-width: 190px; }
+  .star-pager { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+                font-size: 12.5px; color: var(--muted); border-top: 1px solid var(--line); }
+  .star-pager input { width: 72px; min-width: 72px; padding: 5px 6px; text-align: center; }
   /* 自适应（v1.13.0）：窄屏收窄内边距与栅格，工具栏自动换行 */
   @media (max-width: 960px) {
     header { padding: 10px 14px; gap: 10px; }
@@ -303,10 +312,47 @@
         <span class="muted" id="starHint" style="font-size:12px"></span>
       </div>
     </div>
+    <!-- v1.16.4：分页 + 批量管理。默认每页 50 条，避免一次性渲染 3000+ 卡片 -->
+    <div class="body pad star-toolbar">
+      <div class="row">
+        <input type="search" id="starQuery" placeholder="搜索词条 / 别名 / 备注" autocomplete="off">
+        <label class="muted" style="font-size:12px;display:inline-flex;align-items:center;gap:5px">每页
+          <select class="tbSel" id="starPageSize" title="每页加载条数（默认 50）">
+            <option value="50" selected>50 条</option>
+            <option value="100">100 条</option>
+            <option value="200">200 条</option>
+            <option value="500">500 条</option>
+          </select>
+        </label>
+        <label class="muted" style="font-size:12px;display:inline-flex;align-items:center;gap:5px" title="只切换本页词条">
+          <input type="checkbox" id="starSelAll"> 本页全选
+        </label>
+        <span style="flex:1"></span>
+        <button class="sm" id="btnStarSelAll" title="选中当前筛选下的全部词条（跨页）">全选全部</button>
+        <button class="sm" id="btnStarSelInvert" title="对当前筛选下的全部词条取反">反选</button>
+        <button class="sm" id="btnStarSelNone" title="清空选择">清空选择</button>
+        <button class="sm warn" id="btnStarBatchDel" disabled>删除选中 (<span id="starSelCount">0</span>)</button>
+        <button class="sm" id="btnStarBatchOn" disabled>批量启用</button>
+        <button class="sm" id="btnStarBatchOff" disabled>批量停用</button>
+      </div>
+      <div class="muted" id="starPageInfo" style="font-size:12px;margin-top:6px"></div>
+    </div>
     <div class="body" id="starList"><div class="empty">展开时加载词库…</div></div>
+    <div class="body pad star-pager" id="starPager">
+      <button class="sm" id="starFirst">首页</button>
+      <button class="sm" id="starPrev">上一页</button>
+      <span id="starPageLabel">-</span>
+      <button class="sm" id="starNext">下一页</button>
+      <button class="sm" id="starLast">末页</button>
+      <span style="flex:1"></span>
+      <span>跳转到</span>
+      <input type="number" id="starJump" min="1" value="1">
+      <button class="sm" id="starGo">跳转</button>
+    </div>
     <div class="body pad" id="starStats" style="display:none">
       <div class="row" style="margin-bottom:8px">
         <span class="muted" id="starStatsHint" style="font-size:12px;flex:1"></span>
+        <button class="sm" id="btnStarStatsRefresh" title="跳过 2 分钟快照缓存，重新逐站实时统计（大库要等十几秒）">↻ 强制刷新</button>
         <button class="sm" id="btnStarStatsClose">收起</button>
       </div>
       <div style="border:1px solid var(--line);border-radius:8px;overflow:auto" id="starStatsBody"></div>
@@ -395,6 +441,9 @@
       <button class="sm warn" id="btnAutoSelOff" disabled title="仅对勾选的源站暂停自动同步">暂停所选</button>
       <button class="sm" id="btnAdultSelOn" disabled title="把勾选的源站标记为「包含 18+ 内容」；前端开启未成年模式时这些站整站被屏蔽（含正常影视）">标记所选 18+</button>
       <button class="sm" id="btnAdultSelOff" disabled title="把勾选的源站改回「不包含 18+ 内容」，未成年模式下立即恢复展示">取消所选 18+</button>
+      <button class="sm warn" id="btnBlockSel" disabled title="屏蔽所选源站：从列表隐藏，并复用既有「单站暂停」让定时任务/全站同步跳过；不改动客户端可见的源站集合">屏蔽所选</button>
+      <button class="sm" id="btnUnblockSel" disabled title="取消屏蔽所选源站（不会自动触发同步）">取消屏蔽所选</button>
+      <button class="sm" id="btnSourceShowBlocked" title="显示 / 隐藏已屏蔽的源站">显示已屏蔽 (0)</button>
       <button class="sm" id="sourcesToggle" title="折叠 / 展开本区块（折叠时不参与 5 秒轮询，降低后端压力）">展开 ▾</button>
     </div>
     <div id="sourcesWrap" style="display:none">
@@ -525,9 +574,10 @@ const PAUSE_LABELS = {
   incremental: "增量同步已暂停（水位线未动，继续后自动重跑）",
 };
 
-async function loadPause() {
+async function loadPause(prefetched) {
   try {
-    const p = await api("/api/v1/pause");
+    // v1.16.4：refreshAll 走合并接口时把 pause 直接喂进来，省掉一次往返
+    const p = prefetched || await api("/api/v1/pause");
     pauseState = p;
     if (!pauseBusy) {
       $("#pauseGlobal").checked = !!p.global;
@@ -579,9 +629,10 @@ $("#pauseFull").addEventListener("change", (e) => togglePause("full", e.target))
 $("#pauseIncr").addEventListener("change", (e) => togglePause("incremental", e.target));
 
 // ---------------- 概览 ----------------
-async function loadStats() {
+async function loadStats(prefetched) {
   try {
-    const s = await api("/api/v1/stats");
+    // v1.16.4：refreshAll 走合并接口时直接复用已取回的 stats
+    const s = prefetched || await api("/api/v1/stats");
     $("#statSources").innerHTML = fmtNum(s.sources_total) + `<small>启用 ${fmtNum(s.sources_enabled)}</small>`;
     $("#statVideos").textContent = fmtNum(s.videos_total);
     $("#statSyncing").innerHTML = fmtNum(s.sources_syncing)
@@ -606,6 +657,13 @@ async function loadStats() {
 const selectedSlugs = new Set();
 const pendingAuto = {};
 let currentSlugs = [];
+// v1.16.4：面板屏蔽名单（后端 settings 持久化）；showBlocked 只在本次会话生效
+const blockedSlugs = new Set();
+let showBlocked = false;
+// 5 秒轮询的渲染签名：数据没变就整表跳过 innerHTML 重建
+let sourcesSig = "";
+let refreshBusy = false;
+let syncWasActive = false;
 
 function updateBulkButtons(autoCount) {
   const n = selectedSlugs.size;
@@ -613,7 +671,10 @@ function updateBulkButtons(autoCount) {
   $("#btnAutoSelOff").disabled = n === 0;
   $("#btnAdultSelOn").disabled = n === 0;
   $("#btnAdultSelOff").disabled = n === 0;
-  const base = `共 ${currentSlugs.length} 个源站 · 自动同步 ${autoCount ?? "…"} 个`;
+  $("#btnBlockSel").disabled = n === 0;
+  $("#btnUnblockSel").disabled = n === 0;
+  const base = `共 ${currentSlugs.length} 个源站 · 自动同步 ${autoCount ?? "…"} 个`
+             + (blockedSlugs.size ? ` · 已屏蔽 ${blockedSlugs.size} 个` : "");
   $("#sourcesHint").textContent = n ? `${base} · 已选 ${n} 个` : base;
 }
 
@@ -626,12 +687,26 @@ function sourcesBusy() {
   return $("#sourcesBody").contains(ae);
 }
 
-async function loadSources(force = false) {
+async function loadSources(force = false, prefetched = null) {
   if (!force && sourcesBusy()) return;
   try {
-    const data = await api("/api/v1/sources");
-    const list = data.list || [];
+    // v1.16.4：refreshAll 走合并接口时直接复用已取回的源站清单
+    const data = prefetched || await api("/api/v1/sources");
+    const list = (data.list || []).filter((s) => showBlocked || !blockedSlugs.has(s.slug));
     currentSlugs = list.map((s) => s.slug);
+    // 源站被屏蔽/隐藏后，把已经不在表里的勾选清掉，避免批量操作打到隐形行
+    for (const slug of [...selectedSlugs]) {
+      if (!currentSlugs.includes(slug)) selectedSlugs.delete(slug);
+    }
+    // 绝大多数轮询轮次数据一字未变；以前每 5 秒都把 65 行 × 十几个 DOM 节点
+    // 全部销毁重建，滚动位置/焦点/下拉展开状态一起丢。这里做一个差量短路。
+    const sig = JSON.stringify([list, pauseState, pendingAuto, showBlocked,
+                                [...blockedSlugs].sort(), [...selectedSlugs].sort()]);
+    if (!force && sig === sourcesSig) {
+      updateBulkButtons(list.filter((s) => s.auto_sync).length);
+      return;
+    }
+    sourcesSig = sig;
     if (!list.length) {
       $("#sourcesHint").textContent = "";
       $("#sourcesBody").innerHTML = `<div class="empty">尚未发现源站，请点击「刷新源站列表」</div>`;
@@ -719,6 +794,9 @@ async function loadSources(force = false) {
           <option value="0" ${adultOn ? "" : "selected"}>否</option>
           <option value="1" ${adultOn ? "selected" : ""}>是</option>
         </select>`;
+      // v1.16.4：源站屏蔽（面板层；不改客户端可见的源站集合）
+      const isBlocked = blockedSlugs.has(s.slug);
+      const blockBtn = `<button class="sm ${isBlocked ? "" : "warn"}" data-act="block" data-slug="${esc(s.slug)}" data-blocked="${isBlocked ? 1 : 0}" title="${isBlocked ? "取消屏蔽并恢复该站参与同步（不会自动触发同步任务）" : "屏蔽该源站：从列表隐藏，并暂停其定时任务/全站同步"}">${isBlocked ? "取消屏蔽" : "屏蔽"}</button>`;
       return `<tr>
         <td><input type="checkbox" class="selRow" data-slug="${esc(s.slug)}" ${selectedSlugs.has(s.slug) ? "checked" : ""}></td>
         <td>
@@ -726,7 +804,7 @@ async function loadSources(force = false) {
           <div class="slugcode">${esc(s.slug)}</div>
         </td>
         <td>${originCell}</td>
-        <td>${s.status === "ok" ? '<span class="badge ok">在线</span>' : '<span class="badge bad">离线</span>'}${s.paused ? ' <span class="badge warn">本站暂停</span>' : ""}${s.queued ? ' <span class="badge mute">排队中</span>' : ""}${backoffBadge(s)}</td>
+        <td>${s.status === "ok" ? '<span class="badge ok">在线</span>' : '<span class="badge bad">离线</span>'}${s.paused ? ' <span class="badge warn">本站暂停</span>' : ""}${s.queued ? ' <span class="badge mute">排队中</span>' : ""}${isBlocked ? ' <span class="badge mute">已屏蔽</span>' : ""}${backoffBadge(s)}</td>
         <td>${lineCell}</td>
         <td class="num">${fmtNum(s.total_videos)}</td>
         <td style="min-width:130px">${prog}</td>
@@ -741,6 +819,7 @@ async function loadSources(force = false) {
           <button class="sm" data-act="detail" data-slug="${esc(s.slug)}">日志</button>
           ${customBtns}
           ${pauseBtn}
+          ${blockBtn}
         </td>
       </tr>`;
     }).join("");
@@ -755,9 +834,10 @@ async function loadSources(force = false) {
 }
 
 // ---------------- 日志 ----------------
-async function loadLogs() {
+async function loadLogs(prefetched) {
   try {
-    const data = await api("/api/v1/logs?limit=20");
+    // v1.16.4：refreshAll 走合并接口时直接复用已取回的日志
+    const data = prefetched || await api("/api/v1/logs?limit=20");
     const list = data.list || [];
     if (!list.length) { $("#logsBody").innerHTML = `<div class="empty">暂无同步记录</div>`; return; }
     const rows = list.map((l) => {
@@ -809,6 +889,7 @@ $("#sourcesBody").addEventListener("click", async (ev) => {
   if (act === "edit") return openSourceForm(slug);
   if (act === "del") return deleteCustomSource(slug);
   if (act === "pause" || act === "resume") return toggleSourcePause(slug, act === "pause");
+  if (act === "block") return setSourceBlocks(btn.dataset.blocked !== "1", [slug]);
   if (act === "full" && !window.confirm(`确认对 ${slug} 从第一页重新全量同步？（数据量大时耗时较长）`)) return;
   if (act === "backfill") {
     if (!window.confirm(`确认对 ${slug} 回填线路来源（play_from）？\n只写这一列，不动水位线与断点，幂等可重跑；建议在空闲时段执行。`)) return;
@@ -938,6 +1019,54 @@ async function bulkAdultMark(enabled) {
 $("#btnAdultSelOn").onclick = () => bulkAdultMark(true);
 $("#btnAdultSelOff").onclick = () => bulkAdultMark(false);
 
+// ---------------- 源站屏蔽（v1.16.4，纯面板能力） ----------------
+// 屏蔽只做两件事：把 slug 记进后端 settings 持久化名单、复用既有的「单站暂停」
+// 标记让定时任务/全站同步跳过。不改 enabled / auto_sync / is_adult，也不动
+// 同步器与调度器，客户端看到的源站集合与已入库数据完全不变。
+function applyBlocks(d) {
+  const next = new Set(d.blocked || []);
+  const changed = next.size !== blockedSlugs.size
+               || [...next].some((s) => !blockedSlugs.has(s));
+  blockedSlugs.clear();
+  next.forEach((s) => blockedSlugs.add(s));
+  $("#btnSourceShowBlocked").textContent =
+    (showBlocked ? "隐藏已屏蔽 (" : "显示已屏蔽 (") + blockedSlugs.size + ")";
+  if (changed) sourcesSig = "";   // 名单变了，下一轮必须重绘
+}
+
+async function loadSourceBlocks() {
+  try { applyBlocks(await api("/api/v1/admin/source-blocks")); }
+  catch (e) { /* 静默：老版后端没有这个接口时，面板其余功能照常 */ }
+}
+
+async function setSourceBlocks(blocked, slugs) {
+  if (!slugs.length) return toast("请先勾选源站", true);
+  if (blocked && !confirm(
+    `确认屏蔽选中的 ${slugs.length} 个源站？\n\n` +
+    `它们将从本列表隐藏，并被标记为「本站暂停」，定时任务与全站同步不再尝试抓取；\n` +
+    `客户端可见的源站集合、已入库数据、手动单站同步都不受影响。\n` +
+    `随时可以点「显示已屏蔽」取消屏蔽。`
+  )) return;
+  try {
+    const r = await _jsonPost("/api/v1/admin/source-blocks", { blocked, slugs });
+    toast(r.msg || "已更新");
+    await loadSourceBlocks();
+    selectedSlugs.clear();
+    await Promise.allSettled([loadSources(true), loadStats()]);
+  } catch (e) {
+    toast((blocked ? "屏蔽" : "取消屏蔽") + "失败：" + e.message, true);
+  }
+}
+
+$("#btnBlockSel").onclick = () => setSourceBlocks(true, [...selectedSlugs]);
+$("#btnUnblockSel").onclick = () => setSourceBlocks(false, [...selectedSlugs]);
+$("#btnSourceShowBlocked").onclick = () => {
+  showBlocked = !showBlocked;
+  sourcesSig = "";
+  applyBlocks({ blocked: [...blockedSlugs] });
+  loadSources(true);
+};
+
 async function showSourceLogs(slug) {
   try {
     const d = await api(`/api/v1/sources/${encodeURIComponent(slug)}`);
@@ -1058,10 +1187,12 @@ const tbState = { tables: [], cols: [], page: 1, total: 0, pages: 0, busy: false
 
 function tbCurName() { return $("#tbTable").value; }
 
-async function tbLoadTables(keep) {
+async function tbLoadTables(keep, refresh = false) {
   const sel = $("#tbTable");
   try {
-    const d = await api("/api/v1/admin/tables");
+    // v1.16.4：首展走 60 秒快照；「↻ 表清单」是用户主动要求重新读 catalog，
+    // 带 refresh=1 跳过缓存，语义与升级前一致。
+    const d = await api("/api/v1/admin/tables" + (refresh ? "?refresh=1" : ""));
     tbState.tables = d.tables || [];
     if (!tbState.tables.length) {
       sel.innerHTML = `<option value="">（无可浏览的表）</option>`;
@@ -1182,7 +1313,7 @@ $("#tbGo").onclick = () => {
 $("#tbJump").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); $("#tbGo").click(); }
 });
-$("#tbReloadTables").onclick = () => tbLoadTables(true);
+$("#tbReloadTables").onclick = () => tbLoadTables(true, true);
 // 长文本单元格：点击展开 / 收起
 $("#tbBody").addEventListener("click", (ev) => {
   const td = ev.target.closest("td.clamp");
@@ -1545,10 +1676,19 @@ function openSettings() {
 }
 
 // ---------------- 明星词库（v1.13.0：从设置弹层移到主面板，独立区块） ----------------
+// v1.16.4：服务端分页 + 多选/全选/反选/批量管理。默认每页 50 条，不再一次性
+// 把 3000+ 词条（约 400KB JSON）拉回来渲染成 3000+ 张卡片。
 const starListEl = $("#starList");
+const selectedStarIds = new Set();
+let starPage = 1, starPages = 1, starTotal = 0;
+let starAllIds = [], starAllIdsKey = null;
+let starQueryTimer = null;
+let starLastResp = {}, starLastLen = 0;
 
 function starRowHtml(t) {
-  return `<div class="star-row">
+  const ck = selectedStarIds.has(t.id);
+  return `<div class="star-row"${ck ? ' data-sel="1"' : ""}>
+    <input type="checkbox" class="starCheck" data-id="${t.id}" ${ck ? "checked" : ""} title="选中以便批量管理">
     <span class="badge ${t.enabled ? "ok" : "mute"}">${t.enabled ? "启用" : "停用"}</span>
     <span class="term">${esc(t.term)}</span>
     ${t.aliases ? `<span class="alias" title="别名（命中后归一到主名）">＝ ${esc(t.aliases)}</span>` : ""}
@@ -1562,15 +1702,54 @@ function starRowHtml(t) {
   </div>`;
 }
 
+// 选择条 / 分页条只写 textContent、disabled、value、checked 这类标量属性，
+// 不碰 querySelectorAll —— 面板渲染回归脚本用的是极简 DOM 桩。
+function updateStarSelBar() {
+  const n = selectedStarIds.size;
+  $("#starSelCount").textContent = n;
+  $("#btnStarBatchDel").disabled = n === 0;
+  $("#btnStarBatchOn").disabled = n === 0;
+  $("#btnStarBatchOff").disabled = n === 0;
+}
+
+function renderStarPager(r, listLen) {
+  const total = Number(r.total ?? listLen) || 0;
+  const size = Number(r.page_size) || 50;
+  starPages = Math.max(1, Number(r.pages ?? 1) || 1);
+  starPage = Math.min(Math.max(1, Number(r.page ?? 1) || 1), starPages);
+  starTotal = total;
+  const from = total ? (starPage - 1) * size + 1 : 0;
+  const to = Math.min(total, (starPage - 1) * size + listLen);
+  $("#starPageLabel").textContent = `第 ${starPage} / ${starPages} 页`;
+  $("#starPageInfo").textContent = total
+    ? `共 ${fmtNum(total)} 条 · 本页 ${fmtNum(from)}–${fmtNum(to)} 条 · 已选 ${selectedStarIds.size} 条`
+    : "共 0 条";
+  $("#starFirst").disabled = starPage <= 1;
+  $("#starPrev").disabled = starPage <= 1;
+  $("#starNext").disabled = starPage >= starPages;
+  $("#starLast").disabled = starPage >= starPages;
+  $("#starJump").max = starPages;
+  $("#starJump").value = starPage;
+  updateStarSelBar();
+}
+
 async function loadStarTerms() {
   try {
-    const r = await api("/api/v1/star-terms");
+    const q = ($("#starQuery").value || "").trim();
+    const size = Number($("#starPageSize").value) || 50;
+    const r = await api(`/api/v1/star-terms?page=${starPage}&page_size=${size}&q=${encodeURIComponent(q)}`);
     const list = r.list || [];
-    const on = list.filter((t) => t.enabled).length;
-    $("#starCount").textContent = `词条 ${list.length} 条 · 启用 ${on} 条 · 进程内生效 ${r.active || 0} 条`;
+    const total = Number(r.total ?? list.length) || 0;
+    const on = Number(r.enabled_total ?? list.filter((t) => t.enabled).length) || 0;
+    $("#starCount").textContent = `词条 ${fmtNum(total)} 条 · 启用 ${fmtNum(on)} 条 · 进程内生效 ${r.active || 0} 条`;
     $("#starHint").textContent = `推断模式 ${r.infer_mode || "-"} · 弱信号系数 ${r.factor ?? "-"}`;
     starListEl.innerHTML = list.map(starRowHtml).join("") ||
       `<div class="empty">词库为空：粘贴名字后点「批量添加」</div>`;
+    const allOnPage = list.length > 0 && list.every((t) => selectedStarIds.has(t.id));
+    $("#starSelAll").checked = allOnPage;
+    starLastResp = r;
+    starLastLen = list.length;
+    renderStarPager(r, list.length);
   } catch (e) {
     $("#starCount").textContent = "-";
     starListEl.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
@@ -1606,6 +1785,7 @@ starListEl.addEventListener("click", async (ev) => {
     } else {
       return;
     }
+    starAllIdsKey = null;   // 词库变了，「全选全部」的 id 缓存作废
     await loadStarTerms();
   } catch (e) {
     toast(e.message, true);
@@ -1619,6 +1799,8 @@ $("#btnStarAdd").addEventListener("click", async () => {
     const r = await _jsonPost("/api/v1/star-terms", { terms: text });
     $("#starInput").value = "";
     toast(r.msg || "已添加");
+    starPage = 1;
+    starAllIdsKey = null;
     await loadStarTerms();
   } catch (e) {
     toast(e.message, true);
@@ -1651,24 +1833,32 @@ function starStatsTable(headers, rowsHtml) {
   // rowsHtml 是已拼好的 <tr> 字符串（调用方各自 map+join），别在这里再 .join()
   return `<table><thead><tr>${headers.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${rowsHtml}</tbody></table>`;
 }
+let starStatsKind = "tags";
 
 // 覆盖统计 / 推荐覆盖率 / 高频词建议（v1.13.0：原先这几个维护接口面板没有入口）
-async function loadStarStats(kind) {
+// v1.16.4：两个逐站 COUNT 接口加了 2 分钟快照缓存；「↻ 强制刷新」带 refresh=1
+// 仍拿实时值，口径与升级前一致。面板把缓存年龄显式写出来，避免把旧数字当实时。
+async function loadStarStats(kind, refresh = false) {
   const body = $("#starStatsBody"), hint = $("#starStatsHint");
+  starStatsKind = kind;
   $("#starStats").style.display = "";
   body.innerHTML = `<div class="empty">加载中…</div>`;
+  const suffix = refresh ? "?refresh=1" : "";
+  const ageTxt = (r) => r.cache_age_s
+    ? ` · 快照 ${r.cache_age_s}s 前（点「↻ 强制刷新」取实时值）`
+    : " · 刚实时统计";
   try {
     if (kind === "tags") {
-      const r = await api("/api/v1/star/tags/status");
-      hint.textContent = "各源站明星 Tag 覆盖（实时 count，数据大时稍等几秒）";
+      const r = await api("/api/v1/star/tags/status" + suffix);
+      hint.textContent = "各源站明星 Tag 覆盖（实时 count，数据大时稍等几秒）" + ageTxt(r);
       const rows = (r.list || []).map((x) =>
         `<tr><td class="slugcode">${esc(x.slug)}</td><td class="num">${fmtNum(x.videos)}</td>` +
         `<td class="num">${fmtNum(x.no_actor_videos)}</td><td class="num">${fmtNum(x.star_mapped)}</td></tr>`).join("");
       body.innerHTML = starStatsTable(["源站", "视频数", "缺演员", "已映射明星"],
         rows || `<tr><td colspan="4" class="empty">无数据</td></tr>`);
     } else if (kind === "related") {
-      const r = await api("/api/v1/related/status");
-      hint.textContent = `相关推荐覆盖率（算法 v${r.algo_version}，视频数用缓存值，点「条数校准」后更准）`;
+      const r = await api("/api/v1/related/status" + suffix);
+      hint.textContent = `相关推荐覆盖率（算法 v${r.algo_version}，视频数用缓存值，点「条数校准」后更准）` + ageTxt(r);
       const rows = (r.list || []).map((x) => {
         const pct = Number(x.coverage || 0);
         const cls = pct >= 80 ? "ok" : pct >= 40 ? "warn" : "bad";
@@ -1697,6 +1887,7 @@ $("#btnStarTagsStatus").addEventListener("click", () => loadStarStats("tags"));
 $("#btnRelatedStatus").addEventListener("click", () => loadStarStats("related"));
 $("#btnUntracked").addEventListener("click", () => loadStarStats("untracked"));
 $("#btnStarStatsClose").addEventListener("click", () => { $("#starStats").style.display = "none"; });
+$("#btnStarStatsRefresh").addEventListener("click", () => loadStarStats(starStatsKind, true));
 
 // 高频词：单击加入单个词；「前 20」批量加入
 $("#starStatsBody").addEventListener("click", async (ev) => {
@@ -1742,6 +1933,145 @@ $("#btnStarTagsRebuild").addEventListener("click", async () => {
 });
 
 $("#btnStarReload").addEventListener("click", () => loadStarTerms());
+$("#btnStarReload").addEventListener("click", () => { starAllIdsKey = null; });
+
+// ---- v1.16.4：分页 / 搜索 / 多选 / 全选 / 反选 / 批量管理 ----
+function starInvalidateAllIds() { starAllIdsKey = null; starAllIds = []; }
+
+function starGoPage(p) {
+  const want = Math.min(Math.max(1, Number(p) || 1), starPages || 1);
+  if (want === starPage) return;
+  starPage = want;
+  loadStarTerms();
+}
+
+// 「全选全部 / 反选」要跨页，因此单独取一次当前筛选下的全量 id（只有整数，
+// 3443 条约 20KB），而不是把 400KB 的完整词条列表又拉回来。
+async function ensureStarAllIds() {
+  const q = ($("#starQuery").value || "").trim();
+  if (starAllIdsKey === q) return starAllIds;
+  const r = await api(`/api/v1/star-terms?ids_only=1&q=${encodeURIComponent(q)}`);
+  starAllIds = r.ids || [];
+  starAllIdsKey = q;
+  return starAllIds;
+}
+
+// 只同步本页 checkbox 的视觉状态，不重新请求后端
+function starRedrawChecks() {
+  const boxes = starListEl.querySelectorAll(".starCheck");
+  boxes.forEach((cb) => {
+    const on = selectedStarIds.has(Number(cb.dataset.id));
+    cb.checked = on;
+    const row = cb.closest(".star-row");
+    if (row) {
+      if (on) row.setAttribute("data-sel", "1");
+      else row.removeAttribute("data-sel");
+    }
+  });
+  $("#starSelAll").checked = boxes.length > 0
+    && Array.from(boxes).every((cb) => cb.checked);
+  renderStarPager(starLastResp, starLastLen);
+}
+
+starListEl.addEventListener("change", (ev) => {
+  const cb = ev.target.closest && ev.target.closest("input.starCheck");
+  if (!cb) return;
+  const id = Number(cb.dataset.id);
+  if (cb.checked) selectedStarIds.add(id);
+  else selectedStarIds.delete(id);
+  const row = cb.closest(".star-row");
+  if (row) {
+    if (cb.checked) row.setAttribute("data-sel", "1");
+    else row.removeAttribute("data-sel");
+  }
+  const boxes = starListEl.querySelectorAll(".starCheck");
+  $("#starSelAll").checked = boxes.length > 0
+    && Array.from(boxes).every((x) => x.checked);
+  renderStarPager(starLastResp, starLastLen);
+});
+
+$("#starSelAll").addEventListener("change", (ev) => {
+  const want = ev.target.checked;
+  starListEl.querySelectorAll(".starCheck").forEach((cb) => {
+    const id = Number(cb.dataset.id);
+    if (want) selectedStarIds.add(id);
+    else selectedStarIds.delete(id);
+    cb.checked = want;
+    const row = cb.closest(".star-row");
+    if (row) {
+      if (want) row.setAttribute("data-sel", "1");
+      else row.removeAttribute("data-sel");
+    }
+  });
+  renderStarPager(starLastResp, starLastLen);
+});
+
+$("#btnStarSelAll").addEventListener("click", async () => {
+  try {
+    const ids = await ensureStarAllIds();
+    ids.forEach((id) => selectedStarIds.add(id));
+    starRedrawChecks();
+    toast(`已选中当前筛选下全部 ${ids.length} 条（跨页）`);
+  } catch (e) { toast(e.message, true); }
+});
+
+$("#btnStarSelInvert").addEventListener("click", async () => {
+  try {
+    const ids = await ensureStarAllIds();
+    const next = ids.filter((id) => !selectedStarIds.has(id));
+    selectedStarIds.clear();
+    next.forEach((id) => selectedStarIds.add(id));
+    starRedrawChecks();
+    toast(`反选完成，当前选中 ${selectedStarIds.size} 条`);
+  } catch (e) { toast(e.message, true); }
+});
+
+$("#btnStarSelNone").addEventListener("click", () => {
+  selectedStarIds.clear();
+  starRedrawChecks();
+});
+
+async function starBatch(action) {
+  const ids = [...selectedStarIds];
+  if (!ids.length) return toast("请先勾选词条", true);
+  if (action === "delete" && !confirm(
+    `确认删除选中的 ${ids.length} 个词条？\n删除后需点「重算推荐」才会更新已回填的 Tag。`
+  )) return;
+  try {
+    const r = await _jsonPost("/api/v1/star-terms/batch", { action, ids });
+    toast(r.msg || "已完成");
+    selectedStarIds.clear();
+    starInvalidateAllIds();
+    await loadStarTerms();
+  } catch (e) { toast(e.message, true); }
+}
+
+$("#btnStarBatchDel").addEventListener("click", () => starBatch("delete"));
+$("#btnStarBatchOn").addEventListener("click", () => starBatch("enable"));
+$("#btnStarBatchOff").addEventListener("click", () => starBatch("disable"));
+
+$("#starQuery").addEventListener("input", () => {
+  clearTimeout(starQueryTimer);
+  starQueryTimer = setTimeout(() => {
+    starPage = 1;
+    selectedStarIds.clear();
+    starInvalidateAllIds();
+    loadStarTerms();
+  }, 300);
+});
+$("#starPageSize").addEventListener("change", () => {
+  starPage = 1;
+  starInvalidateAllIds();
+  loadStarTerms();
+});
+$("#starFirst").addEventListener("click", () => starGoPage(1));
+$("#starPrev").addEventListener("click", () => starGoPage(starPage - 1));
+$("#starNext").addEventListener("click", () => starGoPage(starPage + 1));
+$("#starLast").addEventListener("click", () => starGoPage(starPages));
+$("#starGo").addEventListener("click", () => starGoPage($("#starJump").value));
+$("#starJump").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") starGoPage($("#starJump").value);
+});
 
 // ---------------- 标签索引（v1.14.0 / B-01） ----------------
 // 只读状态 + 手动重建。刻意不参与 5 秒轮询：回填是长任务，靠「索引状态」
@@ -2059,18 +2389,50 @@ function secLoadOpen() {
 
 // ---------------- 刷新循环 ----------------
 let timer = null;
-async function refreshAll() {
-  // 概览与暂停开关是全页面共用的轻接口，恒刷新；
-  // 源站/日志两个重组件只在「展开期间」跟随轮询，收起时完全不请求。
-  const jobs = [loadStats(), loadPause()];
+let idleTicks = 0;
+
+// 合并接口不可用（老后端 / 反代只放行白名单）时完整退回升级前的并发请求，
+// 面板不会因为一次接口改造整体失效。
+async function refreshAllLegacy() {
+  const jobs = [loadStats(), loadPause(), loadSourceBlocks()];
   if (secOpen.sources) jobs.push(loadSources());
   if (secOpen.logs) jobs.push(loadLogs());
   await Promise.allSettled(jobs);
 }
+
+async function refreshAll() {
+  if (refreshBusy) return;      // 单飞：上一轮没回来就不叠请求（慢链路尤其重要）
+  refreshBusy = true;
+  try {
+    const parts = ["stats", "pause"];
+    if (secOpen.sources) parts.push("sources");
+    if (secOpen.logs) parts.push("logs");
+    // v1.16.4：4 次 HTTP 往返合并成 1 次；字段口径与老接口完全一致
+    const d = await api("/api/v1/admin/overview?sections=" + parts.join(","));
+    if (d.stats) loadStats(d.stats);
+    if (d.pause) loadPause(d.pause);
+    if (d.blocks) applyBlocks(d.blocks);
+    if (d.sources && !sourcesBusy()) loadSources(false, d.sources);
+    if (d.logs) loadLogs(d.logs);
+    syncWasActive = Number((d.stats || {}).sources_syncing || 0) > 0
+                 || Number((d.stats || {}).sources_unfinished || 0) > 0;
+  } catch (e) {
+    await refreshAllLegacy();
+  } finally {
+    refreshBusy = false;
+  }
+}
 function schedule() {
   if (timer) clearInterval(timer);
   if ($("#autoRefresh").checked) {
-    timer = setInterval(() => { if (!document.hidden) refreshAll(); }, 5000);
+    // 有任务在跑保持 5 秒；完全空闲时降到 15 秒一轮，页面隐藏则零请求。
+    // 源站表格另有渲染签名短路，数据没变连 DOM 都不重建。
+    timer = setInterval(() => {
+      if (document.hidden) return;
+      if (!syncWasActive && ++idleTicks % 3 !== 0) return;
+      idleTicks = 0;
+      refreshAll();
+    }, 5000);
   }
 }
 $("#autoRefresh").addEventListener("change", schedule);

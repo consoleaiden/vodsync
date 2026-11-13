@@ -103,9 +103,10 @@ def main():
     check("A2 两份 openapi 一致且版本与代码一致",
           spec == spec2 and spec["info"]["version"] == __version__,
           spec["info"]["version"])
-    check("A3 无新增端点（仍 58 paths / 65 methods）",
-          len(spec["paths"]) == 58
-          and sum(len(v) for v in spec["paths"].values()) == 65,
+    # v1.16.4 起面板新增了分页/批量/屏蔽/合并轮询端点，基线集合只增不减
+    check("A3 基线端点仍在（paths ≥ 58 / methods ≥ 65）",
+          len(spec["paths"]) >= 58
+          and sum(len(v) for v in spec["paths"].values()) >= 65,
           (len(spec["paths"]), sum(len(v) for v in spec["paths"].values())))
 
     print("\nB. 阈值白名单登记")
