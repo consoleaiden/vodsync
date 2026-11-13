@@ -440,6 +440,69 @@ def needs_repair() -> bool:
 # ---------------------------------------------------------------------------
 # 就绪判定（能力声明用）
 # ---------------------------------------------------------------------------
+def ensure_state_rows() -> dict:
+    """
+    v1.16.2 / R5：给「启用 + 有 vod 表 + 缺 tag_index_state 行」的源站补状态行。
+
+    现象：面板手动新增源站后会同步入库，upsert_batch 的写时维护已经把
+    video_tags 倒排建好了，但 nobody 给 tag_index_state 插那一行 ——
+    ready() 的 all(s in done) 恒 false，/healthz 不声明 tag_search，
+    App 的标签检索整体回退成标题全文搜索。线上 65 个启用站 / 57 行 state，
+    缺的正是后来手动新增的 8 个站（倒排各有 205~169456 行，数据其实是齐的）。
+
+    只做 count，不扫大表、不重建倒排：有倒排数据的站直接标 done，
+    没有的标 pending 交给启动自愈/手动端点回填。
+    """
+    try:
+        with database.engine.connect() as conn:
+            enabled = [r[0] for r in conn.execute(
+                select(sources.c.slug).where(sources.c.enabled == 1)
+            ).all()]
+            have = {r[0] for r in conn.execute(
+                select(tag_index_state.c.slug)
+            ).all()}
+            existing = database.list_tables("vod_")
+            missing = [s for s in enabled
+                       if s not in have and build_vod_table(s).name in existing]
+            if not missing:
+                return {"filled_done": [], "filled_pending": []}
+            tag_counts = dict(conn.execute(
+                select(video_tags.c.source, func.count())
+                .where(video_tags.c.source.in_(missing))
+                .group_by(video_tags.c.source)
+            ).all())
+            totals = {}
+            for s in missing:
+                try:
+                    totals[s] = int(conn.execute(
+                        select(func.count()).select_from(build_vod_table(s))
+                    ).scalar() or 0)
+                except Exception:  # noqa: BLE001
+                    totals[s] = 0
+        done, pending = [], []
+        with database.write_txn() as conn:
+            for s in missing:
+                n = int(tag_counts.get(s, 0))
+                total = totals.get(s, 0)
+                ok = n > 0
+                conn.execute(
+                    database.dialect_insert(tag_index_state).values(
+                        slug=s, status="done" if ok else "pending",
+                        cursor=0, processed=total if ok else 0,
+                        indexed=n, total=total,
+                        finished_at=datetime.now() if ok else None,
+                    ).on_conflict_do_nothing(index_elements=["slug"])
+                )
+                (done if ok else pending).append(s)
+        invalidate_ready_cache()
+        if done or pending:
+            log.info("补齐标签索引状态行: done=%d pending=%d", len(done), len(pending))
+        return {"filled_done": done, "filled_pending": pending}
+    except Exception as e:  # noqa: BLE001
+        log.warning("补齐标签索引状态行失败（忽略）: %s", e)
+        return {"filled_done": [], "filled_pending": [], "error": str(e)[:200]}
+
+
 def invalidate_ready_cache() -> None:
     with _ready_lock:
         _ready_cache["at"] = 0.0
@@ -452,6 +515,12 @@ def ready() -> bool:
 
     判定：所有启用且**已有数据表**的源站都 status=done，且至少写过一行标签。
     缓存 30 秒：/healthz 是客户端连接测试接口，会被高频调用，不能每次都查库。
+
+    v1.16.2 / R5 设计取舍：**状态行是唯一真源**，ready() 保持纯读，绝不在
+    这里猜「没状态行但有倒排算不算就绪」。原因是「面板手动新增、倒排已由写时
+    维护建好」和「索引还没回填完」在数据形态上完全一样（video_tags 有行、
+    tag_index_state 缺行），一旦放宽，v1.14.0 的「全站回填完才声明 tag_search」
+    灰度契约就形同虚设。缺行由 ensure_state_rows() 在启动引导集中补齐。
     """
     if not config.TAG_SEARCH_ENABLED:
         return False
@@ -474,6 +543,11 @@ def ready() -> bool:
             rows = conn.execute(select(func.count()).select_from(video_tags)).scalar() or 0
         existing = database.list_tables("vod_")
         need = [s for s in enabled if build_vod_table(s).name in existing]
+        # v1.16.2 / R5：面板手动新增的源站（倒排齐、缺状态行）由
+        # ensure_state_rows() 在启动引导补齐，不在这里放宽判据。
+        # 试过用「有倒排行就视同就绪」来兜底，结果和 v1.14.0 契约用例
+        # 「索引未就绪时不声明 tag_search」直接冲突：两者数据形态完全一样，
+        # 无法区分，只会把灰度能力声明变成永远为 true。故回到严格判据。
         val = bool(need) and bool(rows) and all(s in done for s in need)
     except Exception as e:  # noqa: BLE001
         log.debug("标签索就绪判定失败（按未就绪处理）: %s", e)

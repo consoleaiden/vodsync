@@ -1,9 +1,9 @@
-# 数据迁移说明（v1.14.0 ~ v1.16.1，MIGRATION_NOTES）
+# 数据迁移说明（v1.14.0 ~ v1.16.2，MIGRATION_NOTES）
 
 > 对应需求：`BACKEND_UPGRADE_REQUIREMENTS_2026-11-09.md`（B-01 / B-08 / B-09 / B-10 / B-11）、
 > v1.15.0「源站 18+ 标记与未成年模式」、v1.16.0「智能去广告规则下发与命中上报」、
-> v1.16.1「按站点分布统计」
-> 影响面：**新增 5 张表 + 3 个追加列**，不改任何现有列、不重命名任何字段。
+> v1.16.1「按站点分布统计」、v1.16.2「标题词库回填修复」
+> 影响面：**新增 6 张表 + 3 个追加列**，不改任何现有列、不重命名任何字段。
 > 升级方式：拉新镜像重启即可，`init_db()` 会自动建表补列，无需手工 SQL。
 
 ---
@@ -20,6 +20,7 @@
 | `adfilter_reports` | 新表（v1.16.0 命中上报明细） | 自动建表 | `DROP TABLE adfilter_reports`（只影响统计，不影响播放） |
 | `adfilter_reports.host` | 追加列（v1.16.1 按站点聚合） | 自动 `ALTER` + 启动分批回填 | 保留无害（旧代码不读） |
 | `settings.api_token_scope` | 新增一条配置行 | 启动时自动写入 `admin` | 删行即可（等价 admin） |
+| `star_rebuild_state` | 新表（标题词库回填的全量重建水位） | 自动建表 | `DROP TABLE star_rebuild_state`（旧代码不读，残留无害） |
 
 **没有**改动的：`vod_{slug}` 表结构、`sources` 表、任何响应字段名、`list` / `detail` / `pagecount` /
 `original_index` 的语义。
@@ -379,3 +380,41 @@ curl -s "http://127.0.0.1:8181/api/v1/search?tag=%E6%82%AC%E7%96%91&source=ffzy&
 curl -s http://127.0.0.1:8181/api/v1/sources | python -c "import json,sys;print(json.load(sys.stdin)['code'])"
 # 期望：40101
 ```
+
+---
+
+## 7. 标题词库回填修复：新增 `star_rebuild_state`
+
+> 详细根因、实现、上线与回填/回滚方案见
+> [`TITLE_TAG_BACKFILL_PLAN.md`](TITLE_TAG_BACKFILL_PLAN.md)。
+
+**不改任何现有列、不改任何响应契约**，只新增一张表：
+
+```sql
+CREATE TABLE IF NOT EXISTS star_rebuild_state (
+    slug           VARCHAR(64) PRIMARY KEY,
+    last_full_at   TIMESTAMP,
+    rows_scanned   INTEGER DEFAULT 0,
+    rows_tagged    INTEGER DEFAULT 0,
+    rows_mapped    INTEGER DEFAULT 0,
+    elapsed_s      INTEGER DEFAULT 0
+);
+```
+
+为什么必须有它：旧调度用 `max(star_map.computed_at)` 判断「上次全量重建时间」，
+但增量同步 `update_ids()` 每 6h 也刷新这个字段，导致大站永远显示「刚重建过」、
+全量重建从未轮到。新表**只有 `rebuild_source()` 完成才写入**，`update_ids()`
+绝不推进，夜间轮转因此可靠。
+
+升级行为：
+
+- 服务启动 `META.create_all()` 自动建表，**无需手工 SQL**。
+- 新表初始为空 = 所有站都「从未全量重建过」，夜间调度会按
+  「从未重建优先 → 时间升序 → 小站优先」逐步校准。
+- 存量 `vod_tag` 不会因为升级自动变化：新片由写时推断覆盖，存量需按
+  `TITLE_TAG_BACKFILL_PLAN.md` 第 8.3 节按站一次性回填。
+- 启动引导会调 `tags.ensure_state_rows()` 给「有倒排但缺 `tag_index_state` 行」
+  的手动新增源站补状态行（`done` 或 `pending`），与 `TAG_INDEX_ON_STARTUP` 解耦。
+
+回滚：回退镜像即可，新表保留但旧代码不读。**已写入的 `vod_tag` 不会自动回滚**
+（改动是幂等合并、保住源站原生标签，业务上可直接使用；精确回退只能从备份恢复）。

@@ -1,28 +1,40 @@
 # ---------------------------------------------------------------------------
-# 明星 Tag 回填 + 明星作品推荐（v1.9.1）
+# 明星 Tag 回填 + 明星作品推荐（v1.9.1，v1.16.2 重构回填链路）
 #
 # 数据流：
-#   star_terms（词库，面板维护，已录入大量数据）
+#   star_terms（词库，面板维护，3400+ 条）
 #       ↓ 编译为单个正则（一次扫描出全部命中）
-#   vod_{slug}.vod_tag   缺演员的行：标题命中词库 → 写入明星名（多个逗号分隔）
-#   star_map             全量重建：真实演员 ∩ 词库（src=actor）+ 标题命中（src=title）
+#   ① 写时：syncer.upsert_batch → infer_on_ingest → 合并进 vod_tag + video_tags
+#   ② 全量：rebuild_source → 标题命中写 vod_tag；标题∪演员命中进 star_map
 #       ↓ (slug, term) 索引查询
 #   GET /api/v1/star/related   明星相关视频，毫秒级，不打大表
+#   GET /api/v1/videos?tag=    标签推荐（video_tags 倒排）
 #
-# 高性能方案（为什么快）：
-#   1. 单正则扫描：词库 N 个名字编译成一个 alternation 正则，一个标题一次
-#      扫描出全部命中，复杂度 O(标题长)，与词库大小解耦 —— 对比逐词判断的
-#      O(N×标题长) 快 N 倍；词表按长度降序排列，「吴京安」优先于「吴京」。
-#      词库到十万级再考虑换 Aho-Corasick 自动机（pyahocorasick），当前规模
-#      单正则已足够（万级词库编译一次 ~10ms，扫描每标题 ~µs 级）。
-#   2. 数据库侧过滤下推 + 流式 keyset 分页（vod_id > last_id）：每批只取
-#      STAR_TAG_BATCH_SIZE 行，内存恒定，不做 OFFSET 深分页（越翻越慢）。
-#   3. 真实演员行不跑正则：演员串切分归一化后与词库集合做交集，O(演员数)。
-#   4. 批量写库：vod_tag 用 executemany 批量 UPDATE，star_map 批量插入。
-#   5. 倒排映射表：API 查询命中 idx_star_map_term 索引，代价 O(该明星的视频数)，
-#      而不是对 220 万行 LIKE '%吴京%' 全表扫（那要几百 ms 且不可索引）。
-#   6. 重建是全量幂等的（先删 star_map 再批量插）：词库增删后历史未命中行
-#      会被重新评估 —— 这是有意设计，不是浪费。
+# v1.16.2 修的四个真实缺陷（线上乐播站实测反例：33.8 万行、actor 全空，
+#   词库有「香草少女」、标题含该词 118 行，vod_tag 却全空）：
+#   1. 夜间轮转用 max(star_map.computed_at) 当「上次重建时间」，而每 6h
+#      的增量同步 update_ids() 也刷新它 —— 大站永远「刚重建过」，全量重建
+#      从未轮到（乐播只有 383 条映射，真跑过的站是 10 万条量级）。
+#      → 独立 star_rebuild_state 水位，只有全量重建完成才推进。
+#   2. _hits_for_row 旧实现「有演员就只看演员」，标题正则一次都不跑。
+#   3. _scan_and_collect 只有 src=="title" 才写 vod_tag，且用推断值整体
+#      覆盖源站原生标签；无命中时还会把已有标签清空。
+#      → 合并式回写 merge_vod_tag：保留原生段，只替换上次推断段。
+#   4. 面板手动新增的源站缺 tag_index_state 行，会让 ready() 恒 false、把
+#      tag_search 从 /healthz 摘掉（线上 65 个启用站 / 57 行 state）。
+#      → tags.ensure_state_rows() 在启动引导补齐状态行；ready() 保持严格
+#        灰度判据（不能放宽，否则「新增站」和「未回填完」无法区分）。
+#
+# 性能（为什么这套比反复全量重扫划算）：
+#   1. 单正则扫描：N 个词编译成一个 alternation，O(标题长) 与词库规模解耦，
+#      长词优先（「吴京安」优先于「吴京」）；万级词库编译 ~10ms、每标题 µs 级。
+#      到十万级再考虑 Aho-Corasick（pyahocorasick）。
+#   2. 写时推断每页几十条，成本可忽略 —— 新片从入库那一刻就有标签，
+#      全量重建从「常规路径」降为「一次性存量回填 + 低频校准」。
+#   3. keyset 分页（vod_id > last_id）+ 批大小 STAR_TAG_BATCH_SIZE +
+#      批间休眠，内存恒定、不与同步抢满 IO。
+#   4. 只写「标签发生变化」的行（cur_tag != new_tag），重复重建零写入。
+#   5. star_map / video_tags 都是倒排，读侧 O(命中视频数)，不对大表 LIKE。
 # ---------------------------------------------------------------------------
 import logging
 import re
@@ -33,10 +45,15 @@ from sqlalchemy import bindparam, func, select
 from sqlalchemy import and_, or_
 
 from . import config, database
-from .models import build_vod_table, star_map, star_terms
+from .models import build_vod_table, star_map, star_rebuild_state, star_terms
 from .related import _star_norm, canon_hits, canon_star, star_alias_map, star_pattern
 
 log = logging.getLogger("vodsync.star_tags")
+
+# vod_tag 的分隔符：与 tags.split_tags 保持一致（源站写法五花八门）
+_TAG_SPLIT_RE = re.compile(r"[,，/|｜、;；]+")
+# vod_tag 是 VARCHAR(255)，合并时按段累加，绝不切出半个词
+_TAG_MAX_CHARS = 255
 
 
 def _library_set() -> frozenset:
@@ -74,17 +91,111 @@ def _actor_hits(actor_raw: str, library: frozenset) -> set:
     return hits
 
 
+def _filter_hits(hits: set) -> set:
+    """过滤纯 ASCII 的过短词（词库里 er/ss/jk 这类 2 字母词会污染标签）。
+
+    中文词仍按 reload_star_terms() 既有的 len>=2 规则；这里只额外约束 ASCII。
+    """
+    n = config.STAR_TAG_MIN_ASCII_LEN
+    if n <= 0:
+        return hits
+    return {t for t in hits if not (t.isascii() and len(t) < n)}
+
+
 def _hits_for_row(name_raw: str, actor_raw: str, pattern, library: frozenset):
     """
-    返回 (主名集合, 来源)：
-      真实演员行 → 演员 ∩ 词库（别名归一，不跑正则，快）
-      缺演员行   → 标题单正则扫描（命中变体归一为主名）
+    v1.16.2：返回 (写 vod_tag 的集合, 进 star_map 的集合, 来自演员的集合)。
+
+    旧实现是「有演员就只看演员」的二选一 —— 只要 vod_actor 非空，标题正则
+    一次都不跑，且 _scan_and_collect 只有 src=="title" 才回写 vod_tag。于是
+    演员字段非空（哪怕值并不在词库里）的视频，标题里明明有多个词库词，
+    vod_tag 和 star_map 双双为空。
+
+    现在两路都算。口径严格按需求：**只有标题命中写 vod_tag**；演员命中仍
+    只进 star_map（保持 v1.9.1 起的既有语义，不改变「真实演员行 tag 保留
+    源站原值」的契约）。单正则扫一个标题 µs 级，全库多跑一遍很便宜。
     """
-    if (actor_raw or "").strip():
-        return _actor_hits(actor_raw, library), "actor"
-    if pattern is None:
-        return set(), "title"
-    return canon_hits(pattern.findall(_star_norm(name_raw or ""))) & library, "title"
+    actor_hits = _filter_hits(
+        _actor_hits(actor_raw, library) if (actor_raw or "").strip() else set()
+    )
+    title_hits = set()
+    if pattern is not None:
+        title_hits = _filter_hits(
+            canon_hits(pattern.findall(_star_norm(name_raw or ""))) & library
+        )
+    if config.STAR_TAG_UNION_HITS:
+        return title_hits, title_hits | actor_hits, actor_hits
+    if actor_hits:  # 旧语义（回滚开关，正常不启用）
+        return set(), actor_hits, actor_hits
+    return title_hits, title_hits, set()
+
+
+def _tag_key(s: str) -> str:
+    """标签段比较键：与词库主名同一套归一化（NFKC/小写/繁转简）。"""
+    return _star_norm(s or "").strip()
+
+
+def merge_vod_tag(cur_tag: str, old_inferred, new_inferred, max_n: int = None) -> str:
+    """
+    v1.16.2：合并式回写，替代旧的整体覆盖。
+
+      kept = cur_tag 的段 - 本服务上次写进去的推断段（old_inferred）
+      out  = kept + 本次命中段（new_inferred，最多 max_n 个）
+
+    这样：① 源站原生标签（如「巨乳」）不会被冲掉；② 词库删词/标题改名后
+    过期推断段能精确移除；③ 重复跑幂等（cur_tag 相同就不写库）。
+    old_inferred 取自在 star_map 里该视频的旧映射，由调用方批量预取。
+    """
+    max_n = config.STAR_TAG_MAX_PER_VIDEO if max_n is None else max_n
+    old_keys = {_tag_key(t) for t in (old_inferred or ())}
+    kept, seen = [], set()
+    for part in _TAG_SPLIT_RE.split(cur_tag or ""):
+        s = part.strip()
+        if not s:
+            continue
+        k = _tag_key(s)
+        if not k or k in old_keys or k in seen:
+            continue
+        seen.add(k)
+        kept.append(s)
+    add = []
+    for t in sorted(new_inferred or ())[:max_n]:
+        k = _tag_key(t)
+        if k and k not in seen:
+            seen.add(k)
+            add.append(t)
+    out, used = [], 0
+    for s in kept + add:
+        cost = len(s) + (1 if out else 0)
+        if used + cost > _TAG_MAX_CHARS:
+            break
+        out.append(s)
+        used += cost
+    return ",".join(out)
+
+
+def _old_inferred_map(conn, slug: str, ids: list) -> dict:
+    """批量取「本服务上次写进去的推断段」：star_map 里该批视频的全部 term。
+
+    一次 IN 查询（每 500 个 id 一片），避免逐行查库。全量重建时这些旧行
+    马上会被删掉，所以必须在删除之前取。
+    """
+    out: dict = {}
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        if not chunk:
+            continue
+        for vid, term in conn.execute(
+            select(star_map.c.vod_id, star_map.c.term).where(
+                star_map.c.slug == slug,
+                star_map.c.vod_id.in_(chunk),
+                # 只有 src=title 的词是上次写进 vod_tag 的推断段；
+                # actor 命中的词从来不写 vod_tag，不能拿来当清理依据。
+                star_map.c.src == "title",
+            )
+        ).all():
+            out.setdefault(int(vid), set()).add(term)
+    return out
 
 
 def _flush_tag_updates(slug: str, table, upd_rows: list):
@@ -125,11 +236,27 @@ def _flush_map_insert(rows: list):
         conn.execute(stmt, rows)
 
 
+def _delete_map_ids(slug: str, ids: list):
+    """按批删掉这批视频的旧 star_map 行（幂等重建）。"""
+    with database.write_txn() as conn:
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            if chunk:
+                conn.execute(star_map.delete().where(
+                    star_map.c.slug == slug, star_map.c.vod_id.in_(chunk)
+                ))
+
+
 def _scan_and_collect(slug: str, pattern, library: frozenset) -> dict:
     """
-    流式扫描 vod_{slug} 全表（keyset 分页），产出：
-      tag_rows  待回写 vod_tag 的行（只对缺演员行回填，真实演员 tag 保留源站原值）
-      map_rows  待插入 star_map 的行（真实演员 + 标题命中都进映射，API 才有完整作品列表）
+    流式扫描 vod_{slug} 全表（keyset 分页，内存恒定）。
+
+    v1.16.2 三处关键变化：
+      1. 所有行都跑标题正则 + 演员交集取并集（旧实现二选一）；
+      2. 所有行都回写 vod_tag（旧实现只有 src=="title" 才写）；
+      3. 用合并式回写，保留源站原生标签，只替换上一次的推断段。
+    每批先读旧映射（拿到上一次的推断段）→ 删旧映射 → 写 tag/倒排 → 插新映射。
+    不再一次性 DELETE 整站（大事务 + 拿不到旧推断段），孤儿行由读侧 JOIN 自然过滤。
     """
     table = build_vod_table(slug)
     tag_rows, map_rows = [], []
@@ -150,32 +277,46 @@ def _scan_and_collect(slug: str, pattern, library: frozenset) -> dict:
             break
         last_id = rows[-1]["vod_id"]
         scanned += len(rows)
+        ids = [r["vod_id"] for r in rows]
+
+        # 必须在删旧映射之前取：这些 term 就是上一次写进 vod_tag 的推断段
+        with database.engine.connect() as conn:
+            old_map = _old_inferred_map(conn, slug, ids)
 
         batch_tag, batch_map = [], []
         for r in rows:
-            hits, src = _hits_for_row(r["name"], r["vod_actor"], pattern, library)
-            if src == "title":
-                # 缺演员行的 vod_tag 由词库推断独占：命中则写入，没命中则清空。
-                # v1.10.0 / B3：旧实现只在 hits 非空时回写，词库删改后旧 tag 永久
-                # 残留（且 upsert 的 COALESCE 保护让它连重新同步都洗不掉）。
-                hits = sorted(hits)[: config.STAR_TAG_MAX_PER_VIDEO]
-                new_tag = ",".join(hits)
-                cur_tag = r["vod_tag"] or ""
-                if cur_tag != new_tag and (new_tag or config.STAR_TAG_CLEAR_STALE):
-                    batch_tag.append({"vid": r["vod_id"], "tag": new_tag})
-            else:
-                hits = sorted(hits)[: config.STAR_TAG_MAX_PER_VIDEO]
-            for h in hits:
+            tag_hits, map_hits, actor_hits = _hits_for_row(
+                r["name"], r["vod_actor"], pattern, library
+            )
+            inferred_tag = sorted(tag_hits)[: config.STAR_TAG_MAX_PER_VIDEO]
+            inferred_map = sorted(map_hits)[: config.STAR_TAG_MAX_PER_VIDEO]
+            cur_tag = r["vod_tag"] or ""
+            if config.STAR_TAG_MERGE_TAG:
+                new_tag = merge_vod_tag(
+                    cur_tag, old_map.get(r["vod_id"], set()), inferred_tag
+                )
+                write_tag = cur_tag != new_tag
+            else:  # 旧语义（回滚开关，正常不启用）
+                new_tag = ",".join(inferred_tag)
+                write_tag = (cur_tag != new_tag
+                             and (bool(new_tag) or config.STAR_TAG_CLEAR_STALE))
+            if write_tag:
+                batch_tag.append({"vid": r["vod_id"], "tag": new_tag})
+            for h in inferred_map:
                 batch_map.append(
                     {"slug": slug, "vod_id": r["vod_id"], "term": h,
-                     "src": src, "computed_at": now}
+                     "src": "actor" if h in actor_hits else "title",
+                     "computed_at": now}
                 )
+        _delete_map_ids(slug, ids)
         if batch_tag:
             _flush_tag_updates(slug, table, batch_tag)
             tag_rows.extend(batch_tag)
         if batch_map:
             _flush_map_insert(batch_map)
             map_rows.extend(batch_map)
+        if config.STAR_TAG_REBUILD_SLEEP_MS > 0:
+            time.sleep(config.STAR_TAG_REBUILD_SLEEP_MS / 1000.0)
     return {"scanned": scanned, "tagged": len(tag_rows), "mapped": len(map_rows)}
 
 
@@ -193,17 +334,33 @@ def rebuild_source(slug: str, reason: str = "manual") -> dict:
     if not database.table_exists(table.name):
         return {"slug": slug, "skipped": "no_table", "reason": reason}
 
-    # 全量重建：先清该源旧映射（幂等），扫描过程中分批插新映射
-    with database.write_txn() as conn:
-        conn.execute(star_map.delete().where(star_map.c.slug == slug))
-
+    # v1.16.2：不再一次性 DELETE 整站。_scan_and_collect 按批「先读旧推断段 →
+    # 删该批映射 → 写新值」，既能做合并式回写，也避免几十万行的大事务。
     stats = _scan_and_collect(slug, pattern, library)
     elapsed = round(time.time() - started, 1)
+    _mark_full_rebuild(slug, stats, elapsed)
     log.info(
         "[明星Tag] %s 重建完成(%s): 扫描 %d 行, 回填 tag %d 行, 映射 %d 条, 耗时 %ss",
         slug, reason, stats["scanned"], stats["tagged"], stats["mapped"], elapsed,
     )
     return {"slug": slug, "reason": reason, "elapsed_s": elapsed, **stats}
+
+
+def _mark_full_rebuild(slug: str, stats: dict, elapsed: float):
+    """只有全量重建完成才推进水位 —— 夜间轮转据此选站，增量回填绝不碰它。"""
+    now = datetime.now()
+    vals = {
+        "slug": slug,
+        "last_full_at": now,
+        "rows_scanned": int(stats.get("scanned", 0)),
+        "rows_tagged": int(stats.get("tagged", 0)),
+        "rows_mapped": int(stats.get("mapped", 0)),
+        "elapsed_s": int(elapsed),
+    }
+    stmt = database.dialect_insert(star_rebuild_state).values(**vals)
+    set_ = {k: v for k, v in vals.items() if k != "slug"}
+    with database.write_txn() as conn:
+        conn.execute(stmt.on_conflict_do_update(index_elements=["slug"], set_=set_))
 
 
 def update_ids(slug: str, ids: list) -> dict:
@@ -229,32 +386,83 @@ def update_ids(slug: str, ids: list) -> dict:
             select(table.c.vod_id, table.c.name, table.c.vod_actor, table.c.vod_tag)
             .where(table.c.vod_id.in_(ids))
         ).mappings().all()
+        old_map = _old_inferred_map(conn, slug, ids)
     for r in rows:
-        hits, src = _hits_for_row(r["name"], r["vod_actor"], pattern, library)
-        hits = sorted(hits)[: config.STAR_TAG_MAX_PER_VIDEO]
-        if src == "title":
-            new_tag = ",".join(hits)
-            if (r["vod_tag"] or "") != new_tag:
-                tag_rows.append({"vid": r["vod_id"], "tag": new_tag})
-        for h in hits:
+        tag_hits, map_hits, actor_hits = _hits_for_row(
+            r["name"], r["vod_actor"], pattern, library
+        )
+        inferred_tag = sorted(tag_hits)[: config.STAR_TAG_MAX_PER_VIDEO]
+        inferred_map = sorted(map_hits)[: config.STAR_TAG_MAX_PER_VIDEO]
+        cur_tag = r["vod_tag"] or ""
+        if config.STAR_TAG_MERGE_TAG:
+            new_tag = merge_vod_tag(
+                cur_tag, old_map.get(r["vod_id"], set()), inferred_tag
+            )
+            write_tag = cur_tag != new_tag
+        else:
+            new_tag = ",".join(inferred_tag)
+            write_tag = (cur_tag != new_tag
+                         and (bool(new_tag) or config.STAR_TAG_CLEAR_STALE))
+        if write_tag:
+            tag_rows.append({"vid": r["vod_id"], "tag": new_tag})
+        for h in inferred_map:
             map_rows.append(
                 {"slug": slug, "vod_id": r["vod_id"], "term": h,
-                 "src": src, "computed_at": now}
+                 "src": "actor" if h in actor_hits else "title",
+                 "computed_at": now}
             )
-    if map_rows or tag_rows:
-        # 无论这次有没有命中，先把传入 ids 的旧映射清掉：
-        # 视频改名/演员更新后可能不再命中任何词库项，不清会残留过期映射
-        with database.write_txn() as conn:
-            conn.execute(
-                star_map.delete().where(
-                    and_(star_map.c.slug == slug, star_map.c.vod_id.in_(ids))
-                )
-            )
-        if tag_rows:
-            _flush_tag_updates(slug, table, tag_rows)
-        if map_rows:
-            _flush_map_insert(map_rows)
+    # 无论这次有没有命中，都要先清掉传入 ids 的旧映射：
+    # 视频改名/演员更新后可能不再命中任何词库项，不清会残留过期映射。
+    _delete_map_ids(slug, ids)
+    if tag_rows:
+        _flush_tag_updates(slug, table, tag_rows)
+    if map_rows:
+        _flush_map_insert(map_rows)
     return {"updated": len(tag_rows) + len(map_rows)}
+
+
+def infer_on_ingest(slug: str, rows: list, existing_tags: dict, conn) -> int:
+    """
+    v1.16.2 写时推断：同步入库的同一事务里，把标题/演员命中的词库词合并进
+    每行的 vod_tag。只改内存里的 rows，不单独写库 —— 主表 vod_tag 与
+    video_tags 倒排随后由 upsert_batch 一起落库。
+
+    为什么放在写时：老视频的标签本来就只能靠夜间全量重建补，而夜间轮转
+    会被增量同步打乱（见 star_rebuild_state 注释）。写时推断让**新片从入库
+    那一刻就有标签**，存量则靠一次性分批回填，全量重建退化为校准/兜底。
+    每页几十条 × 单正则 µs 级，对同步吞吐影响可忽略。
+    """
+    if not config.STAR_TAG_INFER_ON_SYNC or not rows:
+        return 0
+    pattern = star_pattern()
+    if pattern is None:
+        return 0
+    library = _library_set()
+    if not library:
+        return 0
+    ids = [r["vod_id"] for r in rows if r.get("vod_id") is not None]
+    old_map = _old_inferred_map(conn, slug, ids)
+    patched = 0
+    for r in rows:
+        vid = r.get("vod_id")
+        if vid is None:
+            continue
+        tag_hits, _map_hits, _actor = _hits_for_row(
+            r.get("name", ""), r.get("vod_actor", ""), pattern, library
+        )
+        inferred = sorted(tag_hits)[: config.STAR_TAG_MAX_PER_VIDEO]
+        upstream = r.get("vod_tag") or ""
+        base = upstream or (existing_tags.get(vid) or "")
+        if config.STAR_TAG_MERGE_TAG:
+            merged = merge_vod_tag(base, old_map.get(vid, set()), inferred)
+        else:
+            merged = ",".join(inferred) or base
+        # 空结果不写：upsert 的 COALESCE 保护会把空串解释为「保留旧值」，
+        # 清理过期推断段交给 update_ids / 全量重建，不在同步主链路做。
+        if merged:
+            r["vod_tag"] = merged
+            patched += 1
+    return patched
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +723,22 @@ def status_all() -> list:
         map_counts = dict(conn.execute(
             select(star_map.c.slug, func.count()).group_by(star_map.c.slug)
         ).all())
+        # v1.16.2 / R1：把真正的「上次全量重建」水位一并暴露出来。运维按站
+        # 回填时要能一眼看出哪些站没跑过（last_full_at=None），而不是靠
+        # star_map 的最新 computed_at 猜 —— 后者每 6h 被增量同步刷新过。
+        try:
+            rebuild_rows = {
+                r[0]: r for r in conn.execute(
+                    select(star_rebuild_state.c.slug,
+                           star_rebuild_state.c.last_full_at,
+                           star_rebuild_state.c.rows_scanned,
+                           star_rebuild_state.c.rows_tagged,
+                           star_rebuild_state.c.rows_mapped,
+                           star_rebuild_state.c.elapsed_s)
+                ).all()
+            }
+        except Exception:  # noqa: BLE001  老库还没建新表时不让核对接口挂掉
+            rebuild_rows = {}
         existing = database.list_tables("vod_")
         out = []
         for (slug,) in rows:
@@ -537,11 +761,17 @@ def status_all() -> list:
                 no_actor = conn.execute(
                     select(func.count()).select_from(table).where(no_actor_cond)
                 ).scalar() or 0
+            rb = rebuild_rows.get(slug)
             out.append({
                 "slug": slug,
                 "videos": int(videos or 0),
                 "no_actor_videos": int(no_actor or 0),
                 "star_mapped": map_counts.get(slug, 0),
+                "last_full_rebuild": rb[1].isoformat() if rb and rb[1] else None,
+                "last_full_scanned": int(rb[2] or 0) if rb else 0,
+                "last_full_tagged": int(rb[3] or 0) if rb else 0,
+                "last_full_mapped": int(rb[4] or 0) if rb else 0,
+                "last_full_elapsed_s": int(rb[5] or 0) if rb else 0,
             })
     return out
 

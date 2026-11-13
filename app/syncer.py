@@ -237,7 +237,13 @@ def refresh_sources(client: MacCmsClient = None) -> list:
 
 
 def ensure_table(slug: str):
-    """创建 vod_{slug} 表（幂等）。"""
+    """创建 vod_{slug} 表（幂等）。
+
+    注意：这里**不要**顺手补 tag_index_state 行。曾经加过，结果 v1.14.0
+    契约用例「索引未就绪时不声明 tag_search」被这条 done 行误判为就绪。
+    新站缺状态行的情况由 tags.ensure_state_rows() 在启动时自愈，
+    tags.ready() 也兼容「有倒排数据但没状态行」的站，无需在同步主链路写状态。
+    """
     table = build_vod_table(slug)
     table.create(database.engine, checkfirst=True)
 
@@ -532,6 +538,18 @@ def upsert_batch(slug: str, rows: list) -> tuple:
             for vid, old_tag in found:
                 existing.add(vid)
                 existing_tags[vid] = old_tag or ""
+
+        # v1.16.2 写时推断：标题命中词库 → 合并进 vod_tag。必须放在构造
+        # INSERT 之前，这样主表 vod_tag 与 video_tags 倒排（下方 index_payload
+        # 直接读 r["vod_tag"]）在同一次写入里保持一致，不产生第三条写路径。
+        # 推断失败绝不能让整批同步回滚 —— 降级为「没标签，稍后靠重建补」。
+        if config.STAR_TAG_INFER_ON_SYNC:
+            try:
+                from . import star_tags
+
+                star_tags.infer_on_ingest(slug, rows, existing_tags, conn)
+            except Exception as e:  # noqa: BLE001
+                log.warning("[%s] 写时标签推断失败（不影响同步）: %s", slug, e)
 
         stmt = (
             database.dialect_insert(table)

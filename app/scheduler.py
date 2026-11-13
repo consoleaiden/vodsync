@@ -128,7 +128,7 @@ def _job_star_tags_nightly():
     from sqlalchemy import func, select
 
     from . import star_tags
-    from .models import sources, star_map
+    from .models import sources, star_rebuild_state
 
     if not config.RELATED_ENABLED:
         return
@@ -138,26 +138,28 @@ def _job_star_tags_nightly():
                 select(sources.c.slug, sources.c.total_videos)
                 .where(sources.c.enabled == 1, sources.c.total_videos > 0)
             ).all()
-            # 每站：映射到的**去重视频数** + 最近一次重建时间
-            stats = {
-                s: (int(n), last)
-                for s, n, last in conn.execute(
-                    select(
-                        star_map.c.slug,
-                        func.count(func.distinct(star_map.c.vod_id)),
-                        func.max(star_map.c.computed_at),
-                    ).group_by(star_map.c.slug)
+            # v1.16.2 / R1：只认「全量重建水位」。
+            # 旧实现取 max(star_map.computed_at) 当上次重建时间，但增量同步的
+            # update_ids() 也写 star_map 并刷新 computed_at —— 每 6h 有增量的
+            # 大站看起来永远「刚重建过」，全量重建永远轮不到它（线上乐播
+            # 33.8 万行只有 383 条映射，而真跑过全量重建的站是 10 万条量级）。
+            # star_rebuild_state 只有 rebuild_source() 跑完才写，增量绝不碰。
+            full_at = {
+                s: last for s, last in conn.execute(
+                    select(star_rebuild_state.c.slug,
+                           star_rebuild_state.c.last_full_at)
                 ).all()
             }
         now = datetime.now()
         min_interval = timedelta(hours=max(0, config.STAR_TAG_NIGHTLY_MIN_INTERVAL_HOURS))
         candidates = []
         for slug, tv in rows:
-            mapped, last = stats.get(slug, (0, None))
+            last = full_at.get(slug)
             if last is not None and now - last < min_interval:
                 continue
-            # (从未映射=0, 上次重建时间, 视频数) 升序 → 需要重建的排前面
-            candidates.append(((0 if mapped == 0 else 1, last or datetime.min, tv or 0), slug))
+            # (从未全量重建=0, 上次全量重建时间, 视频数) 升序
+            candidates.append(((0 if last is None else 1,
+                                last or datetime.min, tv or 0), slug))
         candidates.sort(key=lambda x: x[0])
         done = []
         for _key, slug in candidates[: config.STAR_TAG_NIGHTLY_BUDGET]:

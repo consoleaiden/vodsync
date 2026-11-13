@@ -329,6 +329,20 @@ def _bootstrap():
         # 可断点续跑（游标在 tag_index_state），建完的源站不会重扫；
         # 单独线程 + 串行写 + 批间休眠，绝不和同步任务抢 IO。
         # 建完之前 /healthz 不声明 tag_search，客户端继续用 wd 检索。
+        # v1.16.2 / R5：状态行自愈与「是否自动回填」是两件事，故意不耦合到
+        # TAG_INDEX_ON_STARTUP。面板手动新增的源站由 upsert_batch 写时维护建好了
+        # 倒排，但没人插 tag_index_state 行，ready() 会恒 false、把 tag_search
+        # 能力从 /healthz 摘掉（线上 65 个启用站 / 57 行 state，缺的正是这 8 站）。
+        # 这里只补元数据（count 级，不扫大表、不启动回填），即便运维为了省 IO
+        # 关掉开机自动回填，能力声明也必须能自愈。
+        if config.TAG_SEARCH_ENABLED:
+            try:
+                from . import tags
+
+                tags.ensure_state_rows()
+            except Exception:
+                log.exception("补齐标签索引状态行失败（检索能力暂不声明）")
+
         if config.TAG_SEARCH_ENABLED and config.TAG_INDEX_ON_STARTUP:
             try:
                 from . import tags

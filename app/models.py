@@ -186,6 +186,27 @@ star_map = Table(
 Index("idx_star_map_term", star_map.c.slug, star_map.c.term)
 
 # ---------------------------------------------------------------------------
+# 明星 Tag「全量重建」水位（v1.16.2 / R1）
+#
+# 夜间轮转原来用 max(star_map.computed_at) 当「上次重建时间」，但增量同步的
+# update_ids() 也写 star_map 并刷新 computed_at —— 有 6h 增量同步的大站看起来
+# 永远「刚重建过」，全量重建永远轮不到它（线上乐播 33.8 万行只有 383 条映射，
+# 而真正跑过全量重建的站是 10 万条量级、时间戳落在凌晨 02:00~04:00）。
+#
+# 独立记一张表，只有 rebuild_source() 全量跑完才更新，update_ids() 绝不碰。
+# ---------------------------------------------------------------------------
+star_rebuild_state = Table(
+    "star_rebuild_state",
+    META,
+    Column("slug", String(64), primary_key=True),
+    Column("last_full_at", DateTime),               # 上次全量重建完成时间
+    Column("rows_scanned", Integer, default=0),
+    Column("rows_tagged", Integer, default=0),
+    Column("rows_mapped", Integer, default=0),
+    Column("elapsed_s", Integer, default=0),
+)
+
+# ---------------------------------------------------------------------------
 # 标签倒排表（v1.14.0 / B-01）
 #
 # 详情页点标签胶囊 -> 「同一标签的影片」，必须**分词后精确匹配**：把 vod_tag

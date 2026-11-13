@@ -536,10 +536,10 @@ STAR_TAG_NIGHTLY_MIN_INTERVAL_HOURS = int(
 )
 # 单视频最多写入的明星数（防超长溢出 vod_tag VARCHAR(255)）
 STAR_TAG_MAX_PER_VIDEO = int(os.environ.get("STAR_TAG_MAX_PER_VIDEO", "5"))
-# 重建时清掉「旧推断残留」tag（v1.10.0 / B3）：
-# 旧实现只在命中词库时才回写 vod_tag，词库删改后旧值永久残留，而 upsert 的
-# COALESCE(NULLIF()) 保护又让它连源站重同步都洗不掉。开启后，缺演员的行
-# 每次重建都会按当前词库重算 tag（命中则写入，不命中则清空）。
+# 清掉「旧推断残留」tag（v1.10.0 / B3）。
+# v1.16.2 起只在 STAR_TAG_MERGE_TAG=false 的回滚分支生效：正常路径下
+# merge_vod_tag() 会按「本服务上次写进去的推断段」精确移除旧段，词库停用或
+# 标题改名后都不会残留，同时保住源站原生标签。保留此开关仅供回滚对照。
 STAR_TAG_CLEAR_STALE = os.environ.get("STAR_TAG_CLEAR_STALE", "true").lower() == "true"
 # 增量回填单次处理的 id 上限（v1.10.0 / C11：与推荐用的 RELATED_TOUCHED_CAP 解耦）
 STAR_TAG_TOUCHED_CAP = int(os.environ.get("STAR_TAG_TOUCHED_CAP", "50000"))
@@ -559,3 +559,25 @@ STAR_UNTRACKED_STOPWORDS = os.environ.get(
     "电影,电视剧,全集,完整版,高清,超清,国语,粤语,英语,中字,字幕,更新,在线,免费,"
     "第,季,集,部,期,版,篇,之,的,和,与,合集,解说,预告,花絮,正片,加长",
 )
+
+# ---------------------------------------------------------------------------
+# v1.16.2 标题词库回填（把「标题命中词库」真正落进 vod_tag）
+#
+# 背景：18+ 源站的 vod_tag / vod_actor 绝大多数为空，标签推荐只能靠标题推断。
+# 旧实现有两个致命缺口：① 只要 vod_actor 非空就完全不跑标题正则；
+# ② 只有「缺演员行」才回写 vod_tag，且用推断值整体覆盖（会冲掉源站原生标签）。
+# ---------------------------------------------------------------------------
+# 写时推断：同步入库的同一批里就用单正则抽词并合并进 vod_tag。
+# 只影响新写入/更新的行，不动存量；每页几十条，单正则 µs 级，对同步吞吐无影响。
+# 关掉后新片要等全量重建才有标签（不推荐）。
+STAR_TAG_INFER_ON_SYNC = os.environ.get("STAR_TAG_INFER_ON_SYNC", "true").lower() == "true"
+# 标题命中与演员命中取并集（旧实现是「有演员就只看演员」的二选一）
+STAR_TAG_UNION_HITS = os.environ.get("STAR_TAG_UNION_HITS", "true").lower() == "true"
+# 回写采用「合并」：保留源站原生标签段，只替换本服务上次写进去的推断段。
+# 关掉则回到旧的整体覆盖语义（仅供回滚对照，正常应恒为 true）。
+STAR_TAG_MERGE_TAG = os.environ.get("STAR_TAG_MERGE_TAG", "true").lower() == "true"
+# 全量重建批间休眠（毫秒）。群晖上重建与同步抢 IO，主动让路。
+STAR_TAG_REBUILD_SLEEP_MS = int(os.environ.get("STAR_TAG_REBUILD_SLEEP_MS", "20"))
+# 纯 ASCII 词的最短长度：词库里 er/ss/jk/fc2 这类 2 字母词会污染标签，
+# 中文词仍按 2 字起（related.reload_star_terms 的既有规则）。0 = 不额外过滤。
+STAR_TAG_MIN_ASCII_LEN = int(os.environ.get("STAR_TAG_MIN_ASCII_LEN", "3"))
