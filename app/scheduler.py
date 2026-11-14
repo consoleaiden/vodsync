@@ -7,6 +7,8 @@
 import logging
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from . import config, database, pause
 
@@ -250,3 +252,155 @@ def stop_scheduler():
     if _scheduler is not None:
         _scheduler.shutdown(wait=False)
         _scheduler = None
+
+
+# ---------------------------------------------------------------------------
+# 调度器管理接口（v1.16.5 / 管理面板「计划任务」模块）
+#
+# 直接复用进程内已运行的 APScheduler（_scheduler），不改任何业务定时逻辑。
+# 提供：列表（含下一次执行时间 / 暂停态）、暂停 / 恢复 / 立即执行 / 改周期。
+# 注意：运行时改周期只改内存里的 job，重启后由 config 重新装配（这是预期行为，
+# 避免把调度配置悄悄写进环境变量）。
+# ---------------------------------------------------------------------------
+
+# 任务 id -> 面板展示用的中文名（APScheduler 默认只给函数名，不够直观）
+JOB_LABELS = {
+    "refresh_sources": "源站列表刷新",
+    "sync_all": "全站增量同步",
+    "housekeeping": "数据维护",
+    "related_calibration": "相关推荐校准",
+    "field_backfill": "字段回填",
+    "star_tags_nightly": "明星 Tag 重建",
+}
+
+
+def _trigger_text(job) -> str:
+    """把 APScheduler 的 trigger 翻成人能读懂的中文周期描述。"""
+    t = job.trigger
+    try:
+        if isinstance(t, IntervalTrigger):
+            secs = int(t.interval.total_seconds())
+            if secs and secs % 3600 == 0:
+                return f"每 {secs // 3600} 小时"
+            if secs and secs % 60 == 0:
+                return f"每 {secs // 60} 分钟"
+            return f"每 {secs} 秒"
+        if isinstance(t, CronTrigger):
+            s = str(t)  # 形如 cron[hour='4', minute='30', second='0']
+            inner = s[s.find("[") + 1: s.rfind("]")]
+            kv = {}
+            for part in inner.split(","):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    kv[k.strip()] = v.strip().strip("'")
+            if "hour" in kv and "minute" in kv and "day_of_week" not in kv:
+                return f"每天 {kv['hour'].zfill(2)}:{kv['minute'].zfill(2)}"
+            return s
+        return str(t)
+    except Exception:
+        return str(t)
+
+
+def _job_or_raise(job_id: str):
+    if _scheduler is None:
+        raise KeyError("调度器未启动")
+    job = _scheduler.get_job(job_id)
+    if job is None:
+        raise KeyError(job_id)
+    return job
+
+
+def list_jobs() -> list:
+    """返回所有定时任务的摘要：id / 名称 / 周期 / 下次执行 / 是否暂停。"""
+    if _scheduler is None:
+        return []
+    out = []
+    for j in _scheduler.get_jobs():
+        next_run = j.next_run_time.isoformat() if j.next_run_time else None
+        out.append({
+            "id": j.id,
+            "name": JOB_LABELS.get(j.id, j.name or j.id),
+            "trigger": _trigger_text(j),
+            "trigger_type": type(j.trigger).__name__,
+            "next_run_time": next_run,
+            "paused": next_run is None,
+            "pending": next_run is not None,
+        })
+    return out
+
+
+def pause_job(job_id: str) -> bool:
+    _job_or_raise(job_id).pause()
+    return True
+
+
+def resume_job(job_id: str) -> bool:
+    _job_or_raise(job_id).resume()
+    return True
+
+
+def trigger_job(job_id: str) -> bool:
+    """
+    立即跑一次。APScheduler 3.x 没有 scheduler.trigger_job（那是 4.x 的 API），
+    这里直接取 job 的 func 丢到后台线程里跑 —— 与正常定时触发走的是同一函数，
+    只是绕过了触发器。job 函数内部自带 try/except 与暂停判断，手动触发同样遵守
+    「全局/增量暂停时跳过」的语义（用户点「立即执行」若恰在暂停期则不实际跑）。
+    """
+    job = _job_or_raise(job_id)
+    import threading
+
+    threading.Thread(
+        target=job.func,
+        args=tuple(getattr(job, "args", ()) or ()),
+        kwargs=dict(getattr(job, "kwargs", {}) or {}),
+        daemon=True,
+        name=f"manual-{job_id}",
+    ).start()
+    return True
+
+
+def reschedule_job(job_id: str, interval_minutes: int = None,
+                   hour: int = None, minute: int = None) -> bool:
+    """
+    改周期：
+      - interval 型：传 interval_minutes（同时写回 config 内存值，重启前的口径一致）
+      - cron 型：传 hour / minute
+    改完内存里的 job，下次启动由 config 重新装配。
+    """
+    job = _job_or_raise(job_id)
+    if isinstance(job.trigger, IntervalTrigger):
+        if not interval_minutes or interval_minutes < 1:
+            raise ValueError("interval_minutes 必须 >= 1")
+        job.reschedule("interval", minutes=int(interval_minutes))
+        # 同步内存里的 config（只影响本次进程，重启后回到环境变量值）
+        _sync_interval_config(job_id, int(interval_minutes))
+    elif isinstance(job.trigger, CronTrigger):
+        if hour is None or minute is None:
+            raise ValueError("cron 任务需要 hour / minute")
+        h = max(0, min(23, int(hour)))
+        m = max(0, min(59, int(minute)))
+        job.reschedule("cron", hour=h, minute=m)
+        _sync_cron_config(job_id, h, m)
+    else:
+        raise ValueError("不支持的触发器类型，无法改周期")
+    return True
+
+
+def _sync_interval_config(job_id: str, minutes: int):
+    if job_id == "refresh_sources":
+        config.SOURCE_REFRESH_INTERVAL_MINUTES = minutes
+    elif job_id == "sync_all":
+        config.SYNC_INTERVAL_MINUTES = minutes
+    elif job_id == "housekeeping":
+        config.HOUSEKEEPING_INTERVAL_MINUTES = minutes
+
+
+def _sync_cron_config(job_id: str, hour: int, minute: int):
+    if job_id == "related_calibration":
+        config.RELATED_CALIBRATION_HOUR = hour
+        config.RELATED_CALIBRATION_MINUTE = minute
+    elif job_id == "field_backfill":
+        config.FIELD_BACKFILL_START_HOUR = hour
+    elif job_id == "star_tags_nightly":
+        config.STAR_TAG_NIGHTLY_HOUR = hour
+        config.STAR_TAG_NIGHTLY_MINUTE = minute

@@ -261,6 +261,13 @@ def on_startup():
     except Exception:
         log.exception("标记中断任务失败（不影响启动）")
 
+    # v1.16.5：启动自愈，把历史上以 URL 形状入库的非法 slug 改写成安全标识。
+    # 否则这些源站的编辑/暂停/删除/屏蔽等路径型 API 会 404。幂等，改完即跳过。
+    try:
+        syncer.migrate_unsafe_slugs()
+    except Exception:
+        log.exception("非法 slug 迁移失败（不影响启动，下次启动重试）")
+
     # 后台执行首次初始化：拉源站列表 -> （可选）全量同步 -> 启动调度器
     threading.Thread(target=_bootstrap, daemon=True).start()
 

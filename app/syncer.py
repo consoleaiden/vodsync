@@ -8,6 +8,7 @@
 3. 写入：批量 INSERT ... ON CONFLICT(vod_id) DO UPDATE（PostgreSQL 原生语法）
 """
 import logging
+import re
 import secrets
 import threading
 import time
@@ -18,7 +19,19 @@ from sqlalchemy import bindparam, func, select, text
 
 from . import config, database, pause
 from .maccms import MacCmsClient, MacCmsError
-from .models import build_vod_table, forget_vod_table, slugify, sources, sync_logs
+from .models import (
+    build_vod_table,
+    forget_vod_table,
+    slugify,
+    sources,
+    star_map,
+    star_rebuild_state,
+    sync_logs,
+    tag_index_state,
+    video_tags,
+    vod_related,
+)
+from .utils import SAFE_SLUG
 
 log = logging.getLogger("vodsync.syncer")
 
@@ -163,6 +176,33 @@ def _unique_slug(conn, base: str) -> str:
     return f"{base[:50]}_{secrets.token_hex(3)}"
 
 
+def _clean_slug_chars(raw: str, name: str) -> str:
+    """
+    只做字符层面的收敛：把任意用户输入变成 `utils.SAFE_SLUG` 允许的字符串
+    （表名 / API 路径两用），**不查重**。
+
+    非法字符一律换成 `_`、合并连续下划线、去首尾 `_`、截断到 64 位；若清洗后为空
+    则回退到由名称推导出的安全 slug（slugify）。查重交给调用方（登记时用 409 反馈、
+    迁移时用 `_unique_slug` 自动去重，语义不同）。
+    """
+    base = (raw or "").strip().lower()
+    base = re.sub(r"[^a-z0-9_]", "_", base)      # 非法字符 -> 下划线
+    base = re.sub(r"_+", "_", base).strip("_")    # 合并 + 去首尾
+    if not base:
+        base = slugify(name) or "custom"
+    base = base[:64]
+    if not base:
+        base = "custom"
+    return base
+
+
+def _sanitize_slug(raw: str, conn, name: str) -> str:
+    """
+    收敛字符 + 查重，返回可直接入库的安全 slug（迁移自愈用：撞了就追加 `_2`）。
+    """
+    return _unique_slug(conn, _clean_slug_chars(raw, name))
+
+
 def refresh_sources(client: MacCmsClient = None) -> list:
     """
     拉取 latest.json，把新的源站登记进 sources 表并创建数据表。
@@ -248,6 +288,62 @@ def ensure_table(slug: str):
     table.create(database.engine, checkfirst=True)
 
 
+def migrate_unsafe_slugs():
+    """
+    v1.16.5 启动自愈：把历史上以 URL 形状（含 /、: 等）入库的非法 slug 改写成安全标识。
+
+    这些 slug 会让所有路径型 API（编辑/暂停/删除/屏蔽）因 `%2F` 被 ASGI 解码成
+    `/` 而 404 Not Found。本函数幂等、只动不匹配 `utils.SAFE_SLUG` 的源站：
+      - 把 `sources.slug` 改成由名称推导出的安全 slug；
+      - 若存在 `vod_{旧slug}` 数据表则 RENAME 成 `vod_{新slug}`（PG 改名即时生效）；
+      - 同步更新 6 张引用表（sync_logs / vod_related / star_map /
+        star_rebuild_state / video_tags / tag_index_state）的行；
+      - 改名后再次启动自然跳过（全部已合法）。
+    放进 write_txn 单事务：任一步失败整体回滚，不会留下半截状态。
+    """
+    if not SAFE_SLUG:
+        return
+    with database.engine.connect() as conn:
+        rows = conn.execute(
+            select(sources.c.slug, sources.c.name)
+        ).mappings().all()
+    bad = [r for r in rows if not SAFE_SLUG.match(r["slug"])]
+    if not bad:
+        return
+    log.warning("发现 %d 个非法 slug，开始自动迁移: %s",
+                len(bad), ", ".join(r["slug"] for r in bad))
+    for r in bad:
+        old = r["slug"]
+        try:
+            with database.write_txn() as conn:
+                new = _sanitize_slug("", conn, r["name"])
+                # 数据表改名（存在才改；建表失败导致表不存在时只搬引用行）
+                old_table = f"vod_{old}"
+                new_table = f"vod_{new}"
+                if database.table_exists(old_table):
+                    conn.execute(text(f'ALTER TABLE "{old_table}" RENAME TO "{new_table}"'))
+                # 引用表同步
+                conn.execute(sources.update().where(sources.c.slug == old).values(slug=new))
+                conn.execute(sync_logs.update().where(sync_logs.c.slug == old).values(slug=new))
+                conn.execute(vod_related.update().where(vod_related.c.slug == old).values(slug=new))
+                conn.execute(star_map.update().where(star_map.c.slug == old).values(slug=new))
+                conn.execute(
+                    star_rebuild_state.update()
+                    .where(star_rebuild_state.c.slug == old).values(slug=new)
+                )
+                conn.execute(video_tags.update().where(video_tags.c.source == old).values(source=new))
+                conn.execute(
+                    tag_index_state.update()
+                    .where(tag_index_state.c.slug == old).values(slug=new)
+                )
+            # 丢弃旧/新 slug 的 Table 缓存，避免 META 同名冲突（正常启动期缓存为空，防御性调用）
+            forget_vod_table(old)
+            forget_vod_table(new)
+            log.info("迁移非法 slug 成功: %s -> %s", old, new)
+        except Exception:
+            log.exception("迁移非法 slug 失败（跳过，下次启动重试）: %s", old)
+
+
 # ---------------------------------------------------------------------------
 # 自定义源站（v1.8.0）
 #
@@ -317,7 +413,9 @@ def register_custom_source(name: str, api_url: str, slug: str = "",
         if exist:
             raise ValueError(f"该 API 地址已登记为源站 {exist['slug']}")
         if slug:
-            slug = slug.strip().lower()
+            # v1.16.5：先收敛字符（杜绝 URL 形状 / 含特殊字符的 slug 破坏所有
+            # 路径型 API），再查重；撞了就明确提示用户换一个（不再静默改后缀）。
+            slug = _clean_slug_chars(slug, name)
             if conn.execute(select(sources.c.id).where(sources.c.slug == slug)).first():
                 raise ValueError(f"标识 {slug} 已被占用，请换一个")
         else:

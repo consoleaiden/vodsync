@@ -428,6 +428,26 @@
     </div>
   </section>
 
+  <!-- 计划任务（v1.16.5）：展示 APScheduler 后台定时任务，可暂停/恢复/立即执行/改周期 -->
+  <section class="panel" id="schedPanel">
+    <div class="head">
+      <h2>计划任务</h2>
+      <span class="hint">后台定时任务（源站刷新 / 增量同步 / 数据维护 / 相关校准 / 字段回填 / 明星Tag重建），可暂停、恢复、立即执行或改周期</span>
+      <span style="flex:1"></span>
+      <button class="sm" id="schedReload" title="刷新任务列表与状态">↻ 刷新</button>
+      <button class="sm" id="schedToggle" title="折叠 / 展开本区块（首次展开才加载数据）">展开 ▾</button>
+    </div>
+    <div id="schedWrap" style="display:none">
+      <div class="body pad">
+        <div class="muted" style="font-size:12px;line-height:1.75">
+          这里的周期来自服务配置（环境变量）；改周期只影响本次运行，重启后会回到配置值。
+          任务被暂停后不再触发，但「立即执行」仍可手动跑一次。数据维护 / 字段回填默认可能未启用。
+        </div>
+      </div>
+      <div class="body" id="schedBody"><div class="empty">展开时加载任务列表…</div></div>
+    </div>
+  </section>
+
   <!-- 源站列表 -->
   <section class="panel">
     <div class="head">
@@ -2097,7 +2117,10 @@ async function loadTagStatus(showTable) {
     if (!showTable) return r;
     const rows = (r.sources || []).map((s) => `
       <tr>
-        <td>${esc(s.slug)}</td>
+        <td>
+          <div class="name">${esc(s.name || s.slug)}</div>
+          <div class="slugcode">${esc(s.slug)}</div>
+        </td>
         <td>${esc(s.status)}</td>
         <td style="min-width:120px">${tagProgressBar(s.progress)}<span class="muted" style="font-size:11px">${tagPct(s.progress)}%</span></td>
         <td title="断点游标 vod_id=${fmtNum(s.cursor)}（下次从这里继续；上游 ID 稀疏，不等于条数）">${fmtNum(s.processed)} / ${fmtNum(s.total)}</td>
@@ -2139,6 +2162,109 @@ $("#btnLogout").addEventListener("click", async () => {
   try { await _jsonPost("/api/v1/auth/logout", {}); } catch (e) {}
   location.href = authState.enabled ? "/login" : "/";
 });
+
+// ---------------- 计划任务（v1.16.5） ----------------
+// 只读展示 APScheduler 后台定时任务，并提供 暂停 / 恢复 / 立即执行 / 改周期。
+// 改周期只改内存里的 job，重启后回到环境变量配置（接口层也是这个语义）。
+async function loadScheduler() {
+  const box = $("#schedBody");
+  if (!box) return;
+  try {
+    const r = await api("/api/v1/admin/scheduler");
+    if (!r.available) {
+      box.innerHTML = `<div class="empty">调度器不可用：${esc(r.error || "未知")}</div>`;
+      return;
+    }
+    const jobs = r.jobs || [];
+    if (!jobs.length) {
+      box.innerHTML = `<div class="empty">当前没有运行中的定时任务</div>`;
+      return;
+    }
+    const rows = jobs.map((j) => {
+      const next = j.next_run_time ? fmtTime(j.next_run_time) : "—";
+      const state = j.paused
+        ? '<span class="badge mute">已暂停</span>'
+        : '<span class="badge ok">运行中</span>';
+      const pauseBtn = j.paused
+        ? `<button class="sm primary" data-sched-act="resume" data-job="${esc(j.id)}">恢复</button>`
+        : `<button class="sm warn" data-sched-act="pause" data-job="${esc(j.id)}">暂停</button>`;
+      return `<tr>
+        <td><div class="name">${esc(j.name)}</div><div class="slugcode">${esc(j.id)}</div></td>
+        <td>${esc(j.trigger)}</td>
+        <td>${next}</td>
+        <td>${state}</td>
+        <td style="white-space:nowrap">
+          ${pauseBtn}
+          <button class="sm" data-sched-act="trigger" data-job="${esc(j.id)}">立即执行</button>
+          <button class="sm" data-sched-act="edit" data-job="${esc(j.id)}"
+            data-trigger="${esc(j.trigger_type)}" data-cur="${esc(j.trigger)}">改周期</button>
+        </td>
+      </tr>`;
+    }).join("");
+    box.innerHTML = `<table>
+      <thead><tr><th>任务</th><th>周期</th><th>下次执行</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  } catch (e) {
+    box.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+// 任务操作：暂停 / 恢复 / 立即执行（直接调用），改周期（弹窗输入后调用）
+$("#schedBody").addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-sched-act]");
+  if (!btn) return;
+  const act = btn.getAttribute("data-sched-act");
+  const job = btn.getAttribute("data-job");
+  if (act === "pause" || act === "resume" || act === "trigger") {
+    try {
+      const r = await _jsonPost(`/api/v1/admin/scheduler/${encodeURIComponent(job)}/${act}`, {});
+      toast(r.msg || "操作成功");
+      await loadScheduler();
+    } catch (err) { toast(err.message, true); }
+    return;
+  }
+  if (act === "edit") {
+    const triggerType = btn.getAttribute("data-trigger");
+    const cur = btn.getAttribute("data-cur") || "";
+    let fields, parse;
+    if (triggerType === "IntervalTrigger") {
+      fields = `<label style="display:block;font-size:12px;color:var(--muted)">执行间隔（分钟），当前：${esc(cur)}
+        <input id="schedVal" style="${INPUT_CSS};margin-top:4px" type="number" min="1" value=""></label>`;
+      parse = () => ({ interval_minutes: parseInt($("#schedVal").value, 10) });
+    } else {
+      fields = `<div style="display:flex;gap:10px">
+        <label style="font-size:12px;color:var(--muted)">小时 (0-23)<input id="schedH" type="number" min="0" max="23"
+          style="${INPUT_CSS};margin-top:4px;width:90px"></label>
+        <label style="font-size:12px;color:var(--muted)">分钟 (0-59)<input id="schedM" type="number" min="0" max="59"
+          style="${INPUT_CSS};margin-top:4px;width:90px"></label>
+      </div>`;
+      parse = () => ({ hour: parseInt($("#schedH").value, 10), minute: parseInt($("#schedM").value, 10) });
+    }
+    const mask = openModal("修改周期 · " + job, `
+      <div class="kv">${triggerType === "IntervalTrigger" ? "按间隔执行（分钟）" : "每天固定时间执行（时:分）"}</div>
+      ${fields}
+      <div id="schedMsg" style="font-size:12px;min-height:16px;line-height:1.6"></div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px">
+        <button class="primary" id="schedSave">保存</button>
+      </div>`);
+    const q = (id) => mask.querySelector("#" + id);
+    q("schedSave").onclick = async () => {
+      try {
+        const body = parse();
+        const r = await _jsonPost(`/api/v1/admin/scheduler/${encodeURIComponent(job)}/reschedule`, body);
+        toast(r.msg || "已修改周期");
+        mask.remove();
+        await loadScheduler();
+      } catch (err) {
+        const m = q("schedMsg");
+        m.textContent = "保存失败：" + err.message;
+        m.style.color = "#c62828";
+      }
+    };
+  }
+});
+$("#schedReload").addEventListener("click", loadScheduler);
 
 // ---------------- 去广告规则包（v1.16.0） ----------------
 // 只做控制面：读当前规则 / 编辑后发布 / 回滚 / 看上报量。过滤本身在客户端执行。
@@ -2349,6 +2475,8 @@ const SEC_DEFS = {
   stars:   { btn: "#starsToggle",   wrap: "#starsWrap",   load: () => loadStarTerms() },
   sources: { btn: "#sourcesToggle", wrap: "#sourcesWrap", load: () => loadSources() },
   logs:    { btn: "#logsToggle",    wrap: "#logsWrap",    load: () => loadLogs() },
+  // v1.16.5：计划任务不进轮询（状态变化很少），只在展开时加载一次 + 手动刷新
+  scheduler: { btn: "#schedToggle", wrap: "#schedWrap", load: () => loadScheduler() },
   // v1.16.0：规则包不进轮询（编辑到一半被刷新顶掉最烦），只在展开时加载一次
   adfilter: { btn: "#adfilterToggle", wrap: "#adfilterWrap", load: () => adLoad() },
 };

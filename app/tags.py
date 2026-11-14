@@ -585,6 +585,13 @@ def status() -> dict:
             select(tag_index_state).order_by(tag_index_state.c.slug)
         ).mappings().all()
         total_tags = conn.execute(select(func.count()).select_from(video_tags)).scalar() or 0
+        # 源站名称映射：面板「标签索引」列表展示源站名称而非难读的标识（v1.16.5）
+        name_map = {
+            r["slug"]: r["name"]
+            for r in conn.execute(
+                select(sources.c.slug, sources.c.name)
+            ).mappings().all()
+        }
     return {
         "ready": ready(),
         "enabled": config.TAG_SEARCH_ENABLED,
@@ -594,6 +601,7 @@ def status() -> dict:
         "sources": [
             {
                 "slug": r["slug"],
+                "name": name_map.get(r["slug"], r["slug"]),
                 "status": r["status"],
                 "cursor": r["cursor"],
                 # 已处理条数（与 total 同量纲）；存量库迁移后由续跑逻辑补算

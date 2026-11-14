@@ -1939,6 +1939,80 @@ def admin_set_source_blocks(payload: dict):
     }
 
 
+# ---------------------------------------------------------------------------
+# 计划任务管理（v1.16.5 / 管理面板「计划任务」模块）
+#
+# 直接复用进程内 APScheduler（app.scheduler._scheduler），不改任何业务定时逻辑。
+# 仅暴露「查看 / 暂停 / 恢复 / 立即执行 / 改周期」四类操作。
+# ---------------------------------------------------------------------------
+@router.get("/api/v1/admin/scheduler", summary="计划任务列表（管理端）")
+def admin_scheduler_list():
+    """返回全部定时任务的摘要：id / 名称 / 周期 / 下次执行 / 是否暂停。"""
+    from .. import scheduler
+
+    try:
+        jobs = scheduler.list_jobs()
+    except Exception as e:  # noqa: BLE001
+        return {"code": SUCCESS_CODE, "jobs": [], "available": False, "error": str(e)[:200]}
+    return {"code": SUCCESS_CODE, "jobs": jobs, "available": True}
+
+
+@router.post("/api/v1/admin/scheduler/{job_id}/pause", summary="暂停计划任务（管理端）")
+def admin_scheduler_pause(job_id: str):
+    from .. import scheduler
+
+    try:
+        scheduler.pause_job(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="任务不存在或调度器未启动")
+    return {"code": SUCCESS_CODE, "ok": True}
+
+
+@router.post("/api/v1/admin/scheduler/{job_id}/resume", summary="恢复计划任务（管理端）")
+def admin_scheduler_resume(job_id: str):
+    from .. import scheduler
+
+    try:
+        scheduler.resume_job(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="任务不存在或调度器未启动")
+    return {"code": SUCCESS_CODE, "ok": True}
+
+
+@router.post("/api/v1/admin/scheduler/{job_id}/trigger", summary="立即执行一次（管理端）")
+def admin_scheduler_trigger(job_id: str):
+    from .. import scheduler
+
+    try:
+        scheduler.trigger_job(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="任务不存在或调度器未启动")
+    return {"code": SUCCESS_CODE, "ok": True}
+
+
+@router.post("/api/v1/admin/scheduler/{job_id}/reschedule", summary="修改周期（管理端）")
+def admin_scheduler_reschedule(job_id: str, body: dict):
+    """
+    改周期（运行时生效，重启后回到环境变量配置）：
+      - interval 型（源站刷新 / 增量同步 / 数据维护）：interval_minutes
+      - cron 型（相关校准 / 字段回填 / 明星Tag重建）：hour + minute
+    """
+    from .. import scheduler
+
+    try:
+        scheduler.reschedule_job(
+            job_id,
+            interval_minutes=body.get("interval_minutes"),
+            hour=body.get("hour"),
+            minute=body.get("minute"),
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="任务不存在或调度器未启动")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"code": SUCCESS_CODE, "ok": True}
+
+
 @router.get("/api/v1/admin/tables/{name}/rows")
 def admin_browse_table(
     name: str,
