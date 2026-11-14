@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.16.5"
+    "version": "1.16.6"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -3155,14 +3155,38 @@
     "/api/v1/tag/status": {
       "get": {
         "summary": "Tag Index Status",
-        "description": "标签倒排索引状态：是否就绪（决定 /healthz 是否声明 tag_search）、\n各源站回填进度（cursor / total / indexed）、总行数。\n\n排查「标签检索没结果」时先看这里：`ready=false` 说明还没建完，\n客户端此时本来就该继续用 wd 全文检索。",
+        "description": "标签倒排索引状态：是否就绪（决定 /healthz 是否声明 tag_search）、\n各源站回填进度（cursor / total / indexed）、各源站实时倒排行数、总行数。\n\n排查「标签检索没结果」时先看这里：`ready=false` 说明还没建完，\n客户端此时本来就该继续用 wd 全文检索。\n\n`rows`（逐站）与顶层 `rows`（总数）是**实时** `video_tags` 行数；\n`indexed` 只是「上次重建索引累计写入」，明星 Tag 夜间重建不更新它，\n别拿它当当前表大小（v1.16.6 修正口径）。行数走 120s 快照缓存，\n`refresh=1` 取实时值，`cache_age_s` 告诉你是多久前的快照。",
         "operationId": "tag_index_status_api_v1_tag_status_get",
+        "parameters": [
+          {
+            "name": "refresh",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "跳过 120s 行数快照缓存，重新 GROUP BY 实时统计",
+              "default": false,
+              "title": "Refresh"
+            },
+            "description": "跳过 120s 行数快照缓存，重新 GROUP BY 实时统计"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
               }
             }
           }

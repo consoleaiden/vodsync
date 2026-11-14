@@ -578,13 +578,47 @@ def _progress(status: str, processed, total) -> float:
     return round(max(0.0, min(100.0, p)), 1)
 
 
-def status() -> dict:
-    """索引状态（面板/维护接口展示：进度、游标、就绪与否）。"""
+def _row_counts() -> dict:
+    """
+    倒排表实时行数：一次 GROUP BY 同时给出总数与逐站分布。
+
+    走 `video_tags` 主键 `(source, vod_id, tag_norm)` 的 index-only scan ——
+    按第一列分组，PG 沿索引顺序聚合即可，不需要回表。比「先 COUNT(*) 再逐站
+    COUNT(*)」少扫一遍 170 万行。
+    """
+    with database.engine.connect() as conn:
+        rows = conn.execute(
+            select(video_tags.c.source, func.count().label("n"))
+            .group_by(video_tags.c.source)
+        ).mappings().all()
+    per = {r["source"]: int(r["n"]) for r in rows}
+    return {"total": sum(per.values()), "per_source": per}
+
+
+def row_counts(refresh: bool = False) -> tuple:
+    """
+    带 120s 快照缓存的行数统计，返回 `(counts, cache_age_s)`。
+
+    面板每 5 秒轮询一次 stats（其中含本统计），不缓存的话 170 万行的 GROUP BY
+    会按轮询频率反复扫。TTL 与 `star.tags.status` / `related.status` 保持同一口径；
+    `refresh=True` 供「强制刷新」使用。
+    """
+    from . import panel  # 延迟导入：避免核心模块与面板支撑在加载期互相牵连
+
+    return panel.cached("tag.rows", 120.0, _row_counts, refresh=refresh)
+
+
+def status(refresh: bool = False) -> dict:
+    """
+    索引状态（面板/维护接口展示：进度、游标、就绪与否）。
+
+    `refresh=True` 跳过行数快照缓存（默认 120s），用于手工核对实时值。
+    """
+    counts, cache_age = row_counts(refresh=refresh)
     with database.engine.connect() as conn:
         rows = conn.execute(
             select(tag_index_state).order_by(tag_index_state.c.slug)
         ).mappings().all()
-        total_tags = conn.execute(select(func.count()).select_from(video_tags)).scalar() or 0
         # 源站名称映射：面板「标签索引」列表展示源站名称而非难读的标识（v1.16.5）
         name_map = {
             r["slug"]: r["name"]
@@ -592,12 +626,14 @@ def status() -> dict:
                 select(sources.c.slug, sources.c.name)
             ).mappings().all()
         }
+    per = counts["per_source"]
     return {
         "ready": ready(),
         "enabled": config.TAG_SEARCH_ENABLED,
         "on_sync": config.TAG_INDEX_ON_SYNC,
         "building": building(),
-        "rows": int(total_tags),
+        "rows": counts["total"],
+        "cache_age_s": cache_age,
         "sources": [
             {
                 "slug": r["slug"],
@@ -607,6 +643,11 @@ def status() -> dict:
                 # 已处理条数（与 total 同量纲）；存量库迁移后由续跑逻辑补算
                 "processed": r["processed"],
                 "total": r["total"],
+                # 实时倒排行数（真值，面板展示用）
+                "rows": per.get(r["slug"], 0),
+                # 回填累计计数：只有「重建索引」会写它，明星 Tag 夜间重建
+                # 直接写 video_tags 不回写这里 —— 所以它只是回填进度参考，
+                # 绝不能拿来当当前表大小（v1.16.6 修的就是这个口径错）
                 "indexed": r["indexed"],
                 "progress": _progress(r["status"], r["processed"], r["total"]),
                 "error": r["error"] or "",

@@ -410,7 +410,7 @@
       <span style="flex:1"></span>
       <span class="badge" id="tagReady">-</span>
       <span class="muted" id="tagRows" style="font-size:12px"></span>
-      <button class="sm" id="btnTagStatus" title="查看各源站回填进度（已处理条数 / 总条数 / 已写行数）">索引状态</button>
+      <button class="sm" id="btnTagStatus" title="查看各源站回填进度（已处理条数 / 总条数 / 实时倒排行数）">索引状态</button>
       <button class="sm warn" id="btnTagRebuild" title="对全部启用源站回填标签倒排（后台串行，可断点续跑）">重建索引</button>
     </div>
     <div class="body pad">
@@ -422,6 +422,7 @@
     <div class="body pad" id="tagStatusBox" style="display:none">
       <div class="row" style="margin-bottom:8px">
         <span class="muted" id="tagStatusHint" style="font-size:12px;flex:1"></span>
+        <button class="sm" id="btnTagStatusRefresh" title="跳过 120s 快照缓存，重新实时统计各源站倒排行数">↻ 实时行数</button>
         <button class="sm" id="btnTagStatusClose">收起</button>
       </div>
       <div style="border:1px solid var(--line);border-radius:8px;overflow:auto" id="tagStatusBody"></div>
@@ -2107,14 +2108,16 @@ function tagProgressBar(p) {
     <div style="height:100%;width:${n}%;background:var(--accent,#2f6fed)"></div></div>`;
 }
 
-async function loadTagStatus(showTable) {
+async function loadTagStatus(showTable, refresh) {
   try {
-    const r = await api("/api/v1/tag/status");
+    const r = await api("/api/v1/tag/status" + (refresh ? "?refresh=1" : ""));
     const ready = !!r.ready;
     $("#tagReady").textContent = ready ? "已就绪" : (r.building && r.building.length ? "回填中" : "未就绪");
     $("#tagReady").className = "badge " + (ready ? "ok" : "mute");
     $("#tagRows").textContent = `已建 ${fmtNum(r.rows)} 行`;
     if (!showTable) return r;
+    // 行数走 120s 快照缓存（与覆盖统计/推荐覆盖率同口径），age 让"多久前的数"可见
+    const ageTxt = Number(r.cache_age_s) > 0 ? ` · 行数快照 ${r.cache_age_s}s 前` : "";
     const rows = (r.sources || []).map((s) => `
       <tr>
         <td>
@@ -2124,14 +2127,14 @@ async function loadTagStatus(showTable) {
         <td>${esc(s.status)}</td>
         <td style="min-width:120px">${tagProgressBar(s.progress)}<span class="muted" style="font-size:11px">${tagPct(s.progress)}%</span></td>
         <td title="断点游标 vod_id=${fmtNum(s.cursor)}（下次从这里继续；上游 ID 稀疏，不等于条数）">${fmtNum(s.processed)} / ${fmtNum(s.total)}</td>
-        <td>${fmtNum(s.indexed)}</td>
+        <td title="实时倒排行数（video_tags，走 120s 快照）。回填计数 ${fmtNum(s.indexed)} 只有「重建索引」会更新，不代表当前表大小">${fmtNum(s.rows)}</td>
         <td class="muted" style="font-size:11px">${esc(s.error || "")}</td>
       </tr>`).join("");
-    $("#tagStatusHint").textContent = ready
+    $("#tagStatusHint").textContent = (ready
       ? `索引已就绪：/healthz 已声明 tag_search（共 ${fmtNum(r.rows)} 行）`
-      : `索引未就绪：客户端继续用名称模糊检索（已建 ${fmtNum(r.rows)} 行，可点「重建索引」）`;
+      : `索引未就绪：客户端继续用名称模糊检索（已建 ${fmtNum(r.rows)} 行，可点「重建索引」）`) + ageTxt;
     $("#tagStatusBody").innerHTML = `<table>
-      <thead><tr><th>源站</th><th>状态</th><th>进度</th><th>已处理 / 总条数</th><th>已写行</th><th>备注</th></tr></thead>
+      <thead><tr><th>源站</th><th>状态</th><th>进度</th><th>已处理 / 总条数</th><th title="video_tags 实时行数（120s 快照）">倒排行数</th><th>备注</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="6" class="empty">暂无回填记录（点「重建索引」开始）</td></tr>`}</tbody>
     </table>`;
     $("#tagStatusBox").style.display = "";
@@ -2145,6 +2148,7 @@ async function loadTagStatus(showTable) {
 }
 
 $("#btnTagStatus").addEventListener("click", () => loadTagStatus(true));
+$("#btnTagStatusRefresh").addEventListener("click", () => loadTagStatus(true, true));
 $("#btnTagStatusClose").addEventListener("click", () => { $("#tagStatusBox").style.display = "none"; });
 $("#btnTagRebuild").addEventListener("click", async () => {
   if (!confirm("对全部启用源站回填标签倒排索引？数据量大时后台要跑一段时间（可断点续跑，也可重复点）。")) return;

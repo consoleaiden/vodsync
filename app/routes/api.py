@@ -3048,17 +3048,24 @@ def related_status(
 # 能中途重启接着跑 —— 而明星 Tag 重建是分批小任务，跑完即完。
 # ---------------------------------------------------------------------------
 @router.get("/api/v1/tag/status")
-def tag_index_status():
+def tag_index_status(
+    refresh: bool = Query(False, description="跳过 120s 行数快照缓存，重新 GROUP BY 实时统计"),
+):
     """
     标签倒排索引状态：是否就绪（决定 /healthz 是否声明 tag_search）、
-    各源站回填进度（cursor / total / indexed）、总行数。
+    各源站回填进度（cursor / total / indexed）、各源站实时倒排行数、总行数。
 
     排查「标签检索没结果」时先看这里：`ready=false` 说明还没建完，
     客户端此时本来就该继续用 wd 全文检索。
+
+    `rows`（逐站）与顶层 `rows`（总数）是**实时** `video_tags` 行数；
+    `indexed` 只是「上次重建索引累计写入」，明星 Tag 夜间重建不更新它，
+    别拿它当当前表大小（v1.16.6 修正口径）。行数走 120s 快照缓存，
+    `refresh=1` 取实时值，`cache_age_s` 告诉你是多久前的快照。
     """
     from .. import tags
 
-    return {"code": SUCCESS_CODE, **tags.status()}
+    return {"code": SUCCESS_CODE, **tags.status(refresh=refresh)}
 
 
 @router.post("/api/v1/maintenance/tag-index")
