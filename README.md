@@ -587,6 +587,21 @@ vodsync/
 
 > 按版本号**从新到旧**排列，最新版本在最前。历史版本只做归档记录，细节以对应版本的代码与文档为准。
 
+### v1.17.1
+**指纹库阻断性修复 + 上报响应补全**（前端已升级，据线上联调反馈修复）：
+
+- **修复指纹永不匹配的阻断性 bug**：`adfilter_fp.rebuild()` 此前写 `pattern_json` 时只有
+  `host/hit_count/users/urls`，缺 `dur_bucket/size_bucket/dur_bucket_ms/size_bucket_b`；
+  而 `downloadable()` 从 `pattern_json` 读这些字段下发，缺失全部回落 0 →
+  客户端按 10s 分片算出 `dur_bucket=10` 永远匹配不上。现改为聚合时取 `min(dur_ms)/min(size_b)`
+  样本、经 `signature()` 还原桶字段写入 `pattern_json`，**插入与更新（含 disabled 分支）都回写**，
+  存量坏数据重跑一次 rebuild 即自动修复，前端无需改动
+- **上报响应补全**：`POST /api/v1/adfilter/report` 手工重建响应时漏透传 `segments_accepted`
+  （`ingest()` 已返回），现补上；前端仅用于日志展示，不影响功能
+- **运维动作**：升级后需在面板手动触发一次「指纹重算」（或等待定时任务，默认 360 分钟），
+  把存量指纹的桶字段补齐后重新发布规则包才生效
+- 测试：`test_v1170_fingerprint.py` 新增桶字段下发/存量修复断言（现 60 项全过），全量回归绿
+
 ### v1.17.0
 **广告指纹库（Phase 2）**：把「哪些片段是广告」从客户端本地启发式升级为跨用户共享知识，服务端完成全链路落地。
 

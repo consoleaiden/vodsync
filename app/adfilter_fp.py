@@ -217,6 +217,13 @@ def rebuild() -> dict:
       - **已 disabled 的指纹永不自动改回**（人工/误杀降权的决定必须人工撤销）；
       - 已 confirmed 的若样本回落到门槛下（例如清理了历史数据）→ 降回 candidate，
         避免下发一个证据已经消失的指纹。
+
+    v1.17.1 修复：pattern_json 必须携带 dur_bucket / size_bucket / dur_bucket_ms /
+    size_bucket_b——downloadable() 从这里读桶字段下发给客户端，缺了会全部回落
+    默认 0，客户端永远匹配不上（阻断性 bug）。同一 fp_hash 组内所有片段的桶序号
+    必然相同（fp_hash 就是桶字段算出来的），所以聚合时取 min(dur_ms)/min(size_b)
+    样本即可无损还原桶字段；更新分支同样回写 pattern_json，保证存量坏数据在
+    重跑 rebuild 后自动修复。
     返回 {scanned, created, confirmed, demoted, disabled_kept}。
     """
     with database.engine.connect() as conn:
@@ -229,12 +236,34 @@ def rebuild() -> dict:
                 func.count(func.distinct(adfilter_segments.c.url_hash)).label("distinct_urls"),
                 func.min(adfilter_segments.c.at).label("first_seen"),
                 func.max(adfilter_segments.c.at).label("last_seen"),
+                # 桶字段还原样本：组内同 fp_hash ⇒ 同桶，任取一条即可（用 min 保持确定性）
+                func.min(adfilter_segments.c.dur_ms).label("sample_dur_ms"),
+                func.min(adfilter_segments.c.size_b).label("sample_size_b"),
             )
             .group_by(adfilter_segments.c.fp_hash, adfilter_segments.c.host)
         ).mappings().all()
 
     created = confirmed = demoted = disabled_kept = 0
     now = datetime.now()
+
+    def _pattern(m: dict, hits: int, users: int, urls: int) -> dict:
+        """从聚合样本还原完整 pattern（含下发必需的桶字段）。"""
+        sig = signature(
+            m["host"],
+            int(m["sample_dur_ms"] or 0),
+            int(m["sample_size_b"] or 0),
+        )
+        return {
+            "host": m["host"],
+            "dur_bucket": sig["dur_bucket"],
+            "size_bucket": sig["size_bucket"],
+            "dur_bucket_ms": config.ADFILTER_FP_DUR_BUCKET_MS,
+            "size_bucket_b": config.ADFILTER_FP_SIZE_BUCKET_B,
+            "hit_count": hits,
+            "distinct_users": users,
+            "distinct_urls": urls,
+        }
+
     with database.write_txn() as conn:
         seen: set = set()
         for row in grouped:
@@ -262,17 +291,15 @@ def rebuild() -> dict:
 
             first_seen = int(m["first_seen"] or 0)
             last_seen = int(m["last_seen"] or 0)
+            # 每次 rebuild 都重算完整 pattern（含桶字段），存量缺桶字段的数据在此自动修复
+            pattern_json = json.dumps(
+                _pattern(m, hits, users, urls), ensure_ascii=False
+            )[:MAX_PATTERN_JSON]
             if existing is None:
-                pattern = {
-                    "host": m["host"],
-                    "hit_count": hits,
-                    "distinct_users": users,
-                    "distinct_urls": urls,
-                }
                 status = STATUS_CONFIRMED if qualified else STATUS_CANDIDATE
                 conn.execute(adfilter_fingerprints.insert().values(
                     fp_hash=fp_hash, host=m["host"],
-                    pattern_json=json.dumps(pattern, ensure_ascii=False)[:MAX_PATTERN_JSON],
+                    pattern_json=pattern_json,
                     status=status, confidence=confidence,
                     hit_count=hits, distinct_users=users, distinct_urls=urls,
                     first_seen_at=first_seen, last_seen_at=last_seen,
@@ -285,12 +312,13 @@ def rebuild() -> dict:
             else:
                 old_status = existing["status"]
                 if old_status == STATUS_DISABLED:
-                    # 只更新时间证据，不动 status/confidence 的下发判定
+                    # 只更新时间证据与 pattern（桶字段修复），不动 status/confidence 的下发判定
                     conn.execute(
                         adfilter_fingerprints.update()
                         .where(adfilter_fingerprints.c.id == existing["id"])
                         .values(
                             hit_count=hits, distinct_users=users, distinct_urls=urls,
+                            pattern_json=pattern_json,
                             last_seen_at=last_seen, updated_at=now,
                         )
                     )
@@ -303,6 +331,7 @@ def rebuild() -> dict:
                     .values(
                         confidence=confidence, hit_count=hits,
                         distinct_users=users, distinct_urls=urls,
+                        pattern_json=pattern_json,
                         last_seen_at=last_seen,
                         status=new_status,
                         reviewed_at=now if new_status == STATUS_CONFIRMED else existing["reviewed_at"],

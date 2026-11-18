@@ -1086,6 +1086,8 @@ def adfilter_report(payload: dict = None, request: Request = None):
         "accepted": result["accepted"],
         "dropped": result["dropped"],
         "duplicates": result["duplicates"],
+        # v1.17.1：透传片段特征实际入库数（前端仅用于日志展示，不解析也不影响功能）
+        "segments_accepted": result.get("segments_accepted", 0),
     }
 
 

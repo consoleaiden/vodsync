@@ -1,4 +1,4 @@
-# 数据迁移说明（v1.14.0 ~ v1.17.0，MIGRATION_NOTES）
+# 数据迁移说明（v1.14.0 ~ v1.17.1，MIGRATION_NOTES）
 
 > 对应需求：`BACKEND_UPGRADE_REQUIREMENTS_2026-11-09.md`（B-01 / B-08 / B-09 / B-10 / B-11）、
 > v1.15.0「源站 18+ 标记与未成年模式」、v1.16.0「智能去广告规则下发与命中上报」、
@@ -485,6 +485,60 @@ curl -s -X POST -H "Authorization: Bearer <token>" \
 
 回滚到 v1.16.7：切回旧镜像即可 —— 旧代码不读新表、不认识 `rules.fingerprints`（按未知键静默丢弃），
 两张新表与其中的数据原样保留，无害。测试：`scripts/test_v1170_fingerprint.py`（42 项全过）。
+
+---
+
+## 2.9 v1.17.1：指纹桶字段修复（无数据库变更，2026-11-18）
+
+**结论先说**：这是**纯代码修复，不新增表、不新增列、不改表结构**，`init_db()` 无需做任何事。
+但**存量指纹数据必须重算一次**才能生效。
+
+### 问题
+
+`adfilter_fingerprints.pattern_json` 在 v1.17.0 里只写了
+`{host, hit_count, distinct_users, distinct_urls}`，缺下发必需的四个桶字段。
+`downloadable()` 从 `pattern_json` 读 `dur_bucket/size_bucket/dur_bucket_ms/size_bucket_b`，
+取不到就回落 `0` —— 客户端按真实分片时长算出 `dur_bucket=10`，与下发的 `0` 永远不相等，
+指纹匹配功能实际不生效（阻断性）。
+
+### 修复
+
+1. `rebuild()` 聚合查询新增 `min(dur_ms)` / `min(size_b)` 样本列。
+   同一 `fp_hash` 组内所有片段桶序号必然相同（`fp_hash = sha256(host|dur_bucket|size_bucket)`），
+   故任取一条即可无损还原桶字段。
+2. 写入 `pattern_json` 时经 `signature()` 还原完整四字段。
+3. **插入、普通更新、`disabled` 分支更新三处都回写 `pattern_json`** ——
+   保证存量坏数据在重跑 rebuild 后自动修好，无需手工 SQL。
+4. 同时补上 `POST /api/v1/adfilter/report` 响应漏透传的 `segments_accepted`。
+
+### 升级后必做的运维动作
+
+```bash
+# 1) 升级镜像后确认版本
+curl -s http://<host>:8181/healthz | grep -o '"version":"[^"]*"'      # 期望 1.17.1
+
+# 2) 重算一次指纹（把存量 pattern_json 的桶字段补齐）
+curl -s -X POST -H "Authorization: Bearer <token>" \
+  "http://<host>:8181/api/v1/adfilter/admin/fingerprints/rebuild"
+
+# 3) 确认下发桶字段不再是 0（关键验收点）
+curl -s -H "Authorization: Bearer <token>" \
+  "http://<host>:8181/api/v1/adfilter/admin/fingerprints?limit=5"
+# 看 pattern_json / 下发里 dur_bucket、size_bucket 是否非 0
+
+# 4) 重新发布规则包，让客户端拿到新指纹
+#    面板「去广告规则包」→ 校验并发布（自动注入 confirmed 指纹）
+```
+
+> 不做第 2 步：旧指纹仍是 `dur_bucket=0`，前端依然匹配不上（前端无需改动，问题全在服务端数据）。
+> 不做第 4 步：客户端仍持有旧规则包版本，新指纹不会下发。
+
+### 回滚
+
+切回 v1.17.0 镜像即可。数据无变化，指纹表结构一致（只是 `pattern_json` 里多了几个键，
+旧代码读不到会走默认值——即回到「匹配不上」的原状态，不会报错）。
+
+测试：`scripts/test_v1170_fingerprint.py`（现 60 项，含桶字段下发与存量修复回归，全过）。
 
 ---
 

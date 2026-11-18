@@ -136,11 +136,44 @@ check("样本不足指纹保持 candidate", fp_little and fp_little["status"] ==
 dl = adfilter_fp.downloadable()
 check("downloadable 含 confirmed 指纹", any(x["fp_hash"] == target_hash for x in dl), len(dl))
 check("downloadable 不含 candidate", all(x["fp_hash"] != little for x in dl))
+
+# v1.17.1 阻断性回归：pattern_json 必须带桶字段，下发字段不能回落 0
+from app.models import adfilter_fingerprints as fp_tbl  # noqa: E402
+dl_target = next(x for x in dl if x["fp_hash"] == target_hash)
+check("下发 dur_bucket=10（非 0）", dl_target["dur_bucket"] == 10, dl_target)
+check("下发 size_bucket=2（非 0）", dl_target["size_bucket"] == 2, dl_target)
+check("下发 dur_bucket_ms=1000", dl_target["dur_bucket_ms"] == config.ADFILTER_FP_DUR_BUCKET_MS, dl_target)
+check("下发 size_bucket_b=65536", dl_target["size_bucket_b"] == config.ADFILTER_FP_SIZE_BUCKET_B, dl_target)
+with database.engine.connect() as conn:
+    import json as _json  # noqa: E402
+    raw_pj = conn.execute(
+        select(fp_tbl.c.pattern_json).where(fp_tbl.c.fp_hash == target_hash)
+    ).scalar()
+pat = _json.loads(raw_pj)
+for k, v in (("dur_bucket", 10), ("size_bucket", 2),
+             ("dur_bucket_ms", 1000), ("size_bucket_b", 65536)):
+    check("pattern_json 含 %s=%s" % (k, v), pat.get(k) == v, pat)
+
 pub = adfilter.publish(adfilter.default_rules(), note="test fp publish")
 check("发布包含 fingerprints 字段", "fingerprints" in pub["rules"], pub["rules"].keys())
-check("发布包 fingerprints 含目标指纹", any(x["fp_hash"] == target_hash for x in pub["rules"]["fingerprints"]))
+pub_target = next(x for x in pub["rules"]["fingerprints"] if x["fp_hash"] == target_hash)
+check("发布包指纹 dur_bucket 非 0", pub_target["dur_bucket"] == 10, pub_target)
 cur = adfilter.current()
 check("当前规则包可读到 fingerprints", "fingerprints" in cur["rules"])
+
+# v1.17.1 存量修复：手工把 pattern_json 写回「旧格式（无桶字段）」，rebuild 后应自动修复
+old_pattern = {"host": "ad-example.com", "hit_count": 9, "distinct_users": 3, "distinct_urls": 9}
+with database.write_txn() as conn:
+    conn.execute(
+        fp_tbl.update().where(fp_tbl.c.fp_hash == target_hash).values(
+            pattern_json=_json.dumps(old_pattern)
+        )
+    )
+check("存量坏数据注入成功（下发桶字段回落 0）",
+      next(x for x in adfilter_fp.downloadable() if x["fp_hash"] == target_hash)["dur_bucket"] == 0)
+adfilter_fp.rebuild()  # 幂等重跑，修复存量
+check("rebuild 修复存量后 dur_bucket=10",
+      next(x for x in adfilter_fp.downloadable() if x["fp_hash"] == target_hash)["dur_bucket"] == 10)
 
 # ---------------- 2d：反馈闭环 ----------------
 fb1 = adfilter_fp.feedback(target_hash, adfilter_fp.FEEDBACK_HIT)
