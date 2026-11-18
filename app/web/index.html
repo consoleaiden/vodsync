@@ -537,6 +537,40 @@
     </div>
   </section>
 
+  <!-- 广告指纹库（v1.17.0，Phase 2：跨用户聚合的片段特征签名） -->
+  <section class="panel" id="fpPanel">
+    <div class="head">
+      <h2>广告指纹库</h2>
+      <span class="hint">跨用户聚合的片段结构签名 · 过滤仍在端上，服务端只做聚合并随规则包下发</span>
+      <span style="flex:1"></span>
+      <span class="muted" id="fpStats" style="font-size:12px"></span>
+      <button class="sm" id="fpToggle" title="折叠 / 展开本区块（首次展开才加载数据）">展开 ▾</button>
+    </div>
+    <div id="fpWrap" style="display:none">
+      <div class="body pad">
+        <div class="muted" style="font-size:12px;line-height:1.75;margin-bottom:8px">
+          指纹 = <code>站点 + 归一化时长桶 + 大小桶</code>，由客户端上报的片段特征跨用户聚合而来。
+          样本达到门槛（<code id="fpThresholds">-</code>）自动晋升 <b>confirmed</b> 并随规则包下发；
+          客户端回报「误杀」累计达阈值会自动 <b>disabled</b> 止血。人工审核优先于门槛，
+          <code>disabled</code> 永不自动恢复。下方改动需点「发布指纹到规则包」才对客户端生效。
+        </div>
+        <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:6px">
+          <select class="tbSel" id="fpStatusFilter" title="按状态筛选">
+            <option value="">全部状态</option>
+            <option value="candidate">candidate（样本不足）</option>
+            <option value="confirmed">confirmed（下发中）</option>
+            <option value="disabled">disabled（已停用）</option>
+          </select>
+          <input id="fpHostFilter" placeholder="按站点 host 筛选" style="width:180px">
+          <button class="primary" id="btnFpPublish" title="把当前 confirmed 指纹发布为新规则包版本">发布指纹到规则包</button>
+          <button id="btnFpRebuild" title="从片段明细全量重算聚合（幂等）">↻ 重算聚合</button>
+          <button id="btnFpReload" title="重新拉取列表">刷新</button>
+        </div>
+      </div>
+      <div id="fpList"><div class="empty">展开时加载指纹…</div></div>
+    </div>
+  </section>
+
   <!-- 同步日志 -->
   <section class="panel">
     <div class="head">
@@ -2576,6 +2610,125 @@ $("#adHistory").addEventListener("click", async (ev) => {
   }
 });
 
+// ---------------- 广告指纹库（v1.17.0 / Phase 2） ----------------
+// 只读聚合 + 审核启停 + 发布下发。不做播放数据面，过滤仍在客户端。
+function fpStatusBadge(s) {
+  if (s === "confirmed") return '<span class="badge ok">下发中</span>';
+  if (s === "disabled") return '<span class="badge warn">已停用</span>';
+  return '<span class="badge mute">样本不足</span>';
+}
+
+function renderFpList(data) {
+  const box = $("#fpList");
+  if (!box) return;
+  const rows = data.items || [];
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">暂无指纹（客户端上报带 segments 的过滤明细后，点「重算聚合」生成）</div>';
+    return;
+  }
+  box.innerHTML = `<table>
+    <thead><tr><th style="width:120px">指纹</th><th>站点 host</th><th class="num">时长桶</th>
+      <th class="num">大小桶</th><th class="num">置信度</th><th class="num">命中段</th>
+      <th class="num">去重用户</th><th class="num">去重地址</th><th class="num">误杀</th>
+      <th style="width:90px">状态</th><th style="width:210px">操作</th></tr></thead>
+    <tbody>${rows.map((r) => {
+      const p = r.pattern || {};
+      return `<tr>
+        <td title="${esc(r.fp_hash)}"><code>${esc((r.fp_hash || "").slice(0, 10))}…</code></td>
+        <td title="${esc(r.host)}">${esc(r.host) || "-"}</td>
+        <td class="num">${fmtNum(p.dur_bucket || 0)}</td>
+        <td class="num">${fmtNum(p.size_bucket || 0)}</td>
+        <td class="num">${(Number(r.confidence || 0) * 100).toFixed(0)}%</td>
+        <td class="num">${fmtNum(r.hit_count)}</td>
+        <td class="num">${fmtNum(r.distinct_users)}</td>
+        <td class="num">${fmtNum(r.distinct_urls)}</td>
+        <td class="num">${fmtNum(r.miss_count)}</td>
+        <td>${fpStatusBadge(r.status)}</td>
+        <td style="white-space:nowrap">
+          <button class="sm" data-fp-act="confirmed" data-hash="${esc(r.fp_hash)}" title="人工确认并下发">确认</button>
+          <button class="sm warn" data-fp-act="disabled" data-hash="${esc(r.fp_hash)}" title="止血：停用且不再下发">停用</button>
+          <button class="sm" data-fp-act="candidate" data-hash="${esc(r.fp_hash)}" title="退回样本不足">退回</button>
+        </td></tr>`;
+    }).join("")}</tbody></table>`;
+}
+
+async function fpLoad() {
+  try {
+    const ov = await api("/api/v1/adfilter/admin/fingerprints/overview");
+    const c = ov.config || {};
+    $("#fpThresholds").textContent = `用户 ≥ ${fmtNum(c.min_users)} / 地址 ≥ ${fmtNum(c.min_urls)} / 命中 ≥ ${fmtNum(c.min_hits)}，误杀 ≥ ${fmtNum(c.miss_disable)} 停用`;
+    $("#fpStats").textContent = `共 ${fmtNum(ov.total)} 条`
+      + ` · 下发中 ${fmtNum((ov.by_status || {}).confirmed || 0)}`
+      + ` · 可下发 ${fmtNum(ov.downloadable)}`
+      + ` · 命中段 ${fmtNum(ov.total_hits)}`
+      + (ov.total_miss ? ` · 误杀 ${fmtNum(ov.total_miss)}` : "");
+    const st = $("#fpStatusFilter").value || "";
+    const host = ($("#fpHostFilter").value || "").trim();
+    const q = new URLSearchParams({ limit: "100", offset: "0" });
+    if (st) q.set("status", st);
+    if (host) q.set("host", host);
+    const data = await api("/api/v1/adfilter/admin/fingerprints?" + q.toString());
+    renderFpList(data);
+  } catch (e) {
+    $("#fpList").innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+$("#fpReload").onclick = () => fpLoad();
+$("#fpStatusFilter").onchange = () => fpLoad();
+$("#fpHostFilter").addEventListener("keydown", (ev) => { if (ev.key === "Enter") fpLoad(); });
+
+$("#btnFpRebuild").onclick = async () => {
+  const btn = $("#btnFpRebuild");
+  btn.disabled = true;
+  try {
+    const res = await api("/api/v1/adfilter/admin/fingerprints/rebuild", { method: "POST" });
+    toast(`重算完成：扫描 ${fmtNum(res.scanned)}，新建 ${fmtNum(res.created)}，晋升 ${fmtNum(res.confirmed)}`);
+    await fpLoad();
+  } catch (e) {
+    toast("重算失败：" + e.message, true);
+  } finally { btn.disabled = false; }
+};
+
+$("#btnFpPublish").onclick = async () => {
+  if (!confirm("把当前 confirmed 指纹发布为新规则包版本？\n客户端下次拉取规则后生效（TTL 30 分钟，起播也会触发）。")) return;
+  const btn = $("#btnFpPublish");
+  btn.disabled = true;
+  try {
+    const res = await api("/api/v1/adfilter/admin/fingerprints/publish", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ channel: "stable", note: "发布指纹库快照" }),
+    });
+    toast(res.msg || "已发布");
+    await fpLoad();
+    if (typeof adLoad === "function") await adLoad();  // 同步刷新规则包区块的版本号
+  } catch (e) {
+    toast("发布失败：" + e.message, true);
+  } finally { btn.disabled = false; }
+};
+
+$("#fpList").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-fp-act]");
+  if (!btn) return;
+  const status = btn.dataset.fpAct;
+  const fpHash = btn.dataset.hash;
+  const labels = { confirmed: "确认下发", disabled: "停用止血", candidate: "退回样本不足" };
+  if (!confirm(`确认将指纹 ${fpHash.slice(0, 10)}… 设为「${labels[status]}」？\n发布规则包后对客户端生效。`)) return;
+  btn.disabled = true;
+  try {
+    await api("/api/v1/adfilter/admin/fingerprints/review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fp_hash: fpHash, status, note: labels[status] }),
+    });
+    toast("已更新：" + labels[status]);
+    await fpLoad();
+  } catch (e) {
+    toast("更新失败：" + e.message, true);
+  } finally { btn.disabled = false; }
+});
+
 // 可折叠区块（v1.14.1）：默认收起、首次展开才加载数据，缩短管理面板首屏时间。
 // - tables / stars：加载一次，不进轮询（编辑/翻页状态不能被覆盖，与之前行为一致）
 // - sources / logs：展开期间跟随 5 秒轮询；收起时不请求（这就是省流的关键）
@@ -2595,6 +2748,8 @@ const SEC_DEFS = {
   proxy:    { btn: "#proxyToggle", wrap: "#proxyWrap", load: () => loadProxy() },
   // v1.16.0：规则包不进轮询（编辑到一半被刷新顶掉最烦），只在展开时加载一次
   adfilter: { btn: "#adfilterToggle", wrap: "#adfilterWrap", load: () => adLoad() },
+  // v1.17.0：指纹库不进轮询（状态变化少，且审核操作不能被刷新顶掉），展开时加载一次
+  fp: { btn: "#fpToggle", wrap: "#fpWrap", load: () => fpLoad() },
 };
 
 function secPaint(key) {

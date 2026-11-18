@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.16.7"
+    "version": "1.17.0"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -956,6 +956,248 @@
             "description": "参与异常判定的最少样本数，0=用服务端默认"
           }
         ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adfilter/fp-feedback": {
+      "post": {
+        "summary": "指纹命中/误杀反馈（v1.17.0）",
+        "description": "客户端回报某条指纹的命中结果（2d 反馈闭环）。read Token 即可调用。\n\nbody：`{\"fp_hash\": \"...\", \"kind\": \"hit\" | \"miss\"}`\n  - hit ：该指纹成功命中，run_hits++；\n  - miss：客户端认为该指纹误杀，miss_count++，累计达阈值自动 disabled。\n\n未知 fp_hash（客户端缓存了已撤销指纹）返回 found:false，不报错。",
+        "operationId": "adfilter_fp_feedback_api_v1_adfilter_fp_feedback_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adfilter/admin/fingerprints": {
+      "get": {
+        "summary": "指纹库分页列表（管理端）",
+        "description": "指纹分页列表；带 fp_hash 时只返回该条（total=1 或 0），便于面板详情。",
+        "operationId": "adfilter_admin_fingerprints_api_v1_adfilter_admin_fingerprints_get",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "按状态筛：candidate/confirmed/disabled，空=全部",
+              "default": "",
+              "title": "Status"
+            },
+            "description": "按状态筛：candidate/confirmed/disabled，空=全部"
+          },
+          {
+            "name": "host",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "按站点 host 精确筛",
+              "default": "",
+              "title": "Host"
+            },
+            "description": "按站点 host 精确筛"
+          },
+          {
+            "name": "fp_hash",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "按 fp_hash 取单条详情",
+              "title": "Fp Hash"
+            },
+            "description": "按 fp_hash 取单条详情"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adfilter/admin/fingerprints/overview": {
+      "get": {
+        "summary": "指纹库概览（管理端）",
+        "description": "各状态数量 + 累计命中/误杀 + 当前生效阈值，面板区块首屏用。",
+        "operationId": "adfilter_admin_fp_overview_api_v1_adfilter_admin_fingerprints_overview_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adfilter/admin/fingerprints/rebuild": {
+      "post": {
+        "summary": "重算指纹聚合（管理端）",
+        "description": "从 segments 明细全量重算指纹（幂等，可反复调用）。人工审核过的 disabled 不受影响。",
+        "operationId": "adfilter_admin_fp_rebuild_api_v1_adfilter_admin_fingerprints_rebuild_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adfilter/admin/fingerprints/review": {
+      "post": {
+        "summary": "人工审核指纹（管理端）",
+        "description": "把某条指纹设为 candidate / confirmed / disabled。\n\nbody：`{\"fp_hash\": \"...\", \"status\": \"confirmed\", \"note\": \"人工确认\"}`\n人工 confirmed 不受样本门槛限制（运营判断优先）；disabled 是止血，永不自动恢复。",
+        "operationId": "adfilter_admin_fp_review_api_v1_adfilter_admin_fingerprints_review_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adfilter/admin/fingerprints/publish": {
+      "post": {
+        "summary": "发布指纹到规则包（管理端）",
+        "description": "把当前 confirmed 指纹快照注入规则包，发布为新版本（版本号 +1）。\n\nbody：`{\"channel\": \"stable\", \"note\": \"发布指纹库快照\"}`（均可省略）。\n本质是一次规则包发布，复用既有校验/版本/回滚语义 —— 客户端下次拉规则即拿到指纹。",
+        "operationId": "adfilter_admin_fp_publish_api_v1_adfilter_admin_fingerprints_publish_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",

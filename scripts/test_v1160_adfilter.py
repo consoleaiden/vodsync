@@ -369,9 +369,17 @@ def main():
     check("I7 两份 openapi 一致且版本与代码一致 / 方法数 ≥ 65",
           spec == spec2 and spec["info"]["version"] == __version__
           and sum(len(v) for v in spec["paths"].values()) >= 65, spec["info"]["version"])
-    check("I8 openapi 收录 6 条 adfilter 路径",
-          len([p for p in spec["paths"] if "adfilter" in p]) == 6,
-          [p for p in spec["paths"] if "adfilter" in p])
+    # v1.17.0：指纹库新增 6 条 adfilter 路径，断言改为「老 6 条仍在」而非「恰好 6 条」
+    # —— 增量升级不该破坏历史契约测试，老接口一条都不能少。
+    _legacy_adfilter = {
+        "/api/v1/adfilter/rules", "/api/v1/adfilter/report",
+        "/api/v1/adfilter/admin/packs", "/api/v1/adfilter/admin/packs/{version}",
+        "/api/v1/adfilter/admin/packs/rollback", "/api/v1/adfilter/admin/stats",
+    }
+    _spec_paths = set(spec["paths"])
+    check("I8 openapi 收录原有 6 条 adfilter 路径（v1.17 新增不计）",
+          _legacy_adfilter.issubset(_spec_paths),
+          sorted(_spec_paths - _legacy_adfilter))
 
     print(f"\n==== v1.16.0 adfilter 测试: {passed} passed, {failed} failed ====")
     return 1 if failed else 0

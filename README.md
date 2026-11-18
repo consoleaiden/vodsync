@@ -568,6 +568,7 @@ vodsync/
 └── docs/
     ├── README.md                     # 文档索引（每份文档的用途 / 时效 / 读者）
     ├── API_SPEC_FOR_AI.md            # ★ 交付给 AI 的完整 API 文档（字段字典/状态语义/代码骨架/排查表）
+    ├── ADFILTER_FINGERPRINT_CLIENT_CONTRACT.md # v1.17.0 广告指纹库前端升级契约（增量）
     ├── CLIENT_API.md                 # 简明对接说明（人类速查）
     ├── openapi.json                  # OpenAPI 3.1 快照（可导入代码生成器）
     ├── deploy-synology.md            # 群晖部署
@@ -585,6 +586,25 @@ vodsync/
 ## 变更记录
 
 > 按版本号**从新到旧**排列，最新版本在最前。历史版本只做归档记录，细节以对应版本的代码与文档为准。
+
+### v1.17.0
+**广告指纹库（Phase 2）**：把「哪些片段是广告」从客户端本地启发式升级为跨用户共享知识，服务端完成全链路落地。
+
+- **数据模型**：新增 `adfilter_segments`（逐段特征明细，去重键 `(user,url_hash,at,seg_index)`）
+  与 `adfilter_fingerprints`（聚合指纹，状态 `candidate/confirmed/disabled`），`init_db()` 自动建表，无需手工 SQL
+- **核心模块 `app/adfilter_fp.py`**：签名归一化（`host|时长桶|大小桶`）、跨用户/跨地址聚类置信度、
+  审核状态机、命中/误杀反馈闭环。误杀累计达阈值自动 `disabled` 止血，人工审核优先于门槛
+- **2a 落库**：`POST /api/v1/adfilter/report` 的 `items[]` 新增可选 `segments[]`（`index`/`dur_ms`/`size_b`），
+  老上报不带该字段行为完全不变；响应新增 `segments_accepted`
+- **2b 聚类**：新增定时 job `adfilter_fp_rebuild`（默认每 360 分钟）从明细重算指纹，也支持面板手动触发
+- **2c 下发**：confirmed 指纹随规则包 `rules.fingerprints[]` 下发（发布/回滚时自动注入，按置信度降序取前 128），
+  不暴露任何 url 原文；新增 `POST /api/v1/adfilter/admin/fingerprints/publish`
+- **2d 反馈**：新增 `POST /api/v1/adfilter/fp-feedback`（read Token 可用）回报 `hit`/`miss`
+- **管理端**：指纹分页列表 / 概览 / 重算 / 审核接口 + 面板「广告指纹库」区块（懒加载，不进轮询）
+- **前端对接契约**：`docs/ADFILTER_FINGERPRINT_CLIENT_CONTRACT.md`（字段类型/状态码错误码/鉴权/时序/兼容性/升级 Checklist）；
+  两份 `openapi.json` 已同步（v1.17.0，74 条路径）
+- 测试：`scripts/test_v1170_fingerprint.py`（42 项全过：落库/幂等/聚类/置信度/状态机/下发/反馈/兼容），
+  既有 5 套回归测试全绿
 
 ### v1.16.7
 **中转代理配置从 docker 环境变量搬到管理面板**：改代理地址 / 并发 / 记忆时长不再需要重启容器。

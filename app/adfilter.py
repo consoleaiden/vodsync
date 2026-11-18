@@ -38,6 +38,10 @@ from sqlalchemy import Float, case, cast, func, select, text
 from . import config, database
 from .models import adfilter_reports, adfilter_rule_packs
 
+# v1.17.0：广告指纹库。延迟到函数内 import 会掩盖循环依赖，这里模块级引入——
+# adfilter_fp 只依赖 config/database/models，不反过来 import adfilter，无环。
+from . import adfilter_fp
+
 log = logging.getLogger("vodsync.adfilter")
 
 CHANNELS = ("stable", "beta")
@@ -282,6 +286,25 @@ def normalize(rules) -> dict:
                 clean_sites.append(item)
         out["site_overrides"] = clean_sites
 
+    # v1.17.0 fingerprints 字段刻意不在这里登记：它是服务端发布时从指纹库
+    # 自动注入的（见 _inject_fingerprints），不编辑框手填。运营通过「审核指纹」
+    # 影响下发内容，而不是直接改规则 JSON —— 否则手填的 fp_hash 无法校验真伪。
+    # normalize 的「未知键静默丢弃」语义天然把手填值丢掉，这里只留注释说明。
+
+    return out
+
+
+def _inject_fingerprints(rules: dict) -> dict:
+    """发布时把当前 confirmed 指纹快照注入规则包（2c）。返回新 dict，不改入参。"""
+    out = dict(rules)
+    if not config.ADFILTER_FP_ENABLED:
+        out.pop("fingerprints", None)
+        return out
+    fps = adfilter_fp.downloadable()
+    if fps:
+        out["fingerprints"] = fps
+    else:
+        out.pop("fingerprints", None)
     return out
 
 
@@ -442,6 +465,7 @@ def publish(rules, channel: str = DEFAULT_CHANNEL, note: str = "") -> dict:
     """
     ch = normalize_channel(channel)
     clean = normalize(rules)
+    clean = _inject_fingerprints(clean)
     # 唯一索引冲突（并发发布撞同一个 version）不在这里吞：交给路由层转 409，
     # 让管理员知道「重试一次」而不是看到一个笼统的 500。
     version = _insert_next(ch, clean, note)
@@ -466,6 +490,7 @@ def rollback(version: int, channel: str = DEFAULT_CHANNEL, note: str = "") -> di
     if not src:
         raise LookupError(f"渠道 {ch} 不存在版本 {version}")
     clean = normalize(src["rules"])
+    clean = _inject_fingerprints(clean)
     label = (note or f"回滚至 v{version}")[:255]
     new_version = _insert_next(ch, clean, label)
     log.info(
@@ -581,6 +606,10 @@ def ingest(items: list, user_id: int) -> dict:
     now = int(time.time())
     skew = max(60, int(config.ADFILTER_AT_SKEW_SEC))
     rows, reasons = [], {}
+    # v1.17.0：指纹片段明细。按 (user_id, url_hash, at) 关联，只有本条 report
+    # 真正插入成功才写，避免重复上报产生「有 segments 没有 report」的孤儿行。
+    segs_by_key: dict = {}
+    seg_reasons: dict = {}
 
     def drop(reason: str) -> None:
         reasons[reason] = reasons.get(reason, 0) + 1
@@ -613,11 +642,23 @@ def ingest(items: list, user_id: int) -> dict:
             drop("at_skew")
             continue
 
+        # v1.17.0：可选片段特征。老上报不带这个字段 → 完全跳过，零影响；
+        # 带了但非法 → 只丢 segments、不影响 report 入库。
+        raw_segs = raw.get("segments")
+        if raw_segs is None:
+            clean_segs, seg_drop = [], {}
+        else:
+            clean_segs, seg_drop = adfilter_fp.validate_segments(raw_segs)
+        for k, v in seg_drop.items():
+            seg_reasons[k] = seg_reasons.get(k, 0) + v
+
+        url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        host = host_of(url)   # v1.16.1：写时归一，读侧直接 GROUP BY
         rows.append({
             "user_id": int(user_id),
             "url": url,
-            "url_hash": hashlib.sha256(url.encode("utf-8")).hexdigest(),
-            "host": host_of(url),   # v1.16.1：写时归一，读侧直接 GROUP BY
+            "url_hash": url_hash,
+            "host": host,
             "rule_version": rule_version,
             "removed_runs": removed_runs,
             "removed_ms": removed_ms,
@@ -625,8 +666,11 @@ def ingest(items: list, user_id: int) -> dict:
             "at": at,
             "created_at": datetime.now(),
         })
+        if clean_segs:
+            segs_by_key[(int(user_id), url_hash, at)] = (host, clean_segs)
 
     accepted = 0
+    written_keys = []
     if rows:
         stmt = database.dialect_insert(adfilter_reports).on_conflict_do_nothing(
             index_elements=[
@@ -640,11 +684,29 @@ def ingest(items: list, user_id: int) -> dict:
                 result = conn.execute(stmt.values(**row))
                 rc = result.rowcount
                 # SQLite 的 executemany 口径是 -1；这里逐条执行，正常都是 1/0。
-                accepted += 1 if (rc is None or rc > 0) else 0
+                if rc is None or rc > 0:
+                    accepted += 1
+                    written_keys.append((row["user_id"], row["url_hash"], row["at"]))
+
+    # v1.17.0：report 事务提交后再写 segments（避免嵌套事务在 SQLite 上死锁）。
+    # 只有 report 真正插入成功的那些上报才落片段，重复上报不产生孤儿明细。
+    segs_written = 0
+    for key in written_keys:
+        item = segs_by_key.get(key)
+        if not item:
+            continue
+        seg_host, clean_segs = item
+        segs_written += adfilter_fp.ingest_segments(
+            clean_segs,
+            user_id=key[0], url_hash=key[1], host=seg_host, at=key[2],
+        )
+    if seg_reasons:
+        reasons["segments_" + "_".join(sorted(seg_reasons))] = sum(seg_reasons.values())
+
     if accepted or reasons:
         log.info(
-            "[adfilter] 上报 user=%s 入库 %d/%d 条，丢弃 %s",
-            user_id, accepted, len(items), reasons or "无",
+            "[adfilter] 上报 user=%s 入库 %d/%d 条，片段 %d 条，丢弃 %s",
+            user_id, accepted, len(items), segs_written, reasons or "无",
         )
     # dropped 只统计「数据不合规」的条数；重复上报单独用 duplicates 表达 ——
     # 两者混在一起时，客户端反复重试会和「脏数据」看起来一模一样，不好排障。
@@ -653,6 +715,7 @@ def ingest(items: list, user_id: int) -> dict:
         "accepted": accepted,
         "dropped": invalid,
         "duplicates": len(rows) - accepted,
+        "segments_accepted": segs_written,
         "reasons": reasons,
     }
 

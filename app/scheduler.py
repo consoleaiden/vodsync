@@ -52,6 +52,18 @@ def _job_housekeeping():
         log.exception("数据维护任务失败")
 
 
+def _job_adfilter_fp_rebuild():
+    """广告指纹库重算（v1.17.0）：从 segments 明细聚合指纹、晋升状态。吞异常不影响调度。"""
+    from . import adfilter_fp
+
+    if not config.ADFILTER_ENABLED or not config.ADFILTER_FP_ENABLED:
+        return
+    try:
+        adfilter_fp.rebuild()
+    except Exception:  # noqa: BLE001
+        log.exception("[scheduler] 指纹库重算异常（不影响其它任务）")
+
+
 def _job_related_calibration():
     """相关推荐每日校准：重算 computed_at 过期 / 覆盖率不满的源站（预算内）。"""
     from . import related, syncer
@@ -203,6 +215,15 @@ def start_scheduler():
             max_instances=1,
             coalesce=True,
         )
+    if config.ADFILTER_ENABLED and config.ADFILTER_FP_ENABLED and config.ADFILTER_FP_REBUILD_INTERVAL_MIN > 0:
+        _scheduler.add_job(
+            _job_adfilter_fp_rebuild,
+            "interval",
+            minutes=config.ADFILTER_FP_REBUILD_INTERVAL_MIN,
+            id="adfilter_fp_rebuild",
+            max_instances=1,
+            coalesce=True,
+        )
     if config.RELATED_ENABLED:
         _scheduler.add_job(
             _job_related_calibration,
@@ -271,6 +292,7 @@ JOB_LABELS = {
     "related_calibration": "相关推荐校准",
     "field_backfill": "字段回填",
     "star_tags_nightly": "明星 Tag 重建",
+    "adfilter_fp_rebuild": "广告指纹库重算",
 }
 
 

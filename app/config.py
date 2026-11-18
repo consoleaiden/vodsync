@@ -268,6 +268,31 @@ ADFILTER_HOST_STATS_LIMIT = int(os.environ.get("ADFILTER_HOST_STATS_LIMIT", "20"
 ADFILTER_HOST_STATS_MAX_LIMIT = 200
 
 # ---------------------------------------------------------------------------
+# 广告指纹库（v1.17.0 / Phase 2）
+#
+# 指纹是服务端把客户端上报的片段结构特征（host + 归一化时长/大小桶）跨用户
+# 聚合出的「哪些片段是广告」共享知识。仍然是控制面：不算内容哈希、不碰播放流量。
+# ---------------------------------------------------------------------------
+# 指纹包含入规则包下发的总开关；关掉后 rebuild 照常跑、面板照常看，只是不下发。
+ADFILTER_FP_ENABLED = os.environ.get("ADFILTER_FP_ENABLED", "true").lower() == "true"
+# 时长归一化桶宽（毫秒）。例：1000 表示按秒分桶，950ms 与 1040ms 视为同一特征。
+ADFILTER_FP_DUR_BUCKET_MS = max(100, int(os.environ.get("ADFILTER_FP_DUR_BUCKET_MS", "1000")))
+# 大小归一化桶宽（字节）。0 表示不按大小分桶（只看时长，误杀更少但区分度低）。
+ADFILTER_FP_SIZE_BUCKET_B = max(0, int(os.environ.get("ADFILTER_FP_SIZE_BUCKET_B", "65536")))
+# 单条上报最多接受多少个片段特征（防异常客户端刷爆 segments 表）。
+ADFILTER_FP_MAX_SEGMENTS = max(1, int(os.environ.get("ADFILTER_FP_MAX_SEGMENTS", "50")))
+# 晋升 confirmed 的门槛：不同用户数 / 不同 URL 数 / 总命中次数，三者同时满足。
+ADFILTER_FP_MIN_USERS = max(1, int(os.environ.get("ADFILTER_FP_MIN_USERS", "3")))
+ADFILTER_FP_MIN_URLS = max(1, int(os.environ.get("ADFILTER_FP_MIN_URLS", "3")))
+ADFILTER_FP_MIN_HITS = max(1, int(os.environ.get("ADFILTER_FP_MIN_HITS", "10")))
+# 误杀保护：某指纹被客户端回报「不该删」累计达到该次数 → 自动 disabled 并停止下发。
+ADFILTER_FP_MISS_DISABLE = max(1, int(os.environ.get("ADFILTER_FP_MISS_DISABLE", "5")))
+# 下发到规则包里的指纹条数上限（包体积／客户端装载内存都要兜住）。
+ADFILTER_FP_MAX_DOWNLOAD = max(0, min(256, int(os.environ.get("ADFILTER_FP_MAX_DOWNLOAD", "128"))))
+# 后台自动重算间隔（分钟）。0 = 关闭自动重算，只能面板手动点。
+ADFILTER_FP_REBUILD_INTERVAL_MIN = max(0, int(os.environ.get("ADFILTER_FP_REBUILD_INTERVAL_MIN", "360")))
+
+# ---------------------------------------------------------------------------
 # 标签精确检索（v1.14.0 / B-01）
 #
 # 详情页的标签胶囊点击后，按「分词后精确匹配 vod_tag」检索，而不是把标签

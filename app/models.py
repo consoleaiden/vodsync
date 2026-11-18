@@ -24,6 +24,7 @@ from sqlalchemy import (
     BigInteger,
     Column,
     DateTime,
+    Float,
     Index,
     Integer,
     MetaData,
@@ -341,6 +342,68 @@ Index("uq_adfilter_report_dedup", adfilter_reports.c.user_id,
       adfilter_reports.c.url_hash, adfilter_reports.c.at, unique=True)
 # 聚合与统计按时间倒序取最近数据
 Index("idx_adfilter_report_at", adfilter_reports.c.at)
+
+# ---------------------------------------------------------------------------
+# 广告指纹库（v1.17.0 / Phase 2）
+#
+# 边界仍然不变：服务端不做播放数据面、不算分片内容哈希。所谓「指纹」只是
+# 客户端上报的**结构特征签名**（站点 + 归一化的片段时长/大小桶），由服务端
+# 跨用户、跨 URL 聚合而来。它让「哪些片段是广告」从客户端本地启发式升级为
+# 共享知识：新用户/新站点不必等本地算法跑一段时间，拉到 confirmed 指纹即可命中。
+#
+# adfilter_segments：每次上报里被删片段的逐段特征（明细，只增不改）。
+#   去重键用 (user_id, url_hash, at, seg_index) 而不是 report.id —— 上报幂等靠
+#   on_conflict_do_nothing，重复上报拿不到自增 id，用逻辑键关联才稳定。
+# ---------------------------------------------------------------------------
+adfilter_segments = Table(
+    "adfilter_segments",
+    META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, nullable=False, server_default="0"),
+    Column("url_hash", String(64), nullable=False),       # 关联 adfilter_reports.url_hash
+    Column("host", String(255), nullable=False, server_default=""),
+    Column("at", BigInteger, nullable=False),             # 关联上报的 at
+    Column("seg_index", Integer, nullable=False),         # 片段在播放列表中的序号
+    Column("dur_ms", BigInteger, nullable=False, server_default="0"),
+    Column("size_b", BigInteger, nullable=False, server_default="0"),  # 0 = 客户端未提供
+    Column("fp_hash", String(64), nullable=False),        # 服务端归一化特征签名
+    Column("created_at", DateTime, server_default=func.now()),
+)
+Index(
+    "uq_adfilter_seg_dedup",
+    adfilter_segments.c.user_id, adfilter_segments.c.url_hash,
+    adfilter_segments.c.at, adfilter_segments.c.seg_index,
+    unique=True,
+)
+Index("idx_adfilter_seg_fp", adfilter_segments.c.fp_hash)
+
+# adfilter_fingerprints：跨用户聚合后的指纹实体。
+#   status: candidate（样本不足）→ confirmed（可下发）/ disabled（人工停用或误杀降权）。
+#   confidence / distinct_users / distinct_urls 由 rebuild() 从 segments 重算，
+#   run_hits / miss_count 是 2d 反馈闭环的运行时计数（客户端回报命中/误杀）。
+# ---------------------------------------------------------------------------
+adfilter_fingerprints = Table(
+    "adfilter_fingerprints",
+    META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("fp_hash", String(64), nullable=False, unique=True),
+    Column("host", String(255), nullable=False, server_default=""),
+    Column("pattern_json", Text, nullable=False),          # 归一化特征签名（可读）
+    Column("status", String(16), nullable=False, server_default="candidate"),
+    Column("confidence", Float, nullable=False, server_default="0"),
+    Column("hit_count", Integer, nullable=False, server_default="0"),
+    Column("distinct_users", Integer, nullable=False, server_default="0"),
+    Column("distinct_urls", Integer, nullable=False, server_default="0"),
+    Column("run_hits", Integer, nullable=False, server_default="0"),
+    Column("miss_count", Integer, nullable=False, server_default="0"),
+    Column("first_seen_at", BigInteger, nullable=False, server_default="0"),
+    Column("last_seen_at", BigInteger, nullable=False, server_default="0"),
+    Column("reviewed_at", DateTime),
+    Column("note", String(255), server_default=""),
+    Column("created_at", DateTime, server_default=func.now()),
+    Column("updated_at", DateTime, server_default=func.now()),
+)
+Index("idx_adfilter_fp_status", adfilter_fingerprints.c.status, adfilter_fingerprints.c.confidence)
 
 # ---------------------------------------------------------------------------
 # vod_{slug} 动态表缓存：避免重复构建 Table 对象

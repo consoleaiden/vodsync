@@ -1,11 +1,12 @@
-# 数据迁移说明（v1.14.0 ~ v1.16.4，MIGRATION_NOTES）
+# 数据迁移说明（v1.14.0 ~ v1.17.0，MIGRATION_NOTES）
 
 > 对应需求：`BACKEND_UPGRADE_REQUIREMENTS_2026-11-09.md`（B-01 / B-08 / B-09 / B-10 / B-11）、
 > v1.15.0「源站 18+ 标记与未成年模式」、v1.16.0「智能去广告规则下发与命中上报」、
 > v1.16.1「按站点分布统计」、v1.16.2「标题词库回填修复」、
 > v1.16.3「adfilter 新阈值登记 + 漏判样本隔离（无数据库变更）」、
-> v1.16.4「管理面板性能与批量管理（无数据库变更，仅 settings 增加一个 key）」
-> 影响面：**新增 6 张表 + 3 个追加列**，不改任何现有列、不重命名任何字段。
+> v1.16.4「管理面板性能与批量管理（无数据库变更，仅 settings 增加一个 key）」、
+> v1.16.7「中转代理配置搬到面板」、v1.17.0「广告指纹库（新增 2 张表）」
+> 影响面：**新增 8 张表 + 3 个追加列**，不改任何现有列、不重命名任何字段。
 > 升级方式：拉新镜像重启即可，`init_db()` 会自动建表补列，无需手工 SQL。
 
 ---
@@ -392,6 +393,98 @@ curl -s -X POST -H "Authorization: Bearer <token>" -H 'Content-Type: application
 回滚到 v1.16.6：`settings.panel_proxy_config` 变成无人读取的孤立行，无害；同时把
 `docker-compose.yml` 的 4 行 `PROXY_*` 加回去即可恢复原行为（旧代码只读环境变量）。
 彻底清理：`DELETE FROM settings WHERE key = 'panel_proxy_config';`
+
+---
+
+## 2.8 v1.17.0：广告指纹库（新增 2 张表，2026-11-18）
+
+**数据库变更：新增 2 张表**，不改任何现有列、不重命名字段。`init_db()` 的 `META.create_all()`
+自动建表，`_migrate()` 无需追加列（全是新表）。回滚到 v1.16.x 时这两张表变成无人读取的孤立表，无害。
+
+```sql
+-- 片段特征明细（只增不改；去重键用逻辑键而非 report.id，因为上报幂等拿不到自增 id）
+CREATE TABLE IF NOT EXISTS adfilter_segments (
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER      NOT NULL DEFAULT 0,      -- 凭据身份（见 §2.3）
+    url_hash    VARCHAR(64)  NOT NULL,                 -- 关联 adfilter_reports.url_hash
+    host        VARCHAR(255) NOT NULL DEFAULT '',
+    at          BIGINT       NOT NULL,                 -- 关联上报的 at
+    seg_index   INTEGER      NOT NULL,                 -- 片段在列表中的序号
+    dur_ms      BIGINT       NOT NULL DEFAULT 0,
+    size_b      BIGINT       NOT NULL DEFAULT 0,       -- 0 = 客户端未提供
+    fp_hash     VARCHAR(64)  NOT NULL,                 -- sha256(host|dur_bucket|size_bucket)
+    created_at  TIMESTAMP    DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_adfilter_seg_dedup
+    ON adfilter_segments (user_id, url_hash, at, seg_index);
+CREATE INDEX IF NOT EXISTS idx_adfilter_seg_fp ON adfilter_segments (fp_hash);
+
+-- 跨用户聚合后的指纹实体
+CREATE TABLE IF NOT EXISTS adfilter_fingerprints (
+    id             SERIAL PRIMARY KEY,
+    fp_hash        VARCHAR(64)  NOT NULL UNIQUE,
+    host           VARCHAR(255) NOT NULL DEFAULT '',
+    pattern_json   TEXT         NOT NULL,              -- 归一化特征签名（可读）
+    status         VARCHAR(16)  NOT NULL DEFAULT 'candidate',  -- candidate/confirmed/disabled
+    confidence     FLOAT        NOT NULL DEFAULT 0,
+    hit_count      INTEGER      NOT NULL DEFAULT 0,
+    distinct_users INTEGER      NOT NULL DEFAULT 0,
+    distinct_urls  INTEGER      NOT NULL DEFAULT 0,
+    run_hits       INTEGER      NOT NULL DEFAULT 0,    -- 2d：客户端回报命中数
+    miss_count     INTEGER      NOT NULL DEFAULT 0,    -- 2d：误杀举报数
+    first_seen_at  BIGINT       NOT NULL DEFAULT 0,
+    last_seen_at   BIGINT       NOT NULL DEFAULT 0,
+    reviewed_at    TIMESTAMP,
+    note           VARCHAR(255) DEFAULT '',
+    created_at     TIMESTAMP    DEFAULT now(),
+    updated_at     TIMESTAMP    DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_adfilter_fp_status
+    ON adfilter_fingerprints (status, confidence);
+```
+
+两处设计取舍：
+
+1. **片段去重键用 `(user_id, url_hash, at, seg_index)` 而不是 report 的 `id`**。上报幂等靠
+   `on_conflict_do_nothing`，重复上报拿不到自增 id —— 用逻辑键关联才稳定，重复上报不产生孤儿明细。
+2. **`fp_hash` 用「站点 + 时长桶 + 大小桶」而非内容哈希**。服务端永远拿不到 ts 字节（分片直连 CDN），
+   结构签名是唯一可行的共享指纹；`size_b=0`（客户端没给大小）时大小桶恒为 0，避免「给了」和「没给」
+   被拆成两个指纹。
+
+**状态机与治理**：`candidate`（样本不足）→ 达标自动 `confirmed`（可下发）→ `disabled`（人工停用或误杀
+达阈值）。已 disabled 的指纹**永不自动恢复**（`rebuild()` 只更新时间证据，不改状态），人工审核优先于门槛。
+任何对全体客户端生效的改动都走「规则包 version +1 + 人工确认」，与 `mode:off` 止血同一套模型。
+
+代码变更：
+
+1. `app/models.py` 新增上述 2 张表；`app/adfilter_fp.py` 新增核心模块：签名归一化、校验、落库、
+   聚类置信度、审核状态机、下发快照、反馈闭环、概览统计。
+2. `app/adfilter.py`：`ingest()` 扩展可选 `segments[]`（老上报不带 → 零影响、response 新增
+   `segments_accepted`）；`publish()` / `rollback()` 在校验后自动注入 confirmed 指纹快照到
+   `rules.fingerprints`（空库时不注入，老规则逐字不变）。
+3. `app/routes/api.py` 新增 6 个接口：`POST /api/v1/adfilter/fp-feedback`（read Token 可用）、
+   管理端 `GET .../fingerprints`、`GET .../fingerprints/overview`、`POST .../rebuild`、
+   `POST .../review`、`POST .../publish`。`app/auth.py` 把 fp-feedback 加入 read-scope 写白名单。
+4. `app/config.py` 新增 `ADFILTER_FP_*` 配置（开关、桶宽、门槛、误杀阈值、下发上限、重算间隔）。
+5. `app/scheduler.py` 新增 `adfilter_fp_rebuild` 定时 job（默认每 360 分钟，可配 0 关闭）。
+6. 面板新增「广告指纹库」区块（懒加载、不进轮询）：列表 / 概览 / 重算 / 审核 / 发布。
+
+**客户端影响**：老客户端零影响（新字段是追加、无新能力位、老上报路径不变）。前端升级点、
+字段类型、状态码、时序见 `docs/ADFILTER_FINGERPRINT_CLIENT_CONTRACT.md`。
+
+升级自检：
+
+```bash
+curl -s http://<host>:8181/healthz | grep -o '"version":"[^"]*"'   # 期望 1.17.0
+curl -s -H "Authorization: Bearer <token>" \
+  "http://<host>:8181/api/v1/adfilter/admin/fingerprints/overview"  # 看 by_status / downloadable
+# 造一条带 segments 的上报后重算
+curl -s -X POST -H "Authorization: Bearer <token>" \
+  "http://<host>:8181/api/v1/adfilter/admin/fingerprints/rebuild"
+```
+
+回滚到 v1.16.7：切回旧镜像即可 —— 旧代码不读新表、不认识 `rules.fingerprints`（按未知键静默丢弃），
+两张新表与其中的数据原样保留，无害。测试：`scripts/test_v1170_fingerprint.py`（42 项全过）。
 
 ---
 

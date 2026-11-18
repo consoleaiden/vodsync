@@ -381,8 +381,14 @@ type PlayLine = {
 | 64 | GET | `/api/v1/admin/source-blocks` | 管理 | **v1.16.4** 已屏蔽源站清单 |
 | 65 | POST | `/api/v1/admin/source-blocks` | 管理 | **v1.16.4** 屏蔽 / 取消屏蔽源站（只影响面板与定时同步，客户端无感） |
 | 66 | POST | `/api/v1/star-terms/batch` | 管理 | **v1.16.4** 批量删除 / 启用 / 停用词条（上限 20000 个 id） |
+| 67 | POST | `/api/v1/adfilter/fp-feedback` | 业务 | **v1.17.0** 指纹命中/误杀回报（read Token 可用，详见 4.29） |
+| 68 | GET | `/api/v1/adfilter/admin/fingerprints` | 管理 | **v1.17.0** 指纹分页列表（可按 status/host/fp_hash 筛） |
+| 69 | GET | `/api/v1/adfilter/admin/fingerprints/overview` | 管理 | **v1.17.0** 指纹库概览统计 |
+| 70 | POST | `/api/v1/adfilter/admin/fingerprints/rebuild` | 管理 | **v1.17.0** 从片段明细重算指纹聚合 |
+| 71 | POST | `/api/v1/adfilter/admin/fingerprints/review` | 管理 | **v1.17.0** 人工审核指纹状态 |
+| 72 | POST | `/api/v1/adfilter/admin/fingerprints/publish` | 管理 | **v1.17.0** 把 confirmed 指纹发布为新规则包版本 |
 
-> 本表编号 1~66。服务端实际共 **61 paths / 69 个方法+路径**（`openapi.json` 为准，含
+> 本表编号 1~72。服务端实际共 **74 paths**（`openapi.json` 为准，含
 > `POST /api/v1/auth/logout`、`GET /healthz.capabilities` 等未单列的自解释端点）。
 > 标「管理」的主要供管理面板使用，客户端 App 只需一枚 Token（见 2.1）即可调用「数据」「业务」类接口。
 > 鉴权类中 `/api/v1/auth/login` 与 `/api/v1/auth/state` **免鉴权**，其余需登录会话 cookie（`POST /api/v1/auth/password` 等也可用 Token 访问）。
@@ -1847,6 +1853,38 @@ suspicious = reports >= min_reports
    会继续持用本地包 —— 与 stable 的版本号互不干扰是刻意设计（各渠道各发各的号）。
 3. 上报明细只增不改，**没有自动清理**：需要控制磁盘时按 `created_at` 手工归档，
    或后续用 housekeeping 加保留期；当前量级（日活 × 2 批/会话）不构成压力。
+
+### 4.29 广告指纹库（adfilter fingerprint，v1.17.0）
+
+> **完整的前端升级契约见独立文档 `docs/ADFILTER_FINGERPRINT_CLIENT_CONTRACT.md`**，
+> 本节只做摘要。服务端仍只做控制面：把客户端上报的片段结构特征跨用户聚合成「指纹」，
+> 随规则包下发；不算分片内容哈希、不代理播放流量、过滤全在客户端。
+
+**能力探测**：无新能力位，`/healthz` 仍只声明 `adfilter`。老逻辑照用。
+
+**三个变化点（均为追加，向后兼容）**：
+
+1. `POST /api/v1/adfilter/report` 的 `items[]` 新增可选 `segments[]`：
+   每项 `{index:int≥0, dur_ms:int>0, size_b:int≥0?}`，单条上报 ≤50 段。响应新增 `segments_accepted:int`。
+   老上报不带该字段 → 完全走老路径（零影响）。
+2. `GET /api/v1/adfilter/rules` 的 `rules` 内可能新增 `fingerprints[]`（库里有 confirmed 指纹才有）：
+   每项 `{fp_hash, host, dur_bucket, size_bucket, dur_bucket_ms, size_bucket_b, confidence}`。
+   客户端按 `round(dur_ms/dur_bucket_ms)` 算桶、同 host 比对命中 → 直接判广告，桶宽随包下发不要写死。
+3. 新增 `POST /api/v1/adfilter/fp-feedback`（read Token 可用）：
+   body `{fp_hash, kind:"hit"|"miss"}`；响应 `{found, fp_hash, status?, miss_count?, downloadable?}`。
+   hit 记正向证据；miss 累计达阈值（默认 5）→ 指纹自动 disabled，下次发布规则包后停发。
+   未知 fp_hash 返回 200 + `found:false`，不报错。
+
+**管理端**（需 admin，客户端不要调）：
+`GET /api/v1/adfilter/admin/fingerprints`（分页列表）、`GET .../fingerprints/overview`（概览）、
+`POST .../fingerprints/rebuild`（重算）、`POST .../fingerprints/review`（审核）、
+`POST .../fingerprints/publish`（发布指纹到规则包）。
+
+**指纹状态机**：`candidate`（样本不足）→ 达标自动 `confirmed`（可下发）→ `disabled`（人工停用/误杀）。
+已 disabled 永不自动恢复；人工审核优先于门槛。审核后必须「发布指纹到规则包」生成新版本才对客户端生效。
+
+**数据表**：新增 `adfilter_segments`（逐段明细）与 `adfilter_fingerprints`（聚合指纹），
+`init_db()` 自动建表。兼容性与回滚见 `docs/MIGRATION_NOTES.md` §2.8。
 
 ---
 

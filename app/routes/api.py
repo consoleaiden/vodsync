@@ -24,7 +24,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import bindparam, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 
-from .. import __version__, adfilter, apiresp, auth, config, database, minor_mode
+from .. import (
+    __version__, adfilter, adfilter_fp, apiresp, auth, config, database, minor_mode,
+)
 from ..models import build_vod_table, sources, sync_logs
 from ..syncer import (
     delete_custom_source,
@@ -1199,6 +1201,125 @@ def adfilter_admin_stats(
     仍然**不返回任何 url 原文**：host 是站点级标识，播放地址属于用户隐私。
     """
     return {"code": SUCCESS_CODE, **adfilter.stats(days, limit, min_reports)}
+
+
+# ---------------------------------------------------------------------------
+# 广告指纹库（v1.17.0 / Phase 2）
+#
+# 客户端：
+#   POST /api/v1/adfilter/fp-feedback     回报某指纹命中 / 误杀（read Token 可用）
+# 管理端（/api/v1/adfilter/admin/ 前缀，自动要求 admin）：
+#   GET  /api/v1/adfilter/admin/fingerprints          指纹分页列表（可按 status/host/fp_hash 筛）
+#   GET  /api/v1/adfilter/admin/fingerprints/overview 概览统计
+#   POST /api/v1/adfilter/admin/fingerprints/rebuild  从 segments 重算聚合
+#   POST /api/v1/adfilter/admin/fingerprints/review   人工审核（confirm/candidate/disabled）
+#   POST /api/v1/adfilter/admin/fingerprints/publish  把 confirmed 指纹发布为新规则包版本
+#
+# 注意：这些路径都是 /api/v1/adfilter/... 多段，不会被 /api/v1/{slug} 通配吃掉；
+# 且都放在通配路由之前。响应带 code 包装（管理端）或纯业务字段（客户端反馈）。
+# ---------------------------------------------------------------------------
+@router.post("/api/v1/adfilter/fp-feedback", summary="指纹命中/误杀反馈（v1.17.0）")
+def adfilter_fp_feedback(payload: dict = None, request: Request = None):
+    """
+    客户端回报某条指纹的命中结果（2d 反馈闭环）。read Token 即可调用。
+
+    body：`{"fp_hash": "...", "kind": "hit" | "miss"}`
+      - hit ：该指纹成功命中，run_hits++；
+      - miss：客户端认为该指纹误杀，miss_count++，累计达阈值自动 disabled。
+
+    未知 fp_hash（客户端缓存了已撤销指纹）返回 found:false，不报错。
+    """
+    if not config.ADFILTER_ENABLED:
+        raise HTTPException(status_code=404, detail="adfilter 未启用（ADFILTER_ENABLED=false）")
+    body = payload if isinstance(payload, dict) else {}
+    user_id = auth.request_identity(request)
+    wait = adfilter.check_rate(user_id)
+    if wait:
+        raise HTTPException(
+            status_code=429,
+            detail=f"反馈过于频繁，请 {wait} 秒后重试",
+            headers={"Retry-After": str(wait)},
+        )
+    try:
+        result = adfilter_fp.feedback(body.get("fp_hash", ""), body.get("kind", ""))
+    except adfilter_fp.FPError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return result
+
+
+@router.get("/api/v1/adfilter/admin/fingerprints", summary="指纹库分页列表（管理端）")
+def adfilter_admin_fingerprints(
+    status: str = Query("", description="按状态筛：candidate/confirmed/disabled，空=全部"),
+    host: str = Query("", description="按站点 host 精确筛"),
+    fp_hash: Optional[str] = Query(None, description="按 fp_hash 取单条详情"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """指纹分页列表；带 fp_hash 时只返回该条（total=1 或 0），便于面板详情。"""
+    if fp_hash:
+        row = adfilter_fp.get_fingerprint(fp_hash)
+        return {"code": SUCCESS_CODE, "total": 1 if row else 0,
+                "items": [row] if row else [], "limit": 1, "offset": 0}
+    return {"code": SUCCESS_CODE, **adfilter_fp.list_fingerprints(status, host, limit, offset)}
+
+
+@router.get("/api/v1/adfilter/admin/fingerprints/overview", summary="指纹库概览（管理端）")
+def adfilter_admin_fp_overview():
+    """各状态数量 + 累计命中/误杀 + 当前生效阈值，面板区块首屏用。"""
+    return {"code": SUCCESS_CODE, **adfilter_fp.stats()}
+
+
+@router.post("/api/v1/adfilter/admin/fingerprints/rebuild", summary="重算指纹聚合（管理端）")
+def adfilter_admin_fp_rebuild():
+    """从 segments 明细全量重算指纹（幂等，可反复调用）。人工审核过的 disabled 不受影响。"""
+    return {"code": SUCCESS_CODE, "msg": "重算完成", **adfilter_fp.rebuild()}
+
+
+@router.post("/api/v1/adfilter/admin/fingerprints/review", summary="人工审核指纹（管理端）")
+def adfilter_admin_fp_review(payload: dict = None):
+    """
+    把某条指纹设为 candidate / confirmed / disabled。
+
+    body：`{"fp_hash": "...", "status": "confirmed", "note": "人工确认"}`
+    人工 confirmed 不受样本门槛限制（运营判断优先）；disabled 是止血，永不自动恢复。
+    """
+    body = payload if isinstance(payload, dict) else {}
+    try:
+        row = adfilter_fp.review(
+            body.get("fp_hash", ""), body.get("status", ""), body.get("note", ""),
+        )
+    except adfilter_fp.FPError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"code": SUCCESS_CODE, "msg": "已更新指纹状态", "fingerprint": row}
+
+
+@router.post("/api/v1/adfilter/admin/fingerprints/publish", summary="发布指纹到规则包（管理端）")
+def adfilter_admin_fp_publish(payload: dict = None):
+    """
+    把当前 confirmed 指纹快照注入规则包，发布为新版本（版本号 +1）。
+
+    body：`{"channel": "stable", "note": "发布指纹库快照"}`（均可省略）。
+    本质是一次规则包发布，复用既有校验/版本/回滚语义 —— 客户端下次拉规则即拿到指纹。
+    """
+    body = payload if isinstance(payload, dict) else {}
+    current = adfilter.current(body.get("channel") or adfilter.DEFAULT_CHANNEL)
+    try:
+        result = adfilter.publish(
+            current["rules"],
+            body.get("channel") or adfilter.DEFAULT_CHANNEL,
+            body.get("note") or "发布指纹库快照",
+        )
+    except IntegrityError:
+        raise HTTPException(status_code=409, detail="版本号冲突（有并发发布），请重试一次")
+    fp_count = len(result["rules"].get("fingerprints") or [])
+    return {
+        "code": SUCCESS_CODE,
+        "msg": f"已发布 v{result['version']}（含 {fp_count} 条指纹）",
+        **result,
+        "fingerprint_count": fp_count,
+    }
 
 
 def _tag_stats_brief() -> dict:

@@ -377,7 +377,11 @@ _ADMIN_PREFIXES = (
 # 显式放行「非 GET 但只读 Token 也该能用」的路径（精确匹配）。
 # 上报是客户端（read Token）的正常行为，不是管理操作 —— 若按默认规则要求
 # admin，打开 TOKEN_SCOPE_ENFORCE 后所有 App 上报都会 403，功能静默失效。
-_READ_SCOPE_WRITES = frozenset({"/api/v1/adfilter/report"})
+_READ_SCOPE_WRITES = frozenset({
+    "/api/v1/adfilter/report",
+    # v1.17.0：指纹命中/误杀回报同样是客户端行为（read Token 可用），不是管理操作。
+    "/api/v1/adfilter/fp-feedback",
+})
 
 
 def requires_admin(method: str, path: str) -> bool:

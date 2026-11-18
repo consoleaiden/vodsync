@@ -233,6 +233,23 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
   避免一条脏数据直接改掉全量客户端的过滤行为。
 - 老调用方不传 `limit` / `min_reports` 时，原有的 7 个字段一字未变。
 
+#### 广告指纹库（v1.17.0，客户端升级点）
+
+服务端把「哪些片段是广告」从本地启发式升级为跨用户共享的指纹库。**仍只做控制面**，
+无新能力位（`adfilter` 即可），三个变化点都是追加字段，老客户端零影响：
+
+1. **上报带片段特征**：`POST /api/v1/adfilter/report` 的 `items[]` 每条可加 `segments[]`：
+   `{index:int≥0, dur_ms:int>0, size_b:int≥0?}`（≤50 段）。响应多一个 `segments_accepted:int`。
+   拿不到大小就省略 `size_b`。
+2. **规则包带指纹**：`rules` 内可能多出 `fingerprints[]`，每项含 `fp_hash/host/dur_bucket/
+   size_bucket/dur_bucket_ms/size_bucket_b/confidence`。本地检测片段按 `round(dur_ms/dur_bucket_ms)`
+   算桶、同 host 比对命中 → 直接判广告；桶宽随包下发，勿写死。字段可能不存在（空库/老服务端），要容灾。
+3. **命中/误杀反馈**：新增 `POST /api/v1/adfilter/fp-feedback`，body `{fp_hash, kind:"hit"|"miss"}`，
+   read Token 可用，失败静默降级。命中调 hit；用户举报且曾按指纹过滤则调 miss。
+
+完整字段类型、状态码/错误码、鉴权、调用时序、兼容性与升级 Checklist 见
+**`docs/ADFILTER_FINGERPRINT_CLIENT_CONTRACT.md`**。管理端接口见该文档 §11。
+
 ---
 
 ## 2. 接口总览
@@ -251,7 +268,8 @@ Token 来源：登录管理面板 → 右上「⚙ 设置」→ 复制 API Token
 | GET | `/api/v1/star/works` | 按明星查作品（**v1.9.2** 明星 Tab 完整作品列表） |
 | GET | `/api/v1/minor-mode` | **v1.15.0** 未成年模式状态（是否生效 / 被标记的 18+ 源站） |
 | GET | `/api/v1/adfilter/rules?version=` | **v1.16.0** 拉取去广告规则包（`changed`/`version`/`rules`，见 1.6） |
-| POST | `/api/v1/adfilter/report` | **v1.16.0** 上报过滤命中明细（幂等 + 限流，read Token 可用，见 1.6） |
+| POST | `/api/v1/adfilter/report` | **v1.16.0** 上报过滤命中明细（幂等 + 限流，read Token 可用，见 1.6）；**v1.17.0** 可选 `segments[]` |
+| POST | `/api/v1/adfilter/fp-feedback` | **v1.17.0** 指纹命中/误杀回报（read Token 可用，见 1.6） |
 | GET | `/api/v1/{slug}?ac=list\|detail` | 苹果 CMS(MacCMS) 兼容接口，现有播放器可直接对接 |
 
 ### B. 管理接口（管理端 App / 面板功能）
