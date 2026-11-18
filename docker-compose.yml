@@ -65,10 +65,10 @@ services:
       SYNC_LOG_KEEP_PER_SOURCE: "50"       # 每个源站最多保留多少条
       SYNC_LOG_MAX_ROWS: "20000"           # 全表行数上限
       # ---- 中转代理（源站直连失败时自动降级）----
-      PROXY_ENABLED: "true"
-      PROXY_URLS: "https://pz.v88.qzz.io/,https://mconfig.viptv.work/"
-      PROXY_PREF_TTL_MINUTES: "30"         # 走代理成功的源站，多久后重试直连
-      PROXY_CONCURRENCY: "4"               # 每个代理的并发上限
+      # v1.16.7 起改由管理面板「中转代理」区块配置：打开面板即可看到当前值，
+      # 保存即生效、无需重启，配置持久化在数据库 settings 表。
+      # PROXY_* 环境变量已移除；app/config.py 仍保留同名默认值作为首次启动的
+      # 初始回退（面板从未保存过时用），需要时用面板「恢复默认」即可回到该值。
       # ---- 访问控制（v1.5.0）：面板登录 + API Token ----
       AUTH_ENABLED: "true"                 # 首次启动写入数据库，之后在面板「⚙ 设置」里改
       ADMIN_PASSWORD: "666666"             # 首次启动的面板密码，登录后请改掉

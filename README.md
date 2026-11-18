@@ -418,10 +418,11 @@ curl "http://<IP>:8181/api/v1/videos?source=jkun&token=vs_xxx..."      # 不方�
 | `AUTO_RESUME_ON_BOOT` | true | 启动时自动续跑有断点的全量同步 |
 | `AUTO_RESUME_DELAY_SECONDS` | 30 | 延迟多少秒开始续跑（让服务先起来） |
 | `REQUEST_INTERVAL_SECONDS` | 0.2 | 请求间隔，防源站封禁 |
-| `PROXY_ENABLED` | true | 直连失败后是否自动走中转代理 |
-| `PROXY_URLS` | 2 个内置地址 | 中转代理列表（逗号分隔），格式 `{proxy}?url=<urlencode(目标地址)>` |
-| `PROXY_PREF_TTL_MINUTES` | 30 | "该源站需走代理"的记忆时长，到期重试直连 |
-| `PROXY_CONCURRENCY` | 4 | 每个代理的最大并发请求数 |
+| `PROXY_ENABLED` | true | 直连失败后是否自动走中转代理（**v1.16.7 起可在面板改，这里是默认值 / 回退值**） |
+| `PROXY_URLS` | 2 个内置地址 | 中转代理列表（逗号分隔），格式 `{proxy}?url=<urlencode(目标地址)>`（面板可改） |
+| `PROXY_PREF_TTL_MINUTES` | 30 | "该源站需走代理"的记忆时长，到期重试直连（面板可改） |
+| `PROXY_CONCURRENCY` | 4 | 每个代理的最大并发请求数（面板可改） |
+| `PROXY_TIMEOUT` | 20 | 走代理时的单请求超时（秒，面板可改） |
 | `DB_POOL_SIZE` | 10 | 数据库连接池常驻连接数 |
 | `DB_MAX_OVERFLOW` | 20 | 连接池峰值溢出连接数 |
 | `DB_POOL_TIMEOUT` | 10 | 等连接的秒数，超时返回 503（不是 500） |
@@ -584,6 +585,22 @@ vodsync/
 ## 变更记录
 
 > 按版本号**从新到旧**排列，最新版本在最前。历史版本只做归档记录，细节以对应版本的代码与文档为准。
+
+### v1.16.7
+**中转代理配置从 docker 环境变量搬到管理面板**：改代理地址 / 并发 / 记忆时长不再需要重启容器。
+
+- 新增 `app/proxyconf.py`：代理配置的单一读写入口，持久化在 `settings` 表（key `panel_proxy_config`）
+- 新增接口：`GET /api/v1/admin/proxy`（生效值 + 来源 + 环境变量默认值 + 运行统计）、
+  `POST /api/v1/admin/proxy`（保存，立即生效）、`POST /api/v1/admin/proxy/reset`（恢复环境变量默认）
+- 面板新增「中转代理」区块：启用开关、代理地址（每行一个）、记忆时长、并发上限、超时，
+  并展示直连/代理成功次数与已记忆主机数
+- **优先级：面板配置 > 环境变量**。面板没配过时行为与升级前完全一致（平滑升级）；
+  面板保存后立即生效，`maccms` 的并发信号量会按新上限懒重建
+- 读取带 5 秒内存快照（每个 HTTP 请求都要拿并发上限，不缓存等于每请求一次数据库往返），
+  写操作主动失效
+- `docker-compose.yml` 的 `PROXY_*` 四行已移除；`app/config.py` 保留同名默认值作为首次启动的初始回退
+  （面板从未保存过时用），面板「恢复默认」即回到该值。老部署升级后行为不变，直到有人在面板里改
+- 测试：`scripts/test_v1167_proxy_panel.py`（27 项：env 回退、持久化、非法输入收敛、reset、信号量重建、关闭代理后路由只剩直连）
 
 ### v1.14.1
 修复标签回填进度显示超过 100% 的 bug（面板截图报了 147.1%、172.6%）。

@@ -22,7 +22,7 @@ from typing import Optional
 
 import httpx
 
-from . import config
+from . import config, proxyconf
 
 log = logging.getLogger("vodsync.maccms")
 
@@ -147,7 +147,7 @@ def decode_payload(raw: bytes, content_type: str = "") -> dict:
 # ---------------------------------------------------------------------------
 _proxy_pref: dict = {}          # host -> (proxy_base, 记录时间戳)
 _pref_lock = threading.Lock()
-_proxy_sems: dict = {}          # proxy_base -> Semaphore
+_proxy_sems: dict = {}          # proxy_base -> (Semaphore, 该信号量的并发上限)
 _sem_lock = threading.Lock()
 _proxy_stats = {"direct_success": 0, "proxy_success": 0, "route_fail": 0}
 _stats_lock = threading.Lock()
@@ -160,11 +160,22 @@ def wrap_proxy(proxy_base: str, target: str) -> str:
 
 
 def _proxy_semaphore(proxy_base: str) -> threading.Semaphore:
+    """
+    返回该代理的信号量。
+
+    并发上限现在可以在管理面板实时改（proxyconf），所以这里按「当前配置值」
+    懒重建：面板改了并发数，下一次请求就会换用新容量的信号量。旧信号量若仍
+    被在途请求持有，会自然释放后丢弃，不影响正确性。
+    """
+    cap = max(1, proxyconf.get()["concurrency"])
     with _sem_lock:
-        sem = _proxy_sems.get(proxy_base)
-        if sem is None:
-            sem = threading.Semaphore(max(1, config.PROXY_CONCURRENCY))
-            _proxy_sems[proxy_base] = sem
+        item = _proxy_sems.get(proxy_base)
+        if item is not None and item[1] == cap:
+            return item[0]
+        if item is not None:
+            log.info("[proxy] 并发上限 %s -> %s，重建 %s 的信号量", item[1], cap, proxy_base)
+        sem = threading.Semaphore(cap)
+        _proxy_sems[proxy_base] = (sem, cap)
         return sem
 
 
@@ -175,7 +186,7 @@ def get_proxy_pref(host: str) -> str:
     if not item:
         return ""
     base, ts = item
-    if time.time() - ts > config.PROXY_PREF_TTL_MINUTES * 60:
+    if time.time() - ts > proxyconf.get()["pref_ttl_minutes"] * 60:
         with _pref_lock:
             _proxy_pref.pop(host, None)
         log.info("[proxy] %s 的代理记忆已过期，恢复直连优先", host)
@@ -202,9 +213,14 @@ def proxy_snapshot() -> dict:
         }
     with _stats_lock:
         stats = dict(_proxy_stats)
+    conf = proxyconf.get()
     return {
-        "enabled": config.PROXY_ENABLED,
-        "urls": list(config.PROXY_URLS),
+        "enabled": conf["enabled"],
+        "urls": list(conf["urls"]),
+        "pref_ttl_minutes": conf["pref_ttl_minutes"],
+        "concurrency": conf["concurrency"],
+        "timeout": conf["timeout"],
+        "source": proxyconf.source(),
         "preferred_hosts": pref,
         **stats,
     }
@@ -239,7 +255,8 @@ class MacCmsClient:
     # ------------------------------------------------------------------
     def _routes(self, host: str) -> list:
         """返回按优先级排列的路由列表：[(kind, proxy_base)]，kind ∈ direct/proxy。"""
-        proxies = list(config.PROXY_URLS) if (config.PROXY_ENABLED and config.PROXY_URLS) else []
+        conf = proxyconf.get()
+        proxies = list(conf["urls"]) if (conf["enabled"] and conf["urls"]) else []
         pref = get_proxy_pref(host) if proxies else ""
         routes = []
         if pref:
@@ -274,7 +291,7 @@ class MacCmsClient:
                 _bump("proxy_success")
                 if get_proxy_pref(host) != base:
                     log.info("[%s] 直连不可用，已切换代理: %s（记忆 %d 分钟）",
-                             host, base, config.PROXY_PREF_TTL_MINUTES)
+                             host, base, proxyconf.get()["pref_ttl_minutes"])
                 set_proxy_pref(host, base)
             else:
                 _bump("direct_success")
@@ -284,17 +301,19 @@ class MacCmsClient:
             return data
 
         _bump("route_fail")
+        _conf = proxyconf.get()
         raise MacCmsError(
-            f"全部路由均失败（直连 + {len(config.PROXY_URLS) if config.PROXY_ENABLED else 0} 个代理）: "
+            f"全部路由均失败（直连 + {len(_conf['urls']) if _conf['enabled'] else 0} 个代理）: "
             + " | ".join(errors)
         )
 
     def _request(self, url: str, kind: str, proxy_base: str) -> dict:
         """在指定路由上请求（含重试与限速）。"""
         target = url if kind == "direct" else wrap_proxy(proxy_base, url)
-        timeout = self.timeout if kind == "direct" else min(self.timeout, config.PROXY_TIMEOUT)
+        timeout = self.timeout if kind == "direct" else min(self.timeout, proxyconf.get()["timeout"])
         sem = _proxy_semaphore(proxy_base) if kind == "proxy" else None
-        has_alt_route = bool(config.PROXY_ENABLED and config.PROXY_URLS) or bool(proxy_base)
+        _conf = proxyconf.get()
+        has_alt_route = bool(_conf["enabled"] and _conf["urls"]) or bool(proxy_base)
         last_err: Optional[Exception] = None
         # retries 语义是「总尝试次数」，必须至少 1 次。
         # 原来的写法 range(1, self.retries + 1) 在 retries=0 时循环体一次都不进，

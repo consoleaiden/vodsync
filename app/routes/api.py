@@ -2013,6 +2013,95 @@ def admin_scheduler_reschedule(job_id: str, body: dict):
     return {"code": SUCCESS_CODE, "ok": True}
 
 
+# ---------------------------------------------------------------------------
+# 中转代理配置（v1.16.7）
+#
+# 原先 PROXY_ENABLED / PROXY_URLS / PROXY_PREF_TTL_MINUTES / PROXY_CONCURRENCY
+# 只能写在 docker-compose 里，改一次要重启容器。现在面板可改、立即生效，
+# 持久化在 settings 表；面板没配过就完全按环境变量走（平滑升级）。
+# ---------------------------------------------------------------------------
+@router.get("/api/v1/admin/proxy", summary="中转代理配置（管理端）")
+def admin_get_proxy():
+    """生效配置 + 来源（panel/env）+ 环境变量默认值 + 运行统计。"""
+    from .. import proxyconf
+    from ..maccms import proxy_snapshot
+
+    snap = proxy_snapshot()
+    return {
+        "code": SUCCESS_CODE,
+        **proxyconf.get(refresh=True),
+        "source": proxyconf.source(),
+        "env_default": proxyconf.env_default(),
+        "stats": {
+            "direct_success": snap.get("direct_success", 0),
+            "proxy_success": snap.get("proxy_success", 0),
+            "route_fail": snap.get("route_fail", 0),
+            "preferred_hosts": len(snap.get("preferred_hosts") or {}),
+        },
+    }
+
+
+@router.post("/api/v1/admin/proxy", summary="保存中转代理配置（管理端，立即生效）")
+def admin_set_proxy(payload: dict):
+    """
+    整体替换面板代理配置。字段：
+
+    - `enabled`（bool）
+    - `urls`（数组或逗号分隔字符串；每项须 http/https，最多 8 个）
+    - `pref_ttl_minutes`（0~10080，0 = 不记忆，每次先试直连）
+    - `concurrency`（1~32，每个代理的并发上限）
+    - `timeout`（1~120 秒，走代理的单请求超时）
+
+    非法字段直接 400；合法值写入后立即生效（无需重启）。
+    """
+    from .. import proxyconf
+
+    body = payload or {}
+    if not isinstance(body.get("enabled"), bool):
+        raise HTTPException(status_code=400, detail="enabled 必须是 true / false")
+
+    raw_urls = body.get("urls", [])
+    if isinstance(raw_urls, str):
+        raw_urls = [u.strip() for u in raw_urls.split(",")]
+    if not isinstance(raw_urls, list):
+        raise HTTPException(status_code=400, detail="urls 必须是数组或逗号分隔字符串")
+    urls = [str(u).strip() for u in raw_urls if str(u or "").strip()]
+    if len(urls) > proxyconf.MAX_URLS:
+        raise HTTPException(status_code=400, detail=f"代理地址最多 {proxyconf.MAX_URLS} 个")
+    for u in urls:
+        if not u.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail=f"代理地址必须是 http/https：{u}")
+
+    for key, (lo, hi) in (("pref_ttl_minutes", proxyconf.TTL_RANGE),
+                          ("concurrency", proxyconf.CONCURRENCY_RANGE),
+                          ("timeout", proxyconf.TIMEOUT_RANGE)):
+        if key not in body:
+            raise HTTPException(status_code=400, detail=f"缺少字段 {key}")
+        v = body[key]
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise HTTPException(status_code=400, detail=f"{key} 必须是数字")
+        if not (lo <= int(v) <= hi):
+            raise HTTPException(status_code=400, detail=f"{key} 需在 {lo}~{hi} 之间")
+
+    clean = proxyconf.set_config({
+        "enabled": body["enabled"],
+        "urls": urls,
+        "pref_ttl_minutes": int(body["pref_ttl_minutes"]),
+        "concurrency": int(body["concurrency"]),
+        "timeout": int(body["timeout"]),
+    })
+    return {"code": SUCCESS_CODE, "msg": "代理配置已保存并生效", **clean, "source": "panel"}
+
+
+@router.post("/api/v1/admin/proxy/reset", summary="恢复环境变量默认代理配置（管理端）")
+def admin_reset_proxy():
+    """删除面板配置，回到 docker-compose / 环境变量的默认值。"""
+    from .. import proxyconf
+
+    clean = proxyconf.reset()
+    return {"code": SUCCESS_CODE, "msg": "已恢复环境变量默认值", **clean, "source": "env"}
+
+
 @router.get("/api/v1/admin/tables/{name}/rows")
 def admin_browse_table(
     name: str,

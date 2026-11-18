@@ -77,13 +77,29 @@ def free_port() -> int:
 
 
 def main():
-    from app import config
+    # v1.16.7：代理配置改为面板持久化（proxyconf），不再能靠改 config 常量生效。
+    # 这里用临时 SQLite 承接 settings 表，跑完恢复环境变量默认值。
+    import tempfile
+
+    os.environ["DATABASE_URL"] = f"sqlite:///./{os.path.join(tempfile.gettempdir(), '_v140_proxy_panel.db')}"
+    if os.path.exists(os.environ["DATABASE_URL"].split(":///./", 1)[1]):
+        os.remove(os.environ["DATABASE_URL"].split(":///./", 1)[1])
+
+    from app import config, database, proxyconf
     from app.maccms import MacCmsClient, MacCmsError, get_proxy_pref, set_proxy_pref, wrap_proxy
     from app.routes.api import compute_progress, _is_synced
 
+    database.init_db()
+
+    def cfg(enabled=True, urls=(), ttl=30, conc=2, timeout=20):
+        proxyconf.set_config({
+            "enabled": enabled, "urls": list(urls),
+            "pref_ttl_minutes": ttl, "concurrency": conc, "timeout": timeout,
+        })
+
     # 测试期间提速：无间隔、短重试
     config.REQUEST_INTERVAL_SECONDS = 0.0
-    config.PROXY_CONCURRENCY = 2
+    cfg(conc=2)
 
     target = "https://api.example.com/api.php/provide/vod?ac=list&pg=1"
 
@@ -96,8 +112,8 @@ def main():
     # 2) 直连不可达 → 代理成功
     proxy_srv = start_stub("ok")
     proxy_base = f"http://127.0.0.1:{proxy_srv.server_address[1]}/"   # 形如 .../?url=
-    config.PROXY_ENABLED = True
-    config.PROXY_URLS = [proxy_base]
+    proxy_norm = proxy_base.rstrip("/")   # proxyconf 会归一化掉尾斜杠，比较时用归一化值
+    cfg(enabled=True, urls=[proxy_base])
 
     dead_host = f"127.0.0.1:{free_port()}"
     dead_url = f"http://{dead_host}/api.php/provide/vod?ac=list&pg=1"
@@ -106,11 +122,11 @@ def main():
         data = client._get_json(dead_url)
         check("直连不可达时经代理取到数据", data.get("code") == 1, str(data)[:80])
         check("代理收到 url 参数（已编码目标地址）", "url=" in proxy_srv.last_path, proxy_srv.last_path[:120])
-        check("已记忆该源站走代理", get_proxy_pref(dead_host) == proxy_base, get_proxy_pref(dead_host))
+        check("已记忆该源站走代理", get_proxy_pref(dead_host) == proxy_norm, get_proxy_pref(dead_host))
 
         # 5) 记忆后路由顺序：代理优先
         routes = client._routes(dead_host)
-        check("路由顺序为 代理→直连", routes[0] == ("proxy", proxy_base) and routes[1][0] == "direct", str(routes))
+        check("路由顺序为 代理→直连", routes[0] == ("proxy", proxy_norm) and routes[1][0] == "direct", str(routes))
     finally:
         client.close()
         proxy_srv.shutdown()
@@ -118,7 +134,7 @@ def main():
     # 3) 直连 403 → 立即切代理
     forbid_srv = start_stub("403")
     proxy_srv2 = start_stub("ok")
-    config.PROXY_URLS = [f"http://127.0.0.1:{proxy_srv2.server_address[1]}/"]
+    cfg(enabled=True, urls=[f"http://127.0.0.1:{proxy_srv2.server_address[1]}/"])
     forbid_host = f"127.0.0.1:{forbid_srv.server_address[1]}"
     forbid_url = f"http://{forbid_host}/api.php/provide/vod?ac=list&pg=1"
     client = MacCmsClient(timeout=3, retries=3)
@@ -134,8 +150,7 @@ def main():
         proxy_srv2.shutdown()
 
     # 4) 代理关闭 → 直连失败直接报错
-    config.PROXY_ENABLED = False
-    config.PROXY_URLS = []
+    cfg(enabled=False, urls=[])
     client = MacCmsClient(timeout=2, retries=1)
     try:
         try:
@@ -147,15 +162,13 @@ def main():
         client.close()
 
     # 6) 记忆过期恢复直连
-    config.PROXY_ENABLED = True
-    config.PROXY_URLS = ["https://pz.v88.qzz.io/"]
-    config.PROXY_PREF_TTL_MINUTES = 30
+    cfg(enabled=True, urls=["https://pz.v88.qzz.io"], ttl=30)
     set_proxy_pref("ttl.example.com", "https://pz.v88.qzz.io/")
     check("TTL 内记忆生效", get_proxy_pref("ttl.example.com") == "https://pz.v88.qzz.io/")
-    config.PROXY_PREF_TTL_MINUTES = 0            # 立即过期
+    cfg(ttl=0)                                   # 立即过期
     time.sleep(0.05)
     check("TTL 过期后恢复直连", get_proxy_pref("ttl.example.com") == "")
-    config.PROXY_PREF_TTL_MINUTES = 30
+    cfg(ttl=30)
 
     # 7) 进度口径
     never = {"watermark": "", "total_videos": 0, "last_page": 0, "total_pages": 0}
@@ -179,6 +192,11 @@ def main():
     check("有断点 → synced=true", _is_synced(only_break) is True)
 
     print(f"\n结果: {passed} 通过, {failed} 失败")
+    proxyconf.reset()          # 恢复环境变量默认值，避免污染后续用例
+    try:
+        os.remove(os.environ["DATABASE_URL"].split(":///./", 1)[1])
+    except OSError:
+        pass
     return 1 if failed else 0
 
 

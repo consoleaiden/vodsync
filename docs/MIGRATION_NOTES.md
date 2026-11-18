@@ -335,6 +335,66 @@ curl -s -H "X-API-Key: <token>" "http://<host>:8181/api/v1/admin/tables"
 
 ---
 
+## 2.7 v1.16.7：中转代理配置搬到管理面板（2026-11-18）
+
+**数据库变更：无**。不建表、不加列、不改索引、不回填。唯一落库的写入是 `settings`
+表里新增一个 key `panel_proxy_config`（JSON，整份代理配置）：
+
+```json
+{"enabled": true, "urls": ["https://pz.v88.qzz.io", "https://mconfig.viptv.work"],
+ "pref_ttl_minutes": 30, "concurrency": 4, "timeout": 20}
+```
+
+`settings` 表早已存在（存密码哈希 / Token / `panel_blocked_sources` 等），本 key 与它们同级。
+
+**配置位置迁移**：`docker-compose.yml` 里原来的 4 行
+
+```yaml
+PROXY_ENABLED: "true"
+PROXY_URLS: "https://pz.v88.qzz.io/,https://mconfig.viptv.work/"
+PROXY_PREF_TTL_MINUTES: "30"
+PROXY_CONCURRENCY: "4"
+```
+
+**已删除**。现在改代理地址 / 并发 / 记忆时长 / 超时 / 开关都在面板「中转代理」区块完成，
+保存即生效、无需重启，且持久化在数据库。
+
+**回退与平滑升级**：`app/config.py` 保留同名 `PROXY_*` 默认值作为首次启动的初始回退 ——
+面板从未保存过时（`settings` 无该 key）生效值与升级前完全一致，老部署升级后行为不变，
+直到有人在面板里点保存。面板「恢复默认」会删掉该 key，回到 `app/config.py` 的默认值。
+
+代码变更：
+
+1. 新增 `app/proxyconf.py`：代理配置的单一读写入口。`get()` 生效值（**面板 > 环境变量**，
+   逐字段合并）、`source()` 来源、`env_default()` 环境变量默认、`set_config()` / `reset()`。
+   读带 5 秒内存快照（`maccms` 每个 HTTP 请求都要拿并发上限，不缓存等于每请求一次库往返），
+   写主动失效；URL 归一化去尾斜杠，非法字段回落到默认值。
+2. `app/maccms.py`：并发信号量上限、代理偏好 TTL、代理列表、单请求超时全部从写死的
+   `config.PROXY_*` 改为运行时读 `proxyconf.get()`。并发上限变化时按新值懒重建信号量。
+3. 新增 3 个管理端接口：`GET /api/v1/admin/proxy`（生效值 + 来源 + env 默认 + 运行统计）、
+   `POST /api/v1/admin/proxy`（保存，立即生效）、`POST /api/v1/admin/proxy/reset`（恢复默认）。
+4. 面板新增「中转代理」区块（懒加载）：启用开关、代理地址（每行一个）、记忆时长、并发上限、
+   超时，并展示直连/代理成功次数与已记忆主机数；接入统一 `SEC_DEFS` 折叠与刷新。
+
+**客户端零影响**：中转代理是服务端同步行为，App 调用的接口路径、字段、状态码都不变。
+
+升级自检：
+
+```bash
+curl -s http://<host>:8181/healthz | grep -o '"version":"[^"]*"'   # 期望 1.16.7
+curl -s -H "Authorization: Bearer <token>" "http://<host>:8181/api/v1/admin/proxy"
+# source=env 表示尚未在面板保存（用 config.py 默认），来源可切换到 panel
+curl -s -X POST -H "Authorization: Bearer <token>" -H 'Content-Type: application/json' \
+  -d '{"enabled":true,"urls":["https://x.example"],"pref_ttl_minutes":30,"concurrency":4,"timeout":20}' \
+  "http://<host>:8181/api/v1/admin/proxy"   # 保存后立即生效，source 变 panel
+```
+
+回滚到 v1.16.6：`settings.panel_proxy_config` 变成无人读取的孤立行，无害；同时把
+`docker-compose.yml` 的 4 行 `PROXY_*` 加回去即可恢复原行为（旧代码只读环境变量）。
+彻底清理：`DELETE FROM settings WHERE key = 'panel_proxy_config';`
+
+---
+
 ## 3. 回填（把存量数据灌进 `video_tags`）
 
 **正常情况什么都不用做**：`TAG_INDEX_ON_STARTUP=true`（默认）时，服务启动会检查索引，

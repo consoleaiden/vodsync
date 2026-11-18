@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.16.6"
+    "version": "1.16.7"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -2048,6 +2048,77 @@
                 "schema": {
                   "$ref": "#/components/schemas/HTTPValidationError"
                 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/proxy": {
+      "get": {
+        "summary": "中转代理配置（管理端）",
+        "description": "生效配置 + 来源（panel/env）+ 环境变量默认值 + 运行统计。",
+        "operationId": "admin_get_proxy_api_v1_admin_proxy_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "保存中转代理配置（管理端，立即生效）",
+        "description": "整体替换面板代理配置。字段：\n\n- `enabled`（bool）\n- `urls`（数组或逗号分隔字符串；每项须 http/https，最多 8 个）\n- `pref_ttl_minutes`（0~10080，0 = 不记忆，每次先试直连）\n- `concurrency`（1~32，每个代理的并发上限）\n- `timeout`（1~120 秒，走代理的单请求超时）\n\n非法字段直接 400；合法值写入后立即生效（无需重启）。",
+        "operationId": "admin_set_proxy_api_v1_admin_proxy_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/proxy/reset": {
+      "post": {
+        "summary": "恢复环境变量默认代理配置（管理端）",
+        "description": "删除面板配置，回到 docker-compose / 环境变量的默认值。",
+        "operationId": "admin_reset_proxy_api_v1_admin_proxy_reset_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
               }
             }
           }

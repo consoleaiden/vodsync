@@ -2193,8 +2193,9 @@ func fetchVideos(source: String, page: Int = 1) async throws -> VideoList {
 | `SOURCE_SYNC_CONCURRENCY` / `PAGE_CONCURRENCY` | 2 / 4 | 同步并发度（前者是全局并发闸门，超出排队） |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` / `DB_POOL_TIMEOUT` | 10 / 20 / 10 | 连接池大小与等连接超时（超时接口返回 503） |
 | `SEARCH_CONCURRENCY` | 4 | 聚合搜索并行度 |
-| `PROXY_ENABLED` / `PROXY_URLS` | true / 2 个内置代理 | 直连失败后自动走中转代理（`{proxy}?url=<urlencode(目标)>`） |
-| `PROXY_PREF_TTL_MINUTES` | 30 | "该源站需走代理"的记忆时长 |
+| `PROXY_ENABLED` / `PROXY_URLS` | true / 2 个内置代理 | 直连失败后自动走中转代理（`{proxy}?url=<urlencode(目标)>`）。**v1.16.7 起可在面板改**，此处为默认值 / 回退值 |
+| `PROXY_PREF_TTL_MINUTES` | 30 | "该源站需走代理"的记忆时长（面板可改） |
+| `PROXY_CONCURRENCY` / `PROXY_TIMEOUT` | 4 / 20 | 每代理并发上限、走代理的单请求超时（面板可改） |
 | `MERGE_MAX_PER_TABLE` / `MERGE_CONCURRENCY` | 3000 / 4 | 多源列表归并：每表最多取多少行、并行度 |
 | `TOTAL_APPROXIMATE_ENABLED` | true | v1.10.0：无筛选列表的 `total` 用 `SUM(sources.total_videos)` 估值（省 52 次 count），响应带 `total_approximate` |
 | `CATEGORIES_CACHE_SECONDS` | 300 | v1.10.0：`/api/v1/categories` 结果缓存秒数 |

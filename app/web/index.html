@@ -449,6 +449,20 @@
     </div>
   </section>
 
+  <!-- 中转代理（v1.16.7）：原 docker-compose 环境变量搬进面板，保存即生效 -->
+  <section class="panel" id="proxyPanel">
+    <div class="head">
+      <h2>中转代理</h2>
+      <span class="hint">源站直连失败时自动降级到中转代理；配置持久化在数据库，保存后立即生效，无需重启</span>
+      <span style="flex:1"></span>
+      <button class="sm" id="proxyReload" title="重新读取当前生效配置">↻ 刷新</button>
+      <button class="sm" id="proxyToggle" title="折叠 / 展开本区块（首次展开才加载数据）">展开 ▾</button>
+    </div>
+    <div id="proxyWrap" style="display:none">
+      <div class="body" id="proxyBody"><div class="empty">展开时加载配置…</div></div>
+    </div>
+  </section>
+
   <!-- 源站列表 -->
   <section class="panel">
     <div class="head">
@@ -2270,6 +2284,102 @@ $("#schedBody").addEventListener("click", async (e) => {
 });
 $("#schedReload").addEventListener("click", loadScheduler);
 
+// ---------------- 中转代理（v1.16.7） ----------------
+// 配置原先只能写在 docker-compose 的环境变量里（改一次要重启容器），
+// 现在持久化在 settings 表，保存后立即生效。没配过就按环境变量走。
+async function loadProxy() {
+  const box = $("#proxyBody");
+  if (!box) return null;
+  try {
+    const r = await api("/api/v1/admin/proxy");
+    const fromPanel = r.source === "panel";
+    const srcBadge = fromPanel
+      ? '<span class="badge ok">面板配置</span>'
+      : '<span class="badge mute">环境变量默认</span>';
+    const envLine = (r.env_default.urls || []).join("、") || "（无）";
+    const stat = r.stats || {};
+    box.innerHTML = `
+      <div class="row" style="align-items:center;gap:10px;margin-bottom:12px">
+        <label class="switch" style="font-size:13px">
+          <input type="checkbox" id="pxEnabled" ${r.enabled ? "checked" : ""}> 启用中转代理
+        </label>
+        ${srcBadge}
+        <span style="flex:1"></span>
+        <span class="muted" style="font-size:12px">
+          直连成功 <b>${fmtNum(stat.direct_success || 0)}</b> ·
+          代理成功 <b>${fmtNum(stat.proxy_success || 0)}</b> ·
+          路由失败 <b>${fmtNum(stat.route_fail || 0)}</b> ·
+          已记忆主机 <b>${fmtNum(stat.preferred_hosts || 0)}</b>
+        </span>
+      </div>
+      <div style="display:grid;gap:12px">
+        <label style="font-size:12px;color:var(--muted)">代理地址（每行一个，格式 <code>{proxy}?url=&lt;urlencode(目标)&gt;</code>）
+          <textarea id="pxUrls" rows="3" style="${INPUT_CSS};font-family:ui-monospace,Menlo,Consolas,monospace;margin-top:4px">${esc((r.urls || []).join("\n"))}</textarea>
+        </label>
+        <div style="display:flex;gap:14px;flex-wrap:wrap">
+          <label style="font-size:12px;color:var(--muted)">代理记忆时长（分钟，0 = 每次先试直连）
+            <input id="pxTtl" type="number" min="0" max="10080" value="${Number(r.pref_ttl_minutes) || 0}"
+                   style="${INPUT_CSS};margin-top:4px;width:150px"></label>
+          <label style="font-size:12px;color:var(--muted)">每代理并发上限
+            <input id="pxConc" type="number" min="1" max="32" value="${Number(r.concurrency) || 1}"
+                   style="${INPUT_CSS};margin-top:4px;width:110px"></label>
+          <label style="font-size:12px;color:var(--muted)">代理超时（秒）
+            <input id="pxTimeout" type="number" min="1" max="120" value="${Number(r.timeout) || 20}"
+                   style="${INPUT_CSS};margin-top:4px;width:110px"></label>
+        </div>
+        <div class="muted" style="font-size:12px;line-height:1.75">
+          直连优先，失败按顺序切代理；某源站走代理成功后记住一段时间，期间直接走代理，到期重试直连。
+          环境变量默认值：<code>${esc(envLine)}</code>（启用 ${r.env_default.enabled ? "是" : "否"} /
+          记忆 ${r.env_default.pref_ttl_minutes} 分 / 并发 ${r.env_default.concurrency} / 超时 ${r.env_default.timeout} 秒）
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="primary" id="pxSave">保存并生效</button>
+          <button class="sm" id="pxReset" ${fromPanel ? "" : "disabled"}>恢复环境变量默认</button>
+          <span id="pxMsg" style="font-size:12px"></span>
+        </div>
+      </div>`;
+
+    box.querySelector("#pxSave").addEventListener("click", async () => {
+      const msg = box.querySelector("#pxMsg");
+      const urls = box.querySelector("#pxUrls").value
+        .split("\n").map((s) => s.trim()).filter(Boolean);
+      const payload = {
+        enabled: box.querySelector("#pxEnabled").checked,
+        urls,
+        pref_ttl_minutes: parseInt(box.querySelector("#pxTtl").value, 10),
+        concurrency: parseInt(box.querySelector("#pxConc").value, 10),
+        timeout: parseInt(box.querySelector("#pxTimeout").value, 10),
+      };
+      try {
+        const res = await _jsonPost("/api/v1/admin/proxy", payload);
+        msg.textContent = res.msg || "已保存";
+        msg.style.color = "#2e7d32";
+        toast("代理配置已保存并生效");
+        await loadProxy();
+      } catch (e) {
+        msg.textContent = "保存失败：" + e.message;
+        msg.style.color = "#c62828";
+      }
+    });
+
+    box.querySelector("#pxReset").addEventListener("click", async () => {
+      if (!confirm("确定恢复为环境变量里的默认代理配置？面板配置将被清除。")) return;
+      try {
+        await _jsonPost("/api/v1/admin/proxy/reset", {});
+        toast("已恢复环境变量默认值");
+        await loadProxy();
+      } catch (e) {
+        toast("操作失败：" + e.message, true);
+      }
+    });
+    return r;
+  } catch (e) {
+    box.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+    return null;
+  }
+}
+$("#proxyReload").addEventListener("click", loadProxy);
+
 // ---------------- 去广告规则包（v1.16.0） ----------------
 // 只做控制面：读当前规则 / 编辑后发布 / 回滚 / 看上报量。过滤本身在客户端执行。
 let adState = { channel: "stable", current: 0, packs: [] };
@@ -2481,6 +2591,8 @@ const SEC_DEFS = {
   logs:    { btn: "#logsToggle",    wrap: "#logsWrap",    load: () => loadLogs() },
   // v1.16.5：计划任务不进轮询（状态变化很少），只在展开时加载一次 + 手动刷新
   scheduler: { btn: "#schedToggle", wrap: "#schedWrap", load: () => loadScheduler() },
+  // v1.16.7：代理配置不进轮询（改配置不该被自动刷新顶掉），只在展开时加载一次
+  proxy:    { btn: "#proxyToggle", wrap: "#proxyWrap", load: () => loadProxy() },
   // v1.16.0：规则包不进轮询（编辑到一半被刷新顶掉最烦），只在展开时加载一次
   adfilter: { btn: "#adfilterToggle", wrap: "#adfilterWrap", load: () => adLoad() },
 };
