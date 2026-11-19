@@ -1297,6 +1297,27 @@ def adfilter_admin_fp_review(payload: dict = None):
     return {"code": SUCCESS_CODE, "msg": "已更新指纹状态", "fingerprint": row}
 
 
+@router.delete("/api/v1/adfilter/admin/fingerprints/{fp_hash}", summary="彻底删除指纹（管理端，v1.17.5）")
+def adfilter_admin_fp_delete(fp_hash: str):
+    """
+    物理删除一条指纹：同时删聚合表与上报明细，避免 rebuild 后复活。
+
+    删除后如需立即从客户端规则包移除，再调一次 publish 发布新快照。
+    """
+    try:
+        result = adfilter_fp.delete_fingerprint(fp_hash)
+    except adfilter_fp.FPError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {
+        "code": SUCCESS_CODE,
+        "msg": (f"已删除指纹（聚合 {result['deleted_fingerprints']} 条 / "
+                f"明细 {result['deleted_segments']} 条），重新发布规则包后对客户端生效"),
+        **result,
+    }
+
+
 @router.post("/api/v1/adfilter/admin/fingerprints/publish", summary="发布指纹到规则包（管理端）")
 def adfilter_admin_fp_publish(payload: dict = None):
     """

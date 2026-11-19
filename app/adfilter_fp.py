@@ -603,6 +603,48 @@ def review(fp_hash: str, status: str, note: str = "") -> dict:
     return get_fingerprint(fp_hash)
 
 
+def delete_fingerprint(fp_hash: str) -> dict:
+    """
+    彻底删除一条指纹（管理端，v1.17.5）。
+
+    与 review(disabled) 的区别：disabled 只是「止血、停止下发」，记录仍在库中、
+    面板仍可见、还占着统计口径；delete 是物理删除，记录从面板消失。
+
+    **必须同时删两张表**：
+      - adfilter_fingerprints：聚合实体（面板列表读它）；
+      - adfilter_segments：上报明细（rebuild 的数据源）。
+    只删聚合表的话，下次 rebuild() 会从 segments 明细把这条指纹重新生成出来，
+    用户看到「删了又回来」。两表放在同一个 write_txn 事务里，保证原子性。
+
+    不存在的 fp_hash 抛 LookupError（路由层映射 404）。
+    返回 {"fp_hash": ..., "deleted_fingerprints": n, "deleted_segments": m}。
+    注意：规则包是快照，删除后需另行 publish 才会从下发包里移除（面板有提示）。
+    """
+    fp_hash = (fp_hash or "").strip().lower()
+    if not fp_hash:
+        raise FPError("fp_hash 不能为空", "fp_hash")
+    with database.write_txn() as conn:
+        row = conn.execute(
+            select(adfilter_fingerprints.c.id)
+            .where(adfilter_fingerprints.c.fp_hash == fp_hash)
+        ).first()
+        if row is None:
+            raise LookupError(f"不存在指纹 {fp_hash}")
+        deleted_segments = conn.execute(
+            adfilter_segments.delete().where(adfilter_segments.c.fp_hash == fp_hash)
+        ).rowcount
+        deleted_fingerprints = conn.execute(
+            adfilter_fingerprints.delete().where(adfilter_fingerprints.c.fp_hash == fp_hash)
+        ).rowcount
+    log.info("[adfilter_fp] 删除指纹 %s…: 聚合 %d 行 / 明细 %d 行",
+             fp_hash[:12], deleted_fingerprints, deleted_segments)
+    return {
+        "fp_hash": fp_hash,
+        "deleted_fingerprints": int(deleted_fingerprints or 0),
+        "deleted_segments": int(deleted_segments or 0),
+    }
+
+
 def stats() -> dict:
     """指纹库概览（管理端面板用）：各状态数量 + 累计命中/误杀。"""
     with database.engine.connect() as conn:

@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.17.4"
+    "version": "1.17.5"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -1160,6 +1160,44 @@
             }
           }
         },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adfilter/admin/fingerprints/{fp_hash}": {
+      "delete": {
+        "summary": "彻底删除指纹（管理端，v1.17.5）",
+        "description": "物理删除一条指纹：同时删聚合表与上报明细，避免 rebuild 后复活。\n\n删除后如需立即从客户端规则包移除，再调一次 publish 发布新快照。",
+        "operationId": "adfilter_admin_fp_delete_api_v1_adfilter_admin_fingerprints__fp_hash__delete",
+        "parameters": [
+          {
+            "name": "fp_hash",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Fp Hash"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",

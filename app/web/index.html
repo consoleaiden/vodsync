@@ -2665,6 +2665,7 @@ function renderFpList(data) {
           <button class="sm" data-fp-act="confirmed" data-hash="${esc(r.fp_hash)}" title="人工确认并下发">确认</button>
           <button class="sm warn" data-fp-act="disabled" data-hash="${esc(r.fp_hash)}" title="止血：停用且不再下发">停用</button>
           <button class="sm" data-fp-act="candidate" data-hash="${esc(r.fp_hash)}" title="退回样本不足">退回</button>
+          <button class="sm danger" data-fp-act="delete" data-hash="${esc(r.fp_hash)}" title="物理删除指纹及上报明细，不可恢复">删除</button>
         </td></tr>`;
     }).join("")}</tbody></table>`;
 }
@@ -2730,6 +2731,24 @@ $("#fpList").addEventListener("click", async (ev) => {
   if (!btn) return;
   const status = btn.dataset.fpAct;
   const fpHash = btn.dataset.hash;
+
+  // 物理删除（v1.17.5）：不可恢复，独立确认文案 + DELETE 接口
+  if (status === "delete") {
+    if (!confirm(`⚠️ 确认永久删除指纹 ${fpHash.slice(0, 10)}…？\n\n将同时删除指纹记录和全部上报明细，此操作不可恢复。\n删除后需重新发布规则包，客户端才会移除该指纹。`)) return;
+    btn.disabled = true;
+    try {
+      const res = await api("/api/v1/adfilter/admin/fingerprints/" + encodeURIComponent(fpHash), {
+        method: "DELETE",
+      });
+      toast(res.msg || "已删除指纹");
+      await fpLoad();
+      if (typeof adLoad === "function") await adLoad();  // 规则包可能含该指纹，同步刷新
+    } catch (e) {
+      toast("删除失败：" + e.message, true);
+    } finally { btn.disabled = false; }
+    return;
+  }
+
   const labels = { confirmed: "确认下发", disabled: "停用止血", candidate: "退回样本不足" };
   if (!confirm(`确认将指纹 ${fpHash.slice(0, 10)}… 设为「${labels[status]}」？\n发布规则包后对客户端生效。`)) return;
   btn.disabled = true;
