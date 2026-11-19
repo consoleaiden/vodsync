@@ -282,7 +282,8 @@ ADFILTER_FP_SIZE_BUCKET_B = max(0, int(os.environ.get("ADFILTER_FP_SIZE_BUCKET_B
 # 单条上报最多接受多少个片段特征（防异常客户端刷爆 segments 表）。
 ADFILTER_FP_MAX_SEGMENTS = max(1, int(os.environ.get("ADFILTER_FP_MAX_SEGMENTS", "50")))
 # 晋升 confirmed 的门槛：不同用户数 / 不同 URL 数 / 总命中次数，三者同时满足。
-ADFILTER_FP_MIN_USERS = max(1, int(os.environ.get("ADFILTER_FP_MIN_USERS", "3")))
+# v1.17.3：用户数门槛默认 1（个人单用户场景，多用户聚类不适用）；仍可用环境变量调回。
+ADFILTER_FP_MIN_USERS = max(1, int(os.environ.get("ADFILTER_FP_MIN_USERS", "1")))
 ADFILTER_FP_MIN_URLS = max(1, int(os.environ.get("ADFILTER_FP_MIN_URLS", "3")))
 ADFILTER_FP_MIN_HITS = max(1, int(os.environ.get("ADFILTER_FP_MIN_HITS", "10")))
 # 误杀保护：某指纹被客户端回报「不该删」累计达到该次数 → 自动 disabled 并停止下发。
