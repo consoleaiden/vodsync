@@ -205,6 +205,16 @@
     header h1 { font-size: 15px; }
     .tb-pager { font-size: 12px; }
   }
+  /* v1.17.4：页脚（镜像版本 + 项目地址），与整体浅色主题一致 */
+  footer {
+    border-top: 1px solid var(--line); color: var(--muted); font-size: 12px;
+    padding: 12px 24px 18px; display: flex; align-items: center;
+    justify-content: center; gap: 8px; flex-wrap: wrap;
+  }
+  footer b { font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+  footer a { color: var(--accent); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  footer .sep { opacity: .45; }
 </style>
 </head>
 <body>
@@ -584,6 +594,13 @@
     </div>
   </section>
 </main>
+
+<footer id="appFooter">
+  <span>镜像版本 <b id="footerVersion" title="当前运行镜像的版本（来自 /healthz）">加载中…</b></span>
+  <span class="sep">·</span>
+  <a href="https://github.com/consoleaiden/vodsync" target="_blank" rel="noopener noreferrer"
+     title="在 GitHub 上查看 VodSync 项目源码">GitHub 项目地址 ↗</a>
+</footer>
 
 <div id="toast"></div>
 
@@ -2836,12 +2853,31 @@ function schedule() {
 }
 $("#autoRefresh").addEventListener("change", schedule);
 
+// ---------------- 页脚：镜像版本 ----------------
+// /healthz 是公开接口（无需鉴权），直接读它返回的 version 即为当前镜像版本。
+// 失败时显示占位符即可，绝不抛错影响面板其余功能。
+async function loadFooterVersion() {
+  const el = $("#footerVersion");
+  if (!el) return;
+  try {
+    const res = await fetch("/healthz", { cache: "no-store" });
+    if (!res.ok) throw new Error("healthz " + res.status);
+    const d = await res.json();
+    el.textContent = "v" + (d.version || "未知");
+    el.title = "当前运行镜像版本 " + (d.version || "未知") + "（来自 /healthz）";
+  } catch (e) {
+    el.textContent = "-";
+    el.title = "版本信息暂不可用";
+  }
+}
+
 async function boot() {
   await loadAuthState();
   if (authState.enabled && !authState.logged_in) {
     location.replace("/login?next=" + encodeURIComponent(location.pathname + location.search));
     return;
   }
+  loadFooterVersion();  // 页脚镜像版本（公开 /healthz，非阻塞；失败也不影响面板）
   await refreshAll();
   loadTagStatus();  // 标签索引：只取一次摘要（徽标/行数），详细进度按需展开
   secLoadOpen();    // 上次展开的区块此时补载（鉴权已确认，不浪费未登录的请求）
