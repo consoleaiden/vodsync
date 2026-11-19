@@ -587,6 +587,33 @@ vodsync/
 
 > 按版本号**从新到旧**排列，最新版本在最前。历史版本只做归档记录，细节以对应版本的代码与文档为准。
 
+### v1.19.0
+**运营管理升级「未实现/半实现项」全部补齐**（对照 `ADFILTER_ADMIN_OPS_UPGRADE` 需求文档逐条核查后补齐；规则包/客户端协议结构不变）：
+
+- **§4.3 事件流闭环**：`rebuild` 逐条写 `promoted/demoted`、`feedback` 写 `auto_disabled/feedback_still_ads`、
+  人工补录写 `manual_created`、人工审核写 `locked`；`/events` 返回全部 6 类事件并支持 `since` 过滤，
+  面板头部「近 24h 事件」提示可点击直达事件流 tab（操作审计 / 事件流双 tab 切换）。
+- **§4.6 fp-feedback reason（服务端）**：新增可选 `reason=over_deleted|still_has_ads`；
+  `over_deleted` 才计 `miss_count`，`still_has_ads` 只做漏判统计。新增配置
+  `ADFILTER_FP_MISS_REASON_REQUIRED`（默认 false=过渡期兼容：不带 reason 仍按删多了计，
+  保证老客户端止血不中断；**客户端升级传 reason 后应设为 true** 切换严格口径）。
+  ⚠ 此项需前端 AI 协同升级客户端传 reason，详见发布说明。
+- **§4.4 批量操作**：新增 `POST /fingerprints/batch-delete/preview`（预览将删指纹/明细行数）
+  与 `/batch-delete`（单事务批量物理删除）；批量停用复用 review 数组；面板支持本页全选 +
+  批量确认/停用/删除（删除前如实展示行数）。
+- **§2.4 发布 diff**：新增 `POST /admin/publish-diff`，返回 thresholds 变更字段、url_patterns /
+  site_overrides 增删、指纹数量变化、warnings、桶宽漂移；发布按钮先弹 diff 确认框。
+  `publish-state.pending` 新增 `updated_since_publish`，dirty 判定覆盖通用 `updated_at > pack.created_at`。
+- **§4.1 截断可见**：单条 `block_reason` 新增 `capped`（confirmed 但被 128 上限截断），列表如实标注。
+- **§3.3 漏判样本面板**：新增「漏判样本明细」区块（host/举报数/去重地址/判定/操作），
+  支持近 1/7/30 天切换，`candidate_only` 行一键跳到 near_miss 候选列表直接批量确认。
+- **§3.4 明细概览**：指纹概览展示「明细 N 行 / 最早时间 / 段与举报保留天数」。
+- **§3.1 列表补齐**：新增可下发状态、误杀数筛选；新增命中率、最后命中列。
+- **§2.3 host 校验**：人工补录校验 host 为合法域名/IP/localhost，防止脏数据。
+- **§4.5 迁移脚本**：新增 `scripts/migrate_fp_bucket_width.py`（`--dry-run` / `--apply`），
+  按当前桶宽重算 fp_hash 并重建聚合；发布侧桶宽漂移仍拒绝（面板不提供按钮，符合文档要求）。
+- 测试：新增 `test_v1190_completion.py`（后端全项 + 前端 DOM 完整性守护，全部通过）。
+
 ### v1.18.1
 **运营面板展示修复**（v1.18.0 上线后截图验收发现的两处展示问题，纯前端，后端接口/数据模型不变）：
 

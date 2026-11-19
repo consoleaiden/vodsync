@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.18.1"
+    "version": "1.19.0"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -981,7 +981,7 @@
     "/api/v1/adfilter/fp-feedback": {
       "post": {
         "summary": "指纹命中/误杀反馈（v1.17.0）",
-        "description": "客户端回报某条指纹的命中结果（2d 反馈闭环）。read Token 即可调用。\n\nbody：`{\"fp_hash\": \"...\", \"kind\": \"hit\" | \"miss\"}`\n  - hit ：该指纹成功命中，run_hits++；\n  - miss：客户端认为该指纹误杀，miss_count++，累计达阈值自动 disabled。\n\n未知 fp_hash（客户端缓存了已撤销指纹）返回 found:false，不报错。",
+        "description": "客户端回报某条指纹的命中结果（2d 反馈闭环）。read Token 即可调用。\n\nbody：`{\"fp_hash\": \"...\", \"kind\": \"hit\" | \"miss\", \"reason\": \"over_deleted\" | \"still_has_ads\"}`\n  - hit ：该指纹成功命中，run_hits++；\n  - miss：reason=over_deleted 才计 miss_count（达阈值自动 disabled）；\n          reason=still_has_ads 只做漏判统计不计 miss（v1.19.0 §4.6）；\n          不传 reason 时按 ADFILTER_FP_MISS_REASON_REQUIRED 决定口径。\n\n未知 fp_hash（客户端缓存了已撤销指纹）返回 found:false，不报错。",
         "operationId": "adfilter_fp_feedback_api_v1_adfilter_fp_feedback_post",
         "requestBody": {
           "content": {
@@ -1319,6 +1319,82 @@
         }
       }
     },
+    "/api/v1/adfilter/admin/fingerprints/batch-delete/preview": {
+      "post": {
+        "summary": "批量删除预览（管理端，v1.19.0 §4.4）",
+        "description": "不写库，返回将删除的指纹/明细行数，供面板二次确认框如实展示。",
+        "operationId": "adfilter_admin_fp_batch_delete_preview_api_v1_adfilter_admin_fingerprints_batch_delete_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adfilter/admin/fingerprints/batch-delete": {
+      "post": {
+        "summary": "批量物理删除指纹（管理端，v1.19.0 §4.4）",
+        "description": "单事务批量删除多条指纹及其明细；不存在的 hash 汇总到 not_found。",
+        "operationId": "adfilter_admin_fp_batch_delete_api_v1_adfilter_admin_fingerprints_batch_delete_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/adfilter/admin/fingerprints/{fp_hash}": {
       "delete": {
         "summary": "彻底删除指纹（管理端，v1.17.5）",
@@ -1474,6 +1550,44 @@
         }
       }
     },
+    "/api/v1/adfilter/admin/publish-diff": {
+      "post": {
+        "summary": "发布前差异预览（管理端，v1.19.0 §2.4）",
+        "description": "对比编辑框待发布内容与当前包，返回 thresholds/url/site/fingerprints 差异 + 告警。",
+        "operationId": "adfilter_admin_publish_diff_api_v1_adfilter_admin_publish_diff_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/adfilter/admin/miss-samples": {
       "get": {
         "summary": "漏判样本明细（管理端，v1.18.0）",
@@ -1593,8 +1707,8 @@
     },
     "/api/v1/adfilter/admin/events": {
       "get": {
-        "summary": "系统事件流（管理端，v1.18.0）",
-        "description": "系统事件流（§4.3）：自动晋升/降级/停用等，与人工操作审计共用一张表。",
+        "summary": "系统事件流（管理端，v1.18.0 / v1.19.0 补齐）",
+        "description": "事件流（§4.3）：自动晋升/降级/停用 + 人工创建/锁定，与人工操作审计共用一张表。",
         "operationId": "adfilter_admin_events_api_v1_adfilter_admin_events_get",
         "parameters": [
           {
@@ -1615,11 +1729,23 @@
             "required": false,
             "schema": {
               "type": "string",
-              "description": "事件类型：promoted/demoted/auto_disabled，空=全部",
+              "description": "事件类型：promoted/demoted/auto_disabled/manual_created/locked/feedback_still_ads，空=全部",
               "default": "",
               "title": "Kind"
             },
-            "description": "事件类型：promoted/demoted/auto_disabled，空=全部"
+            "description": "事件类型：promoted/demoted/auto_disabled/manual_created/locked/feedback_still_ads，空=全部"
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "ISO 时间，只返回更晚的事件（面板今日聚合用）",
+              "default": "",
+              "title": "Since"
+            },
+            "description": "ISO 时间，只返回更晚的事件（面板今日聚合用）"
           }
         ],
         "responses": {

@@ -32,14 +32,17 @@ size_b = 0（客户端没提供）时 size_bucket 固定为 0，避免「提供�
 「没提供大小」被拆成两个指纹。
 """
 import hashlib
+import ipaddress
 import json
 import logging
+import re
 import time as time_module
 from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import case, func, select, text
 
+from . import audit as audit_mod
 from . import config, database
 from .models import adfilter_admin_audit, adfilter_fingerprints, adfilter_segments
 
@@ -54,6 +57,13 @@ STATUSES = (STATUS_CANDIDATE, STATUS_CONFIRMED, STATUS_DISABLED)
 # 反馈类型
 FEEDBACK_HIT = "hit"      # 客户端按指纹命中并成功过滤
 FEEDBACK_MISS = "miss"    # 客户端认为该指纹误杀（不该删）
+
+# v1.19.0 §4.6：miss 反馈原因口径（服务端先实现，待客户端协同传 reason）
+#   over_deleted  ：确实删多了 → 计 miss_count，达阈值自动停用
+#   still_has_ads ：还有别的广告（默认）→ 不计 miss，只做漏判统计
+FEEDBACK_REASON_OVER_DELETED = "over_deleted"
+FEEDBACK_REASON_STILL_ADS = "still_has_ads"
+FEEDBACK_REASONS = (FEEDBACK_REASON_OVER_DELETED, FEEDBACK_REASON_STILL_ADS)
 
 MAX_PATTERN_JSON = 512
 MAX_NOTE = 255
@@ -248,6 +258,9 @@ def rebuild() -> dict:
 
     created = confirmed = demoted = disabled_kept = locked_kept = 0
     now = datetime.now()
+    # v1.19.0 §4.3：逐条收集状态跃迁事件，末尾单事务写审计（供事件流/今日提示）
+    events: list = []
+    actor = "system:rebuild"
 
     def _pattern(m: dict, hits: int, users: int, urls: int) -> dict:
         """从聚合样本还原完整 pattern（含下发必需的桶字段）。"""
@@ -314,6 +327,10 @@ def rebuild() -> dict:
                 created += 1
                 if status == STATUS_CONFIRMED:
                     confirmed += 1
+                    events.append({"action": audit_mod.EVENT_PROMOTED, "target": fp_hash,
+                                   "detail": {"reason": "auto_qualified", "source": "auto",
+                                              "users": users, "urls": urls, "hits": hits},
+                                   "actor": actor})
             else:
                 old_status = existing["status"]
                 is_locked = bool(existing["locked"])
@@ -354,8 +371,16 @@ def rebuild() -> dict:
                 )
                 if old_status != STATUS_CONFIRMED and new_status == STATUS_CONFIRMED:
                     confirmed += 1
+                    events.append({"action": audit_mod.EVENT_PROMOTED, "target": fp_hash,
+                                   "detail": {"reason": "auto_qualified", "from": old_status,
+                                              "users": users, "urls": urls, "hits": hits},
+                                   "actor": actor})
                 if old_status == STATUS_CONFIRMED and new_status == STATUS_CANDIDATE:
                     demoted += 1
+                    events.append({"action": audit_mod.EVENT_DEMOTED, "target": fp_hash,
+                                   "detail": {"reason": "sample_fell_below_threshold",
+                                              "users": users, "urls": urls, "hits": hits},
+                                   "actor": actor})
 
     # 明细被清空的指纹：保留实体（历史发布还可能引用），但状态降为 candidate。
     # locked / disabled 行豁免——人工锁定的 confirmed 不因明细清空而被机器降级。
@@ -374,7 +399,14 @@ def rebuild() -> dict:
                     .where(adfilter_fingerprints.c.id == fid)
                     .values(status=STATUS_CANDIDATE, updated_at=now)
                 )
+                events.append({"action": audit_mod.EVENT_DEMOTED,
+                               "target": "", "detail": {"reason": "segments_cleared", "id": fid},
+                               "actor": actor})
             demoted += len(stale)
+
+    # 事件落库（尽力而为，不阻断 rebuild 主流程）
+    if events:
+        audit_mod.record_many(events)
 
     result = {
         "scanned": len(grouped),
@@ -443,36 +475,62 @@ def downloadable(limit: Optional[int] = None) -> list:
     return out
 
 
+def _downloadable_hashes() -> set:
+    """实际可下发指纹的 hash 集合（按 config cap 截断），用于列表 capped 判定。"""
+    try:
+        return {f["fp_hash"] for f in downloadable()}  # 不传 limit → 用 config cap
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 # ---------------------------------------------------------------------------
 # 2d：反馈闭环
 # ---------------------------------------------------------------------------
-def feedback(fp_hash: str, kind: str) -> dict:
+def feedback(fp_hash: str, kind: str, reason: str = "") -> dict:
     """
     客户端回报某指纹命中 / 误杀。返回该指纹的最新状态。
 
     - hit ：run_hits++（正向证据，不影响 status）
-    - miss：miss_count++，累计达到 ADFILTER_FP_MISS_DISABLE → 自动 disabled，
-            并从下发列表中移除（下次发布规则包生效）。
+    - miss：按 reason 决定是否计误杀（v1.19.0 §4.6）：
+        * over_deleted  ：确实删多了 → miss_count++，达阈值自动 disabled；
+        * still_has_ads ：只是还有别的广告 → 不计 miss，仅写
+                          feedback_still_ads 事件喂给漏判统计（§3.3）；
+        * 不传 reason   ：按 ADFILTER_FP_MISS_REASON_REQUIRED 决定——
+                          false（默认过渡期）当 over_deleted 计 miss，保证老客户端
+                          止血能力不中断；true（客户端升级后）当 still_has_ads 不计。
     未知 fp_hash 直接返回 {found:false}，不报错——客户端缓存了旧指纹是正常的。
     """
     if kind not in (FEEDBACK_HIT, FEEDBACK_MISS):
         raise FPError(f"feedback kind 必须是 {FEEDBACK_HIT}/{FEEDBACK_MISS}", "kind")
+    reason = (reason or "").strip().lower()
+    if reason and reason not in FEEDBACK_REASONS:
+        raise FPError(
+            f"reason 必须是 {'/'.join(FEEDBACK_REASONS)} 或留空", "reason"
+        )
     fp_hash = (fp_hash or "").strip().lower()
     if not fp_hash:
         raise FPError("fp_hash 不能为空", "fp_hash")
 
+    event_to_record = None  # 事务外再写审计（write_txn 持锁不可重入）
     with database.write_txn() as conn:
         row = conn.execute(
             select(
                 adfilter_fingerprints.c.id,
                 adfilter_fingerprints.c.miss_count,
                 adfilter_fingerprints.c.status,
+                adfilter_fingerprints.c.host,
             ).where(adfilter_fingerprints.c.fp_hash == fp_hash)
         ).mappings().first()
         if row is None:
             return {"found": False, "fp_hash": fp_hash}
 
         now = datetime.now()
+        # 判定本次 miss 是否计入误杀计数
+        effective_reason = reason or (
+            FEEDBACK_REASON_STILL_ADS if config.ADFILTER_FP_MISS_REASON_REQUIRED
+            else FEEDBACK_REASON_OVER_DELETED
+        )
+        count_as_miss = effective_reason == FEEDBACK_REASON_OVER_DELETED
         if kind == FEEDBACK_HIT:
             conn.execute(
                 adfilter_fingerprints.update()
@@ -484,7 +542,7 @@ def feedback(fp_hash: str, kind: str) -> dict:
             )
             new_miss = int(row["miss_count"] or 0)
             status = row["status"]
-        else:
+        elif count_as_miss:
             new_miss = int(row["miss_count"] or 0) + 1
             disable = new_miss >= config.ADFILTER_FP_MISS_DISABLE
             new_status = STATUS_DISABLED if disable else row["status"]
@@ -503,11 +561,36 @@ def feedback(fp_hash: str, kind: str) -> dict:
             status = new_status
             if disable:
                 log.info("[adfilter_fp] 指纹 %s… 误杀 %d 次，自动停用", fp_hash[:12], new_miss)
+                event_to_record = (
+                    audit_mod.EVENT_AUTO_DISABLED,
+                    {"miss_count": new_miss, "reason": effective_reason,
+                     "threshold": config.ADFILTER_FP_MISS_DISABLE, "host": row["host"]},
+                )
+        else:
+            # still_has_ads：不计 miss，只更新 last_miss_at + 写漏判事件（§3.3 喂数据）
+            new_miss = int(row["miss_count"] or 0)
+            status = row["status"]
+            conn.execute(
+                adfilter_fingerprints.update()
+                .where(adfilter_fingerprints.c.id == row["id"])
+                .values(last_miss_at=now, updated_at=now)
+            )
+            event_to_record = (
+                audit_mod.EVENT_FEEDBACK_STILL_ADS,
+                {"reason": effective_reason, "host": row["host"],
+                 "status": status, "miss_count": new_miss},
+            )
+    # 事务外写事件，避免 write_txn 嵌套锁
+    if event_to_record:
+        audit_mod.record(event_to_record[0], fp_hash, event_to_record[1],
+                         actor="system:feedback")
     return {
         "found": True,
         "fp_hash": fp_hash,
         "status": status,
         "miss_count": new_miss,
+        "counted_as_miss": count_as_miss if kind == FEEDBACK_MISS else False,
+        "reason": effective_reason if kind == FEEDBACK_MISS else "",
         "downloadable": status == STATUS_CONFIRMED and new_miss < config.ADFILTER_FP_MISS_DISABLE,
     }
 
@@ -584,9 +667,21 @@ def list_fingerprints(
             select(fp).where(*where).order_by(*order_by).limit(limit).offset(offset)
         ).mappings().all()
 
+    # v1.19.0 §4.1：单次取全量可下发 hash，用于把「confirmed 但被上限截断」的行
+    # 标成 block_reason=capped（否则面板看不出是 128 条截断还是只有 128 条）。
+    eligible = set()
+    if config.ADFILTER_FP_ENABLED:
+        eligible = _downloadable_hashes()
+
     items = []
     for r in rows:
         item = _row_to_dict(r)
+        # 只有「本应下发（confirmed 且未达误杀阈值）却被 cap 截断」才标 capped
+        if (item["status"] == STATUS_CONFIRMED
+                and item["block_reason"] == ""
+                and r["fp_hash"] not in eligible):
+            item["block_reason"] = "capped"
+            item["downloadable"] = False
         item["blocked_by"] = blocked_by_flags(
             r["status"], int(r["distinct_users"] or 0),
             int(r["distinct_urls"] or 0), int(r["hit_count"] or 0),
@@ -669,6 +764,28 @@ def _safe_json(raw: str) -> dict:
         return value if isinstance(value, dict) else {}
     except Exception:  # noqa: BLE001
         return {}
+
+
+# v1.19.0 §2.3：host 可解析校验（域名/IP/localhost），防止人工补录填乱码把库污染。
+_HOST_LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def valid_host(host: str) -> bool:
+    """域名 / IPv4 / IPv6 / localhost 视为合法；大小写不敏感。空或带路径/端口判非法。"""
+    h = (host or "").strip().lower()
+    if not h or len(h) > 253 or any(c in h for c in " /\\:?#@"):
+        return False
+    if h == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        pass
+    labels = h.rstrip(".").split(".")
+    if len(labels) < 2:
+        return False
+    return all(_HOST_LABEL.match(label) for label in labels)
 
 
 def _apply_review(conn, fp_hash: str, status: str, note: str, lock: bool, now) -> bool:
@@ -767,6 +884,8 @@ def manual_create(host: str, dur_ms: int, size_b: int = 0, note: str = "") -> di
     host = (host or "").strip().lower()
     if not host:
         raise FPError("host 不能为空", "host")
+    if not valid_host(host):
+        raise FPError("host 必须是合法域名 / IP / localhost", "host")
     try:
         dur = int(dur_ms)
         size = int(size_b or 0)
@@ -811,6 +930,11 @@ def manual_create(host: str, dur_ms: int, size_b: int = 0, note: str = "") -> di
             )
             created = False
     row = get_fingerprint(fp_hash)
+    # v1.19.0 §4.3：人工补录写事件流（新建/合并都算人工创建并锁定）
+    audit_mod.record(audit_mod.EVENT_MANUAL_CREATED, fp_hash, {
+        "host": host, "created": created, "dur_ms": dur, "size_b": size,
+        "note": (note or "")[:120], "locked": True,
+    }, actor="admin:manual")
     return {"created": created, "fingerprint": row}
 
 
@@ -862,6 +986,87 @@ def delete_fingerprint(fp_hash: str) -> dict:
         "fp_hash": fp_hash,
         "deleted_fingerprints": int(deleted_fingerprints or 0),
         "deleted_segments": int(deleted_segments or 0),
+    }
+
+
+def batch_delete_preview(fp_hashes: list) -> dict:
+    """
+    批量删除预览（§4.4）：不写库，返回每条指纹将删除的明细行数与合计，
+    供面板二次确认框如实展示「将删除 N 条指纹 / M 行明细」。
+    """
+    hashes = []
+    for h in (fp_hashes or []):
+        hv = (h or "").strip().lower()
+        if hv and hv not in hashes:
+            hashes.append(hv)
+    if not hashes:
+        raise FPError("fp_hashes 不能为空", "fp_hashes")
+    items = []
+    with database.engine.connect() as conn:
+        for hv in hashes:
+            fp_row = conn.execute(
+                select(adfilter_fingerprints.c.id, adfilter_fingerprints.c.host)
+                .where(adfilter_fingerprints.c.fp_hash == hv)
+            ).mappings().first()
+            seg_n = conn.execute(
+                select(func.count()).select_from(adfilter_segments)
+                .where(adfilter_segments.c.fp_hash == hv)
+            ).scalar() or 0
+            items.append({
+                "fp_hash": hv,
+                "exists": fp_row is not None,
+                "host": fp_row["host"] if fp_row else None,
+                "segments": int(seg_n),
+            })
+    return {
+        "items": items,
+        "found": sum(1 for i in items if i["exists"]),
+        "not_found": [i["fp_hash"] for i in items if not i["exists"]],
+        "total_fingerprints": sum(1 for i in items if i["exists"]),
+        "total_segments": sum(i["segments"] for i in items if i["exists"]),
+    }
+
+
+def batch_delete(fp_hashes: list) -> dict:
+    """
+    批量物理删除（§4.4）：单事务删多条指纹 + 对应明细，返回汇总。
+    不存在的 hash 收集到 not_found 不中断整批；尽力写审计事件。
+    """
+    hashes = []
+    for h in (fp_hashes or []):
+        hv = (h or "").strip().lower()
+        if hv and hv not in hashes:
+            hashes.append(hv)
+    if not hashes:
+        raise FPError("fp_hashes 不能为空", "fp_hashes")
+    deleted_fp = deleted_seg = 0
+    not_found = []
+    deleted_hosts = []
+    with database.write_txn() as conn:
+        for hv in hashes:
+            row = conn.execute(
+                select(adfilter_fingerprints.c.id, adfilter_fingerprints.c.host)
+                .where(adfilter_fingerprints.c.fp_hash == hv)
+            ).mappings().first()
+            if row is None:
+                not_found.append(hv)
+                continue
+            deleted_hosts.append(row["host"])
+            deleted_seg += int(conn.execute(
+                adfilter_segments.delete().where(adfilter_segments.c.fp_hash == hv)
+            ).rowcount or 0)
+            deleted_fp += int(conn.execute(
+                adfilter_fingerprints.delete().where(adfilter_fingerprints.c.fp_hash == hv)
+            ).rowcount or 0)
+    if deleted_fp:
+        audit_mod.record("delete", f"batch:{deleted_fp}", {
+            "deleted_fingerprints": deleted_fp, "deleted_segments": deleted_seg,
+            "not_found": not_found, "hosts": deleted_hosts[:20], "by": "batch_delete",
+        }, actor="admin:batch_delete")
+    return {
+        "deleted_fingerprints": deleted_fp,
+        "deleted_segments": deleted_seg,
+        "not_found": not_found,
     }
 
 

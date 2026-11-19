@@ -288,6 +288,14 @@ ADFILTER_FP_MIN_URLS = max(1, int(os.environ.get("ADFILTER_FP_MIN_URLS", "3")))
 ADFILTER_FP_MIN_HITS = max(1, int(os.environ.get("ADFILTER_FP_MIN_HITS", "10")))
 # 误杀保护：某指纹被客户端回报「不该删」累计达到该次数 → 自动 disabled 并停止下发。
 ADFILTER_FP_MISS_DISABLE = max(1, int(os.environ.get("ADFILTER_FP_MISS_DISABLE", "5")))
+# v1.19.0 §4.6：miss 反馈 reason 口径开关。
+#   false（默认/过渡期）：不传 reason 的 miss 仍按「确实删多了」计 miss_count，
+#                        保证老客户端的误杀止血能力不中断；显式 still_has_ads 不计。
+#   true（客户端升级后）：严格口径，不传 reason 一律按 still_has_ads 不计 miss，
+#                        仅 over_deleted 才计入（需前端 AI 协同传 reason 后再开）。
+ADFILTER_FP_MISS_REASON_REQUIRED = os.environ.get(
+    "ADFILTER_FP_MISS_REASON_REQUIRED", "false"
+).strip().lower() in ("1", "true", "yes", "on")
 # 下发到规则包里的指纹条数上限（包体积／客户端装载内存都要兜住）。
 ADFILTER_FP_MAX_DOWNLOAD = max(0, min(256, int(os.environ.get("ADFILTER_FP_MAX_DOWNLOAD", "128"))))
 # 后台自动重算间隔（分钟）。0 = 关闭自动重算，只能面板手动点。

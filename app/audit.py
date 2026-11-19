@@ -23,10 +23,20 @@ from .models import adfilter_admin_audit
 
 log = logging.getLogger("vodsync.audit")
 
-# 事件类型（系统自动产生，与人工操作区分）
+# 事件类型（与人工操作审计共表，用 action 区分）
+#   - 系统自动：promoted / demoted / auto_disabled
+#   - 人工语义：manual_created / locked（v1.19.0 §4.3 补齐，便于事件流统一展示）
 EVENT_PROMOTED = "promoted"
 EVENT_DEMOTED = "demoted"
 EVENT_AUTO_DISABLED = "auto_disabled"
+EVENT_MANUAL_CREATED = "manual_created"
+EVENT_LOCKED = "locked"
+EVENT_FEEDBACK_STILL_ADS = "feedback_still_ads"
+# 事件全集：events() 缺省返回全部类型（§4.3）
+EVENT_TYPES = (
+    EVENT_PROMOTED, EVENT_DEMOTED, EVENT_AUTO_DISABLED,
+    EVENT_MANUAL_CREATED, EVENT_LOCKED, EVENT_FEEDBACK_STILL_ADS,
+)
 
 
 def record(
@@ -53,6 +63,40 @@ def record(
     except Exception as e:  # noqa: BLE001 —— 审计不能拖垮主操作
         log.warning("[audit] 写审计失败 action=%s: %s", action, str(e)[:160])
         return False
+
+
+def record_many(entries: list) -> int:
+    """
+    批量写审计（v1.19.0 §4.3）：单事务写入多条事件，供 rebuild 一次提交
+    promoted/demoted 等事件，避免逐条写事务。尽力而为，返回成功条数。
+    每条 entry: {"action", "target", "detail", "actor"}。
+    """
+    if not entries:
+        return 0
+    rows = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        try:
+            safe_detail = json.dumps(e.get("detail") or {}, ensure_ascii=False, default=str)[:2000]
+        except Exception:  # noqa: BLE001
+            safe_detail = "{}"
+        rows.append({
+            "action": str(e.get("action") or "")[:32],
+            "target": str(e.get("target") or "")[:128],
+            "detail_json": safe_detail,
+            "actor": str(e.get("actor") or "")[:32],
+            "at": datetime.now(),
+        })
+    if not rows:
+        return 0
+    try:
+        with database.write_txn() as conn:
+            conn.execute(adfilter_admin_audit.insert(), rows)
+        return len(rows)
+    except Exception as e:  # noqa: BLE001
+        log.warning("[audit] 批量写审计失败 n=%d: %s", len(rows), str(e)[:160])
+        return 0
 
 
 def list_audit(
@@ -102,12 +146,33 @@ def list_audit(
     return {"total": int(total), "items": items, "limit": limit, "offset": offset}
 
 
-def events(limit: int = 50, kind: str = "") -> dict:
+def events(limit: int = 50, kind: str = "", since: str = "") -> dict:
     """
-    事件流（§4.3）：过滤系统事件类型。kind 为空返回全部事件。
-    事件类型集合与人工操作互斥，便于面板做「今日自动停用 N 条」提示。
+    事件流（§4.3）：返回系统事件 + 人工语义事件（v1.19.0 补齐写入侧）。
+    kind 为空返回全部事件类型；since 为 ISO 时间字符串时只返回更晚的事件
+    （供面板「今日 N 条」聚合），在 Python 侧过滤以便 SQLite/PG 兼容。
     """
-    event_actions = [EVENT_PROMOTED, EVENT_DEMOTED, EVENT_AUTO_DISABLED]
+    event_actions = list(EVENT_TYPES)
     if kind:
         event_actions = [a for a in event_actions if a == kind] or [kind]
-    return list_audit(limit=limit, action=",".join(event_actions))
+    result = list_audit(limit=max(int(limit), 1), action=",".join(event_actions))
+    if since:
+        try:
+            since_s = str(since).replace("Z", "+00:00")
+            from datetime import datetime as _dt
+            cutoff = _dt.fromisoformat(since_s)
+            items = []
+            for it in result["items"]:
+                at = it.get("at")
+                if not at:
+                    continue
+                try:
+                    if _dt.fromisoformat(at.replace("Z", "+00:00")) >= cutoff:
+                        items.append(it)
+                except ValueError:
+                    continue
+            result["items"] = items
+            result["total"] = len(items)
+        except (ValueError, TypeError):
+            pass  # since 非法则忽略过滤，不 500
+    return result

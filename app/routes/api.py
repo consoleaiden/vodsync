@@ -1236,9 +1236,11 @@ def adfilter_fp_feedback(payload: dict = None, request: Request = None):
     """
     客户端回报某条指纹的命中结果（2d 反馈闭环）。read Token 即可调用。
 
-    body：`{"fp_hash": "...", "kind": "hit" | "miss"}`
+    body：`{"fp_hash": "...", "kind": "hit" | "miss", "reason": "over_deleted" | "still_has_ads"}`
       - hit ：该指纹成功命中，run_hits++；
-      - miss：客户端认为该指纹误杀，miss_count++，累计达阈值自动 disabled。
+      - miss：reason=over_deleted 才计 miss_count（达阈值自动 disabled）；
+              reason=still_has_ads 只做漏判统计不计 miss（v1.19.0 §4.6）；
+              不传 reason 时按 ADFILTER_FP_MISS_REASON_REQUIRED 决定口径。
 
     未知 fp_hash（客户端缓存了已撤销指纹）返回 found:false，不报错。
     """
@@ -1254,7 +1256,9 @@ def adfilter_fp_feedback(payload: dict = None, request: Request = None):
             headers={"Retry-After": str(wait)},
         )
     try:
-        result = adfilter_fp.feedback(body.get("fp_hash", ""), body.get("kind", ""))
+        result = adfilter_fp.feedback(
+            body.get("fp_hash", ""), body.get("kind", ""), body.get("reason", "")
+        )
     except adfilter_fp.FPError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return result
@@ -1396,15 +1400,49 @@ def adfilter_admin_fp_review(request: Request, payload: dict = None):
             detail.update(updated=result["updated"], not_found=result["not_found"],
                           fp_hashes=result["not_found"] or [h for h in body["fp_hashes"]][:20])
             audit.record("review", f"batch:{result['updated']}", detail, actor=actor)
+            # v1.19.0 §4.3：批量人工审核逐条写 locked/unlocked 事件
+            if lock:
+                audit.record_many([
+                    {"action": audit.EVENT_LOCKED, "target": (it or {}).get("fp_hash", ""),
+                     "detail": {"status": status, "note": note[:120], "by": "batch_review"},
+                     "actor": actor}
+                    for it in (result.get("items") or [])
+                ])
             return {"code": SUCCESS_CODE, "msg": f"已更新 {result['updated']} 条", **result}
         row = adfilter_fp.review(body.get("fp_hash", ""), status, note, lock)
         detail["from"] = row["status"]
         audit.record("review", row["fp_hash"], detail, actor=actor)
+        if lock:
+            audit.record(audit.EVENT_LOCKED, row["fp_hash"],
+                         {"status": status, "note": note[:120], "by": "review"}, actor=actor)
         return {"code": SUCCESS_CODE, "msg": "已更新指纹状态", "fingerprint": row}
     except adfilter_fp.FPError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/api/v1/adfilter/admin/fingerprints/batch-delete/preview",
+             summary="批量删除预览（管理端，v1.19.0 §4.4）")
+def adfilter_admin_fp_batch_delete_preview(payload: dict = None):
+    """不写库，返回将删除的指纹/明细行数，供面板二次确认框如实展示。"""
+    body = payload if isinstance(payload, dict) else {}
+    try:
+        return {"code": SUCCESS_CODE, **adfilter_fp.batch_delete_preview(body.get("fp_hashes"))}
+    except adfilter_fp.FPError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/api/v1/adfilter/admin/fingerprints/batch-delete",
+             summary="批量物理删除指纹（管理端，v1.19.0 §4.4）")
+def adfilter_admin_fp_batch_delete(request: Request, payload: dict = None):
+    """单事务批量删除多条指纹及其明细；不存在的 hash 汇总到 not_found。"""
+    body = payload if isinstance(payload, dict) else {}
+    try:
+        result = adfilter_fp.batch_delete(body.get("fp_hashes"))
+        return {"code": SUCCESS_CODE, "msg": f"已删除 {result['deleted_fingerprints']} 条指纹", **result}
+    except adfilter_fp.FPError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/api/v1/adfilter/admin/fingerprints/{fp_hash}", summary="彻底删除指纹（管理端，v1.17.5）")
@@ -1498,6 +1536,18 @@ def adfilter_admin_publish_state(
     return {"code": SUCCESS_CODE, **adfilter.publish_state(channel)}
 
 
+@router.post("/api/v1/adfilter/admin/publish-diff", summary="发布前差异预览（管理端，v1.19.0 §2.4）")
+def adfilter_admin_publish_diff(request: Request, payload: dict = None):
+    """对比编辑框待发布内容与当前包，返回 thresholds/url/site/fingerprints 差异 + 告警。"""
+    body = payload if isinstance(payload, dict) else {}
+    try:
+        return {"code": SUCCESS_CODE, **adfilter.publish_diff(
+            body.get("rules", {}), body.get("channel") or "stable"
+        )}
+    except Exception as e:  # noqa: BLE001 —— diff 只读，失败不应 500 阻断面板
+        raise HTTPException(status_code=400, detail=f"差异计算失败：{str(e)[:200]}")
+
+
 @router.get("/api/v1/adfilter/admin/miss-samples", summary="漏判样本明细（管理端，v1.18.0）")
 def adfilter_admin_miss_samples(
     days: int = Query(7, ge=1, le=365),
@@ -1517,13 +1567,14 @@ def adfilter_admin_audit_log(
     return {"code": SUCCESS_CODE, **audit.list_audit(limit, offset, action)}
 
 
-@router.get("/api/v1/adfilter/admin/events", summary="系统事件流（管理端，v1.18.0）")
+@router.get("/api/v1/adfilter/admin/events", summary="系统事件流（管理端，v1.18.0 / v1.19.0 补齐）")
 def adfilter_admin_events(
     limit: int = Query(50, ge=1, le=200),
-    kind: str = Query("", description="事件类型：promoted/demoted/auto_disabled，空=全部"),
+    kind: str = Query("", description="事件类型：promoted/demoted/auto_disabled/manual_created/locked/feedback_still_ads，空=全部"),
+    since: str = Query("", description="ISO 时间，只返回更晚的事件（面板今日聚合用）"),
 ):
-    """系统事件流（§4.3）：自动晋升/降级/停用等，与人工操作审计共用一张表。"""
-    return {"code": SUCCESS_CODE, **audit.events(limit, kind)}
+    """事件流（§4.3）：自动晋升/降级/停用 + 人工创建/锁定，与人工操作审计共用一张表。"""
+    return {"code": SUCCESS_CODE, **audit.events(limit, kind, since)}
 
 
 def _tag_stats_brief() -> dict:

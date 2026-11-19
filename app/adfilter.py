@@ -584,7 +584,8 @@ def publish_state(channel: str = DEFAULT_CHANNEL) -> dict:
     """
     ch = normalize_channel(channel)
     empty_pending = {"dirty": False, "fp_added": 0, "fp_removed": 0,
-                     "reviewed_since_publish": 0, "auto_disabled_since_publish": 0}
+                     "reviewed_since_publish": 0, "auto_disabled_since_publish": 0,
+                     "updated_since_publish": 0}
     empty_rebuild = {"last_at": None, "created": 0, "confirmed": 0,
                      "demoted": 0, "locked_kept": 0}
     try:
@@ -620,6 +621,7 @@ def publish_state(channel: str = DEFAULT_CHANNEL) -> dict:
 
             reviewed_since = 0
             auto_disabled_since = 0
+            updated_since_publish = 0
             if pack_created is not None:
                 reviewed_since = conn.execute(
                     select(func.count()).select_from(adfilter_fp.adfilter_fingerprints)
@@ -632,14 +634,21 @@ def publish_state(channel: str = DEFAULT_CHANNEL) -> dict:
                         adfilter_fp.adfilter_fingerprints.c.updated_at > pack_created,
                     )
                 ).scalar() or 0
+                # v1.19.0 §2.4：覆盖文档要求的通用 updated_at > pack.created_at 判定
+                updated_since_publish = conn.execute(
+                    select(func.count()).select_from(adfilter_fp.adfilter_fingerprints)
+                    .where(adfilter_fp.adfilter_fingerprints.c.updated_at > pack_created)
+                ).scalar() or 0
 
         st = adfilter_fp.stats()
         pending = {
-            "dirty": bool(fp_added or fp_removed or reviewed_since or auto_disabled_since),
+            "dirty": bool(fp_added or fp_removed or reviewed_since
+                          or auto_disabled_since or updated_since_publish),
             "fp_added": fp_added,
             "fp_removed": fp_removed,
             "reviewed_since_publish": int(reviewed_since),
             "auto_disabled_since_publish": int(auto_disabled_since),
+            "updated_since_publish": int(updated_since_publish),
         }
 
         # 最近一次 rebuild 结果（审计表）
@@ -692,6 +701,81 @@ def publish_state(channel: str = DEFAULT_CHANNEL) -> dict:
             "bucket": {"dur_bucket_ms": config.ADFILTER_FP_DUR_BUCKET_MS,
                        "size_bucket_b": config.ADFILTER_FP_SIZE_BUCKET_B, "drift": False},
         }
+
+
+def publish_diff(rules, channel: str = DEFAULT_CHANNEL) -> dict:
+    """
+    发布前差异预览（v1.19.0 §2.4）：对比「编辑框待发布内容」与「当前生效包」，
+    给运营一个可读的 diff 确认框数据。指纹部分按当前库实时快照计算（编辑框里
+    的 fingerprints 会被 normalize() 丢弃，不参与对比）。
+
+    返回：
+      thresholds_changed : [{field, from, to}]
+      url_patterns       : {added:[], removed:[]}
+      site_overrides     : {added:[], removed:[], changed:[]}
+      fingerprints       : {pack, current_downloadable, added, removed}
+      warnings           : normalize + warnings_for 的告警
+      bucket_drift       : 桶宽漂移告警（仍可被拒发）
+    """
+    ch = normalize_channel(channel)
+    pack = current(ch)
+    pack_rules = pack.get("rules") or {}
+    clean = normalize(rules)
+
+    def _flat_thresholds(r: dict) -> dict:
+        t = (r or {}).get("thresholds") or {}
+        return {str(k): v for k, v in t.items()}
+
+    old_t, new_t = _flat_thresholds(pack_rules), _flat_thresholds(clean)
+    thresholds_changed = [
+        {"field": k, "from": old_t.get(k), "to": new_t.get(k)}
+        for k in sorted(set(old_t) | set(new_t))
+        if old_t.get(k) != new_t.get(k)
+    ]
+
+    def _keys_of(r: dict, field: str, key: str) -> set:
+        out = set()
+        for item in ((r or {}).get(field) or []):
+            if isinstance(item, dict):
+                out.add(str(item.get(key) or ""))
+            else:
+                out.add(str(item))
+        out.discard("")
+        return out
+
+    old_urls = _keys_of(pack_rules, "url_patterns", "")
+    new_urls = _keys_of(clean, "url_patterns", "")
+    old_hosts = _keys_of(pack_rules, "site_overrides", "host")
+    new_hosts = _keys_of(clean, "site_overrides", "host")
+
+    # 指纹集合：包内 vs 当前库可下发
+    pack_fps = {
+        str(f.get("fp_hash") or "") for f in (pack_rules.get("fingerprints") or [])
+    }
+    pack_fps.discard("")
+    dl_fps = {f["fp_hash"] for f in adfilter_fp.downloadable()}
+
+    return {
+        "channel": ch,
+        "pack_version": int(pack.get("version") or 0),
+        "thresholds_changed": thresholds_changed,
+        "url_patterns": {
+            "added": sorted(new_urls - old_urls),
+            "removed": sorted(old_urls - new_urls),
+        },
+        "site_overrides": {
+            "added": sorted(new_hosts - old_hosts),
+            "removed": sorted(old_hosts - new_hosts),
+        },
+        "fingerprints": {
+            "pack": len(pack_fps),
+            "current_downloadable": len(dl_fps),
+            "added": len(dl_fps - pack_fps),
+            "removed": len(pack_fps - dl_fps),
+        },
+        "warnings": warnings_for(clean),
+        "bucket_drift": bucket_drift(),
+    }
 
 
 def ensure_seed() -> None:

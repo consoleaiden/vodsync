@@ -557,6 +557,8 @@
       <h2>广告指纹库</h2>
       <span class="hint">跨用户聚合的片段结构签名 · 过滤仍在端上，服务端只做聚合并随规则包下发</span>
       <span style="flex:1"></span>
+      <span class="badge" id="fpEventHint" title="今日自动事件提示（点击展开事件流）"
+        style="cursor:pointer;display:none"></span>
       <span class="muted" id="fpStats" style="font-size:12px"></span>
       <button class="sm" id="fpToggle" title="折叠 / 展开本区块（首次展开才加载数据）">展开 ▾</button>
     </div>
@@ -565,8 +567,9 @@
         <div class="muted" style="font-size:12px;line-height:1.75;margin-bottom:8px">
           指纹 = <code>站点 + 归一化时长桶 + 大小桶</code>，由客户端上报的片段特征跨用户聚合而来。
           样本达到门槛（<code id="fpThresholds">-</code>）自动晋升 <b>confirmed</b> 并随规则包下发；
-          客户端回报「误杀」累计达阈值会自动 <b>disabled</b> 止血。人工审核默认<b>锁定</b>（✕ 图标）
+          客户端回报「误杀」累计达阈值会自动 <b>disabled</b> 止血。人工审核默认<b>锁定</b>（🔒 图标）
           ——锁定后重算不再覆盖该状态；点「交还自动」才恢复自动判定。改动需点「发布指纹到规则包」才生效。
+          <span id="fpDetailStats" class="muted"></span>
         </div>
         <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:6px">
           <select class="tbSel" id="fpStatusFilter" title="按状态筛选">
@@ -586,6 +589,15 @@
             <option value="miss_desc">误杀 ↓</option>
             <option value="updated_desc">最近更新 ↓</option>
           </select>
+          <select class="tbSel" id="fpDlFilter" title="按下发状态筛选">
+            <option value="">全部下发状态</option>
+            <option value="1">可下发</option>
+            <option value="0">未下发</option>
+          </select>
+          <label class="muted" style="font-size:12px;display:inline-flex;align-items:center;gap:3px">
+            误杀&gt;<input id="fpMissGt" type="number" min="0" placeholder="0"
+              title="只看误杀次数大于该值的指纹" style="width:52px">
+          </label>
           <label class="muted" style="font-size:12px;display:inline-flex;align-items:center;gap:3px">
             <input type="checkbox" id="fpNearMiss" title="只看恰好差一项达标的候选，配合批量确认">
             差一项达标
@@ -595,6 +607,8 @@
           <button id="btnFpRebuild" title="从片段明细全量重算聚合（幂等，后台执行）">↻ 重算聚合</button>
           <button id="btnFpReload" title="重新拉取列表">刷新</button>
           <button id="btnFpBatchConfirm" title="把当前筛选结果中差一项达标的候选批量确认">批量确认</button>
+          <button class="sm warn" id="btnFpBatchDisable" title="勾选后批量停用止血（锁定，不再下发）">批量停用</button>
+          <button class="sm danger" id="btnFpBatchDelete" title="勾选后批量物理删除（不可恢复）">批量删除</button>
         </div>
         <div class="row" style="margin-top:6px;flex-wrap:wrap;gap:6px;align-items:center">
           <button id="btnFpManual" title="人工补录一条 confirmed 指纹（无需等样本）">+ 人工补指纹</button>
@@ -609,9 +623,41 @@
       <div class="body pad" style="border-top:1px solid var(--line)">
         <details id="fpAuditBox">
           <summary class="muted" style="cursor:pointer;font-size:12px">最近操作 / 事件（点击展开）</summary>
-          <div id="fpAuditList" style="margin-top:8px"><div class="empty">展开时加载…</div></div>
+          <div class="row" style="margin:8px 0;gap:6px">
+            <button class="sm" id="fpOpTabAudit" title="人工操作审计">操作审计</button>
+            <button class="sm" id="fpOpTabEvents" title="系统事件流（自动晋升/降级/停用/人工补录/锁定）">事件流</button>
+            <select class="tbSel" id="fpEventKind" title="按事件类型筛选" style="display:none">
+              <option value="">全部事件</option>
+              <option value="promoted">自动晋升</option>
+              <option value="demoted">自动降级</option>
+              <option value="auto_disabled">误杀停用</option>
+              <option value="manual_created">人工补录</option>
+              <option value="locked">人工锁定</option>
+              <option value="feedback_still_ads">仍有广告反馈</option>
+            </select>
+          </div>
+          <div id="fpAuditList"><div class="empty">展开时加载…</div></div>
         </details>
       </div>
+    </div>
+  </section>
+
+  <!-- 漏判样本明细（v1.19.0 §3.3） -->
+  <section class="panel" id="fpMissPanel">
+    <div class="head">
+      <h2>漏判样本明细</h2>
+      <span class="hint">按站点聚合「上报了但没删掉」的举报 + 指纹覆盖判定（不返回 URL 原文）</span>
+      <span style="flex:1"></span>
+      <select class="tbSel" id="fpMissDays" title="统计时间窗">
+        <option value="1">近 1 天</option>
+        <option value="7" selected>近 7 天</option>
+        <option value="30">近 30 天</option>
+      </select>
+      <span class="muted" id="fpMissHint" style="font-size:12px"></span>
+      <button class="sm" id="fpMissToggle" title="折叠 / 展开（首次展开才加载）">展开 ▾</button>
+    </div>
+    <div id="fpMissWrap" style="display:none">
+      <div class="body" id="fpMissList"><div class="empty">展开时加载漏判样本…</div></div>
     </div>
   </section>
 
@@ -2649,6 +2695,27 @@ $("#btnAdPublish").onclick = async () => {
   const btn = $("#btnAdPublish");
   btn.disabled = true;
   try {
+    // v1.19.0 §2.4：发布前先拿 diff，给运营确认改动范围
+    let diffMsg = "";
+    try {
+      const diff = await api("/api/v1/adfilter/admin/publish-diff", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rules, channel: $("#adChannel").value || "stable" }),
+      });
+      const lines = [];
+      (diff.thresholds_changed || []).forEach(t =>
+        lines.push(`阈值 ${t.field}: ${t.from} → ${t.to}`));
+      if ((diff.url_patterns || {}).added?.length) lines.push(`URL 模式 +${diff.url_patterns.added.length} 条`);
+      if ((diff.url_patterns || {}).removed?.length) lines.push(`URL 模式 -${diff.url_patterns.removed.length} 条`);
+      if ((diff.site_overrides || {}).added?.length) lines.push(`站点例外 +${diff.site_overrides.added.length} 个`);
+      if ((diff.site_overrides || {}).removed?.length) lines.push(`站点例外 -${diff.site_overrides.removed.length} 个`);
+      const fp = diff.fingerprints || {};
+      lines.push(`指纹：包内 ${fmtNum(fp.pack)} → 可下发 ${fmtNum(fp.current_downloadable)}（+${fmtNum(fp.added)}/-${fmtNum(fp.removed)}）`);
+      if (diff.bucket_drift) lines.push("⛔ 桶宽漂移，发布将被服务端拒绝");
+      if ((diff.warnings || []).length) lines.push("告警：" + diff.warnings.join("；"));
+      diffMsg = "\n\n本次发布变更：\n" + (lines.length ? lines.join("\n") : "（无变更）") + "\n";
+    } catch (e) { diffMsg = "\n\n（差异预览加载失败，请谨慎发布）\n"; }
+    if (!confirm(`确认校验并发布到渠道 ${$("#adChannel").value || "stable"} 的新版本？${diffMsg}`)) return;
     const res = await api("/api/v1/adfilter/admin/packs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2745,9 +2812,12 @@ function renderFpList(data) {
     return parts.join("、");
   };
   box.innerHTML = `<table>
-    <thead><tr><th style="width:110px">指纹</th><th>站点 host</th><th class="num">时长桶</th>
+    <thead><tr><th style="width:28px"><input type="checkbox" id="fpCheckAll" title="全选本页"></th>
+      <th style="width:110px">指纹</th><th>站点 host</th><th class="num">时长桶</th>
       <th class="num">大小桶</th><th class="num">置信度</th><th class="num">命中段</th>
       <th class="num">去重地址</th><th class="num">误杀</th><th class="num">真实命中</th>
+      <th class="num" title="真实命中/(真实命中+误杀)">命中率</th>
+      <th class="num" title="最后真实命中时间">最后命中</th>
       <th>下发</th><th>来源</th><th style="width:100px">状态</th><th style="width:230px">操作</th></tr></thead>
     <tbody>${rows.map((r) => {
       const p = r.pattern || {};
@@ -2764,6 +2834,7 @@ function renderFpList(data) {
       const confirmLabel = (Number(r.miss_count || 0) >= (window._fpMissDisable || 5))
         ? "确认并重置误杀" : "确认";
       return `<tr>
+        <td><input type="checkbox" class="fp-row-check" data-hash="${esc(r.fp_hash)}" title="勾选以批量停用/删除"></td>
         <td title="${esc(r.fp_hash)}"><code>${esc((r.fp_hash || "").slice(0, 10))}…</code></td>
         <td title="${esc(r.host)}">${esc(r.host) || "-"} ${stuck ? `<span class="muted" style="font-size:11px" title="卡在：${stuck}">(${stuck}不足)</span>` : ""}</td>
         <td class="num">${fmtNum(p.dur_bucket || 0)}</td>
@@ -2773,6 +2844,8 @@ function renderFpList(data) {
         <td class="num">${fmtNum(r.distinct_urls)}</td>
         <td class="num">${fmtNum(r.miss_count)}</td>
         <td class="num" title="最后命中：${esc(r.last_hit_at || "无")}">${fmtNum(r.run_hits)}</td>
+        <td class="num" title="命中率=真实命中/(真实命中+误杀)">${((Number(r.hit_rate || 0)) * 100).toFixed(0)}%</td>
+        <td class="num muted" title="最后误杀：${esc(r.last_miss_at || "无")}">${esc((r.last_hit_at || "无").replace("T", " ").slice(0, 16))}</td>
         <td title="${esc(why)}">${r.downloadable ? '<span class="badge ok">是</span>' : '<span class="badge mute">否</span>'}</td>
         <td>${r.source === "manual" ? '<span class="badge" title="人工录入">人工</span>' :'<span class="muted">自动</span>'}</td>
         <td>${fpStatusBadge(r.status, r.locked, r.downloadable, r.block_reason, shortfall)}</td>
@@ -2804,18 +2877,33 @@ async function fpLoad() {
       + ` · 人工锁定 ${fmtNum(ov.locked_count || 0)}`
       + ` · 误杀停用 ${fmtNum(ov.confirmed_but_blocked || 0)}`
       + ((bb.urls || bb.users || bb.hits) ? ` · 卡门槛(用户${fmtNum(bb.users)}/地址${fmtNum(bb.urls)}/命中${fmtNum(bb.hits)})` : "");
+    // §3.4 明细保留概览
+    const det = ov.detail || {};
+    const detBox = $("#fpDetailStats");
+    if (detBox) {
+      detBox.textContent = det.segments != null
+        ? ` · 明细 ${fmtNum(det.segments)} 行${det.oldest_at ? ` / 最早 ${fmtEpoch(det.oldest_at)}` : ""}`
+          + ` · 保留 ${fmtNum(det.segment_retention_days)}/${fmtNum(det.report_retention_days)} 天（段/举报，0=关闭）`
+        : "";
+    }
     const q = new URLSearchParams({ limit: String(fpPageSize), offset: String(fpPage * fpPageSize) });
     const st = $("#fpStatusFilter").value || "";
     const host = ($("#fpHostFilter").value || "").trim();
     const src = $("#fpSourceFilter").value || "";
     const order = $("#fpOrder").value || "";
+    const dl = $("#fpDlFilter").value || "";
+    const missGt = ($("#fpMissGt").value || "").trim();
     if (st) q.set("status", st);
     if (host) q.set("host", host);
     if (src) q.set("source", src);
     if (order) q.set("order", order);
+    if (dl !== "") q.set("downloadable", dl === "1" ? "1" : "0");
+    if (missGt !== "") q.set("miss_gt", missGt);
     if ($("#fpNearMiss").checked) q.set("near_miss", "1");
     const data = await api("/api/v1/adfilter/admin/fingerprints?" + q.toString());
     renderFpList(data);
+    // 今日事件提示（非阻塞，失败不影响列表）
+    fpLoadEventHint();
     // 分页控件
     const total = Number(data.total || 0);
     const pages = Math.max(1, Math.ceil(total / fpPageSize));
@@ -2885,20 +2973,100 @@ function fmtAuditActor(a) {
   return `Token #${n}`;
 }
 
+const FP_EVENT_LABELS = {
+  promoted: "自动晋升", demoted: "自动降级", auto_disabled: "误杀停用",
+  manual_created: "人工补录", locked: "人工锁定", feedback_still_ads: "仍有广告",
+};
+const FP_AUDIT_ACT_LABELS = {
+  publish: "发布", rollback: "回滚", review: "审核", delete: "删除",
+  manual: "人工补录", rebuild: "重算",
+};
+
+let fpOpMode = "audit";   // audit | events
 async function fpLoadAudit(force) {
   const box = $("#fpAuditList");
-  if (!box || (box.dataset.loaded === "1" && !force)) return;
+  if (!box) return;
+  const isEvent = fpOpMode === "events";
+  const cacheKey = isEvent ? "loadedEvents" : "loaded";
+  if (box.dataset[cacheKey] === "1" && !force) return;
   try {
-    const d = await api("/api/v1/adfilter/admin/audit?limit=30");
+    let d, rows;
+    if (isEvent) {
+      d = await api("/api/v1/adfilter/admin/events?limit=50");
+      rows = d.items || [];
+      if (!rows.length) { box.innerHTML = '<div class="empty">暂无事件</div>'; box.dataset[cacheKey] = "1"; return; }
+      box.innerHTML = `<table><thead><tr><th>时间</th><th>事件</th><th>指纹</th><th>详情</th></tr></thead><tbody>`
+        + rows.map(r => `<tr><td class="muted">${esc(r.at || "-")}</td>`
+          + `<td><span class="badge ${r.action === "auto_disabled" || r.action === "demoted" ? "warn" : "ok"}">${esc(FP_EVENT_LABELS[r.action] || r.action)}</span></td>`
+          + `<td><code title="${esc(r.target)}">${esc((r.target || "").slice(0, 14) || "-")}</code></td>`
+          + `<td class="muted" style="font-size:11px" title="${esc(JSON.stringify(r.detail || {}).slice(0, 600))}">${esc((r.detail && r.detail.host) || "")} ${fmtAuditDetail(r.detail)}</td></tr>`).join("")
+        + `</tbody></table>`;
+    } else {
+      d = await api("/api/v1/adfilter/admin/audit?limit=50");
+      rows = d.items || [];
+      if (!rows.length) { box.innerHTML = '<div class="empty">暂无操作记录</div>'; box.dataset[cacheKey] = "1"; return; }
+      box.innerHTML = `<table><thead><tr><th>时间</th><th>动作</th><th>对象</th><th>操作者</th><th>详情</th></tr></thead><tbody>`
+        + rows.map(r => `<tr><td class="muted">${esc(r.at || "-")}</td>`
+          + `<td><code>${esc(FP_AUDIT_ACT_LABELS[r.action] || r.action)}</code></td>`
+          + `<td title="${esc(r.target)}"><code>${esc((r.target || "").slice(0, 14))}</code></td>`
+          + `<td>${fmtAuditActor(r.actor)}</td>`
+          + `<td class="muted" style="font-size:11px" title="${esc(JSON.stringify(r.detail || {}).slice(0, 600))}">${fmtAuditDetail(r.detail)}</td></tr>`).join("")
+        + `</tbody></table>`;
+    }
+    box.dataset[cacheKey] = "1";
+  } catch (e) { box.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+
+// v1.19.0 §4.3：头部「今日事件」提示，点击切到事件流 tab
+async function fpLoadEventHint() {
+  const el = $("#fpEventHint");
+  if (!el) return;
+  try {
+    const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+    const d = await api("/api/v1/adfilter/admin/events?limit=100&since=" + encodeURIComponent(since));
+    const cnt = (d.items || []).reduce((m, r) => { m[r.action] = (m[r.action] || 0) + 1; return m; }, {});
+    const parts = [];
+    if (cnt.auto_disabled) parts.push(`自动停用 ${cnt.auto_disabled} 条`);
+    if (cnt.demoted) parts.push(`降级 ${cnt.demoted} 条`);
+    if (cnt.promoted) parts.push(`晋升 ${cnt.promoted} 条`);
+    if (cnt.feedback_still_ads) parts.push(`仍有广告 ${cnt.feedback_still_ads} 条`);
+    if (!parts.length) { el.style.display = "none"; el.textContent = ""; return; }
+    el.style.display = "inline-block";
+    el.className = "badge warn";
+    el.textContent = "近 24h " + parts.join(" · ");
+  } catch (e) { el.style.display = "none"; }
+}
+
+// v1.19.0 §3.3：漏判样本明细表
+async function fpLoadMiss() {
+  const box = $("#fpMissList");
+  if (!box) return;
+  const days = $("#fpMissDays") ? $("#fpMissDays").value : "7";
+  const hint = $("#fpMissHint");
+  if (hint) hint.textContent = "加载中…";
+  try {
+    const d = await api(`/api/v1/adfilter/admin/miss-samples?days=${days}&limit=50`);
     const rows = d.items || [];
-    if (!rows.length) { box.innerHTML = '<div class="empty">暂无操作记录</div>'; box.dataset.loaded = "1"; return; }
-    box.innerHTML = `<table><thead><tr><th>时间</th><th>动作</th><th>对象</th><th>操作者</th><th>详情</th></tr></thead><tbody>`
-      + rows.map(r => `<tr><td class="muted">${esc(r.at || "-")}</td><td><code>${esc(r.action)}</code></td>`
-        + `<td title="${esc(r.target)}"><code>${esc((r.target || "").slice(0, 14))}</code></td>`
-        + `<td>${fmtAuditActor(r.actor)}</td>`
-        + `<td class="muted" style="font-size:11px" title="${esc(JSON.stringify(r.detail || {}).slice(0, 600))}">${fmtAuditDetail(r.detail)}</td></tr>`).join("")
+    if (hint) hint.textContent = `近 ${fmtNum(d.days)} 天 · ${fmtNum(d.total)} 个站点`;
+    if (!rows.length) { box.innerHTML = '<div class="empty">该时间窗内没有「上报了但没删掉」的漏判样本</div>'; return; }
+    const verdictBadge = (v) => v === "covered"
+      ? '<span class="badge warn" title="有下发中指纹却仍被举报：指纹可能不准或广告换了切片">已覆盖仍漏</span>'
+      : v === "candidate_only"
+        ? '<span class="badge" title="有候选指纹但未达标/未发布">仅候选</span>'
+        : '<span class="badge mute" title="该站无任何指纹">无指纹</span>';
+    box.innerHTML = `<table><thead><tr><th>站点 host</th><th class="num">举报数</th><th class="num">去重地址</th>
+      <th>最近举报</th><th class="num">指纹(总/确认/下发)</th><th>判定</th><th style="width:120px">操作</th></tr></thead><tbody>`
+      + rows.map(r => `<tr>
+        <td title="${esc(r.host)}">${esc(r.host)}</td>
+        <td class="num">${fmtNum(r.reports)}</td>
+        <td class="num">${fmtNum(r.distinct_urls)}</td>
+        <td class="muted">${fmtEpoch(r.last_at)}</td>
+        <td class="num">${fmtNum(r.fingerprints && r.fingerprints.total)} / ${fmtNum(r.fingerprints && r.fingerprints.confirmed)} / ${fmtNum(r.fingerprints && r.fingerprints.downloadable)}</td>
+        <td>${verdictBadge(r.verdict)}</td>
+        <td>${r.verdict === "candidate_only"
+          ? `<button class="sm" data-miss-host="${esc(r.host)}" title="跳到差一项达标筛选，直接批量确认">查候选指纹</button>` : "-"}</td>
+      </tr>`).join("")
       + `</tbody></table>`;
-    box.dataset.loaded = "1";
   } catch (e) { box.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
 
@@ -2911,10 +3079,90 @@ $("#fpPager").addEventListener("click", (ev) => {
 const fpAuditBox = document.getElementById("fpAuditBox");
 if (fpAuditBox) fpAuditBox.addEventListener("toggle", () => { if (fpAuditBox.open) fpLoadAudit(); });
 
+// v1.19.0 §4.3：操作审计 / 事件流 tab 切换
+function fpSetOpMode(mode) {
+  fpOpMode = mode;
+  const a = $("#fpOpTabAudit"), e = $("#fpOpTabEvents"), kind = $("#fpEventKind");
+  if (a) a.className = mode === "audit" ? "sm primary" : "sm";
+  if (e) e.className = mode === "events" ? "sm primary" : "sm";
+  if (kind) kind.style.display = mode === "events" ? "" : "none";
+  fpLoadAudit(true);
+}
+if ($("#fpOpTabAudit")) $("#fpOpTabAudit").onclick = () => fpSetOpMode("audit");
+if ($("#fpOpTabEvents")) $("#fpOpTabEvents").onclick = () => fpSetOpMode("events");
+if ($("#fpEventHint")) $("#fpEventHint").onclick = () => {
+  const box = $("#fpAuditBox");
+  if (box) { box.open = true; }
+  fpSetOpMode("events");
+  if (box) box.scrollIntoView({ behavior: "smooth", block: "center" });
+};
+if ($("#fpEventKind")) $("#fpEventKind").onchange = () => {
+  const kind = $("#fpEventKind").value;
+  const box = $("#fpAuditList");
+  if (!box) return;
+  api("/api/v1/adfilter/admin/events?limit=50&kind=" + encodeURIComponent(kind)).then(d => {
+    const rows = d.items || [];
+    box.innerHTML = rows.length
+      ? `<table><thead><tr><th>时间</th><th>事件</th><th>指纹</th><th>详情</th></tr></thead><tbody>`
+        + rows.map(r => `<tr><td class="muted">${esc(r.at || "-")}</td>`
+          + `<td><span class="badge">${esc(FP_EVENT_LABELS[r.action] || r.action)}</span></td>`
+          + `<td><code>${esc((r.target || "").slice(0, 14) || "-")}</code></td>`
+          + `<td class="muted" style="font-size:11px">${esc((r.detail && r.detail.host) || "")} ${fmtAuditDetail(r.detail)}</td></tr>`).join("")
+        + `</tbody></table>`
+      : '<div class="empty">该类型暂无事件</div>';
+  }).catch(e => { box.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; });
+};
+
+// v1.19.0 §3.3：漏判样本折叠区（首次展开加载，切换时间窗重拉）
+const fpMissBox = document.getElementById("fpMissPanel");
+if (fpMissBox) {
+  const wrap = $("#fpMissWrap"), btn = $("#fpMissToggle");
+  let missLoaded = false;
+  if (btn) btn.onclick = () => {
+    const open = wrap.style.display !== "none";
+    wrap.style.display = open ? "none" : "";
+    if (btn) btn.textContent = open ? "展开 ▾" : "收起 ▴";
+    if (!open && !missLoaded) { missLoaded = true; fpLoadMiss(); }
+  };
+  if ($("#fpMissDays")) $("#fpMissDays").onchange = () => fpLoadMiss();
+  $("#fpMissList").addEventListener("click", (ev) => {
+    const b = ev.target.closest("button[data-miss-host]");
+    if (!b) return;
+    // 跳到指纹区：按 host 筛选 + 只看差一项达标，运营可直接批量确认
+    const host = b.dataset.missHost;
+    const fpPanel = document.getElementById("fpPanel");
+    if (fpPanel) {
+      const wrap = $("#fpWrap");
+      if (wrap && wrap.style.display === "none" && $("#fpToggle")) $("#fpToggle").click();
+    }
+    if ($("#fpStatusFilter")) $("#fpStatusFilter").value = "candidate";
+    if ($("#fpNearMiss")) $("#fpNearMiss").checked = true;
+    if ($("#fpHostFilter")) $("#fpHostFilter").value = host;
+    fpPage = 0;
+    fpLoad();
+    const target = document.getElementById("fpPanel");
+    if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+}
+
+// v1.19.0 §4.4：本页全选（列表会重建，用事件委托绑定）
+if ($("#fpList")) $("#fpList").addEventListener("change", (ev) => {
+  if (ev.target && ev.target.id === "fpCheckAll") {
+    const checked = ev.target.checked;
+    document.querySelectorAll(".fp-row-check").forEach(c => { c.checked = checked; });
+  }
+});
+function fpSelectedHashes() {
+  return Array.from(document.querySelectorAll(".fp-row-check:checked")).map(c => c.dataset.hash);
+}
+
 $("#btnFpReload").onclick = () => fpLoad();
 $("#fpStatusFilter").onchange = () => { fpPage = 0; fpLoad(); };
 $("#fpSourceFilter").onchange = () => { fpPage = 0; fpLoad(); };
 $("#fpOrder").onchange = () => { fpPage = 0; fpLoad(); };
+$("#fpDlFilter").onchange = () => { fpPage = 0; fpLoad(); };
+$("#fpMissGt").addEventListener("keydown", (ev) => { if (ev.key === "Enter") { fpPage = 0; fpLoad(); } });
+$("#fpMissGt").addEventListener("change", () => { fpPage = 0; fpLoad(); });
 $("#fpNearMiss").onchange = () => { fpPage = 0; fpLoad(); };
 $("#fpHostFilter").addEventListener("keydown", (ev) => { if (ev.key === "Enter") { fpPage = 0; fpLoad(); } });
 
@@ -2998,6 +3246,45 @@ $("#btnFpManual").onclick = async () => {
     await fpLoad();
   } catch (e) { toast("补录失败：" + e.message, true); }
   finally { btn.disabled = false; }
+};
+
+// v1.19.0 §4.4：批量停用（复用 review 数组 + lock）
+if ($("#btnFpBatchDisable")) $("#btnFpBatchDisable").onclick = async () => {
+  const hashes = fpSelectedHashes();
+  if (!hashes.length) { toast("请先勾选要停用的指纹", true); return; }
+  if (!confirm(`确认批量停用 ${hashes.length} 条指纹？\n将设为 disabled 并锁定，立即停止下发（发布规则包后客户端生效）。`)) return;
+  try {
+    const res = await api("/api/v1/adfilter/admin/fingerprints/review", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fp_hashes: hashes, status: "disabled", note: "批量停用止血", lock: true }),
+    });
+    toast(`已停用 ${res.updated} 条`);
+    await fpLoad();
+  } catch (e) { toast("批量停用失败：" + e.message, true); }
+};
+
+// v1.19.0 §4.4：批量删除（先预览将删除的明细行数，二次确认）
+if ($("#btnFpBatchDelete")) $("#btnFpBatchDelete").onclick = async () => {
+  const hashes = fpSelectedHashes();
+  if (!hashes.length) { toast("请先勾选要删除的指纹", true); return; }
+  try {
+    const pv = await api("/api/v1/adfilter/admin/fingerprints/batch-delete/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fp_hashes: hashes }),
+    });
+    const msg = `⚠️ 确认永久删除 ${fmtNum(pv.total_fingerprints)} 条指纹 / ${fmtNum(pv.total_segments)} 行上报明细？\n\n`
+      + `此操作不可恢复，rebuild 也无法重建（明细已删）。`
+      + (pv.not_found && pv.not_found.length ? `\n（${pv.not_found.length} 条 hash 不存在，将跳过）` : "")
+      + `\n删除后需发布规则包，客户端才会移除这些指纹。`;
+    if (!confirm(msg)) return;
+    const res = await api("/api/v1/adfilter/admin/fingerprints/batch-delete", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fp_hashes: hashes }),
+    });
+    toast(res.msg || `已删除 ${res.deleted_fingerprints} 条`);
+    await fpLoad();
+    if (typeof adLoad === "function") await adLoad();
+  } catch (e) { toast("批量删除失败：" + e.message, true); }
 };
 
 $("#btnFpBatchConfirm").onclick = async () => {
