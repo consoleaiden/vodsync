@@ -34,13 +34,14 @@ size_b = 0（客户端没提供）时 size_bucket 固定为 0，避免「提供�
 import hashlib
 import json
 import logging
+import time as time_module
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import func, select, text
+from sqlalchemy import case, func, select, text
 
 from . import config, database
-from .models import adfilter_fingerprints, adfilter_segments
+from .models import adfilter_admin_audit, adfilter_fingerprints, adfilter_segments
 
 log = logging.getLogger("vodsync.adfilter_fp")
 
@@ -215,8 +216,10 @@ def rebuild() -> dict:
       - 每个 fp_hash 聚合 distinct_users / distinct_urls / hit_count / 时间窗；
       - 样本三项都达标 → candidate 自动晋升 confirmed；
       - **已 disabled 的指纹永不自动改回**（人工/误杀降权的决定必须人工撤销）；
+      - **已 locked=1 的指纹（人工审核锁定）照常更新证据字段，但跳过 status 与
+        reviewed_at** —— 机器不能推翻人的决定（v1.18.0 §2.1）；
       - 已 confirmed 的若样本回落到门槛下（例如清理了历史数据）→ 降回 candidate，
-        避免下发一个证据已经消失的指纹。
+        避免下发一个证据已经消失的指纹；locked 行除外。
 
     v1.17.1 修复：pattern_json 必须携带 dur_bucket / size_bucket / dur_bucket_ms /
     size_bucket_b——downloadable() 从这里读桶字段下发给客户端，缺了会全部回落
@@ -224,7 +227,7 @@ def rebuild() -> dict:
     必然相同（fp_hash 就是桶字段算出来的），所以聚合时取 min(dur_ms)/min(size_b)
     样本即可无损还原桶字段；更新分支同样回写 pattern_json，保证存量坏数据在
     重跑 rebuild 后自动修复。
-    返回 {scanned, created, confirmed, demoted, disabled_kept}。
+    返回 {scanned, created, confirmed, demoted, disabled_kept, locked_kept}。
     """
     with database.engine.connect() as conn:
         grouped = conn.execute(
@@ -243,7 +246,7 @@ def rebuild() -> dict:
             .group_by(adfilter_segments.c.fp_hash, adfilter_segments.c.host)
         ).mappings().all()
 
-    created = confirmed = demoted = disabled_kept = 0
+    created = confirmed = demoted = disabled_kept = locked_kept = 0
     now = datetime.now()
 
     def _pattern(m: dict, hits: int, users: int, urls: int) -> dict:
@@ -286,6 +289,7 @@ def rebuild() -> dict:
                     adfilter_fingerprints.c.status,
                     adfilter_fingerprints.c.pattern_json,
                     adfilter_fingerprints.c.reviewed_at,
+                    adfilter_fingerprints.c.locked,
                 ).where(adfilter_fingerprints.c.fp_hash == fp_hash)
             ).mappings().first()
 
@@ -304,6 +308,7 @@ def rebuild() -> dict:
                     hit_count=hits, distinct_users=users, distinct_urls=urls,
                     first_seen_at=first_seen, last_seen_at=last_seen,
                     reviewed_at=now if status == STATUS_CONFIRMED else None,
+                    source="auto", locked=0,
                     created_at=now, updated_at=now,
                 ))
                 created += 1
@@ -311,18 +316,27 @@ def rebuild() -> dict:
                     confirmed += 1
             else:
                 old_status = existing["status"]
-                if old_status == STATUS_DISABLED:
-                    # 只更新时间证据与 pattern（桶字段修复），不动 status/confidence 的下发判定
+                is_locked = bool(existing["locked"])
+                if old_status == STATUS_DISABLED or is_locked:
+                    # disabled 与 locked 都只更新证据字段，不动 status/reviewed_at：
+                    #   - disabled：误杀降权是人工/自动的止血决定，永不自动恢复；
+                    #   - locked：人工审核锁定，机器不推翻人的决定（§2.1）。
+                    # 注意即使 locked 的当前状态是 confirmed，也照常更新 confidence，
+                    # 让「人工放行但样本在涨」的指纹置信度保持真实。
                     conn.execute(
                         adfilter_fingerprints.update()
                         .where(adfilter_fingerprints.c.id == existing["id"])
                         .values(
+                            confidence=confidence,
                             hit_count=hits, distinct_users=users, distinct_urls=urls,
                             pattern_json=pattern_json,
                             last_seen_at=last_seen, updated_at=now,
                         )
                     )
-                    disabled_kept += 1
+                    if is_locked:
+                        locked_kept += 1
+                    else:
+                        disabled_kept += 1
                     continue
                 new_status = STATUS_CONFIRMED if qualified else STATUS_CANDIDATE
                 conn.execute(
@@ -343,13 +357,15 @@ def rebuild() -> dict:
                 if old_status == STATUS_CONFIRMED and new_status == STATUS_CANDIDATE:
                     demoted += 1
 
-    # 明细被清空的指纹：保留实体（历史发布还可能引用），但状态降为 candidate
+    # 明细被清空的指纹：保留实体（历史发布还可能引用），但状态降为 candidate。
+    # locked / disabled 行豁免——人工锁定的 confirmed 不因明细清空而被机器降级。
     if seen:
         with database.write_txn() as conn:
             stale = conn.execute(
                 select(adfilter_fingerprints.c.id).where(
                     adfilter_fingerprints.c.fp_hash.notin_(list(seen)),
                     adfilter_fingerprints.c.status == STATUS_CONFIRMED,
+                    adfilter_fingerprints.c.locked == 0,
                 )
             ).scalars().all()
             for fid in stale:
@@ -366,6 +382,7 @@ def rebuild() -> dict:
         "confirmed": confirmed,
         "demoted": demoted,
         "disabled_kept": disabled_kept,
+        "locked_kept": locked_kept,
     }
     log.info("[adfilter_fp] rebuild 完成: %s", result)
     return result
@@ -460,7 +477,10 @@ def feedback(fp_hash: str, kind: str) -> dict:
             conn.execute(
                 adfilter_fingerprints.update()
                 .where(adfilter_fingerprints.c.id == row["id"])
-                .values(run_hits=adfilter_fingerprints.c.run_hits + 1, updated_at=now)
+                .values(
+                    run_hits=adfilter_fingerprints.c.run_hits + 1,
+                    last_hit_at=now, updated_at=now,
+                )
             )
             new_miss = int(row["miss_count"] or 0)
             status = row["status"]
@@ -476,6 +496,7 @@ def feedback(fp_hash: str, kind: str) -> dict:
                     status=new_status,
                     reviewed_at=now if disable else None,
                     note="误杀举报达阈值，自动停用" if disable else None,
+                    last_miss_at=now,
                     updated_at=now,
                 )
             )
@@ -494,37 +515,86 @@ def feedback(fp_hash: str, kind: str) -> dict:
 # ---------------------------------------------------------------------------
 # 管理端查询 / 审核
 # ---------------------------------------------------------------------------
+# 列表排序白名单：order 参数必须是这里的 key，避免任意列注入
+_LIST_ORDERS = {
+    "confidence_desc": (adfilter_fingerprints.c.confidence.desc(), adfilter_fingerprints.c.hit_count.desc()),
+    "hit_desc": (adfilter_fingerprints.c.hit_count.desc(), adfilter_fingerprints.c.confidence.desc()),
+    "miss_desc": (adfilter_fingerprints.c.miss_count.desc(), adfilter_fingerprints.c.hit_count.desc()),
+    "updated_desc": (adfilter_fingerprints.c.updated_at.desc(), adfilter_fingerprints.c.fp_hash.asc()),
+}
+
+
 def list_fingerprints(
     status: str = "",
     host: str = "",
     limit: int = 50,
     offset: int = 0,
+    source: str = "",
+    downloadable: Optional[bool] = None,
+    miss_gt: Optional[int] = None,
+    near_miss: bool = False,
+    order: str = "",
 ) -> dict:
-    """指纹分页列表（管理端）。status/host 可筛选，按置信度降序。"""
+    """
+    指纹分页列表（管理端，v1.18.0 §3.1）。status/host/source/downloadable/
+    miss_gt/near_miss 可筛选，order 排序，末尾始终按 fp_hash 兜底保证分页稳定。
+
+    near_miss=1：仅「恰好差一项达标」的 candidate（批量审核目标）。
+    downloadable 筛选在 SQL 层表达，保证 total 与分页一致。
+    """
+    fp = adfilter_fingerprints
     where = []
     if status in STATUSES:
-        where.append(adfilter_fingerprints.c.status == status)
+        where.append(fp.c.status == status)
     if host:
-        where.append(adfilter_fingerprints.c.host == host.strip().lower()[:253])
+        where.append(fp.c.host == host.strip().lower()[:253])
+    if source in ("auto", "manual"):
+        where.append(fp.c.source == source)
+    if miss_gt is not None:
+        where.append(fp.c.miss_count > max(0, int(miss_gt)))
+    if downloadable is True:
+        where.append(fp.c.status == STATUS_CONFIRMED)
+        where.append(fp.c.miss_count < config.ADFILTER_FP_MISS_DISABLE)
+    elif downloadable is False:
+        where.append(
+            (fp.c.status != STATUS_CONFIRMED)
+            | (fp.c.miss_count >= config.ADFILTER_FP_MISS_DISABLE)
+        )
+    if near_miss:
+        # 只差一项：candidate 且三项门槛中恰好两项达标
+        mu, mr, mh = (fp.c.distinct_users >= config.ADFILTER_FP_MIN_USERS,
+                      fp.c.distinct_urls >= config.ADFILTER_FP_MIN_URLS,
+                      fp.c.hit_count >= config.ADFILTER_FP_MIN_HITS)
+        where.append(fp.c.status == STATUS_CANDIDATE)
+        # SQLAlchemy 布尔表达式不能相加，用 case 转成 0/1 再求和
+        where.append(
+            (case((mu, 1), else_=0) + case((mr, 1), else_=0) + case((mh, 1), else_=0)) == 2
+        )
+
     limit = max(1, min(int(limit), 200))
     offset = max(0, int(offset))
+    order_cols = _LIST_ORDERS.get(order or "", _LIST_ORDERS["confidence_desc"])
+    order_by = tuple(order_cols) + (fp.c.fp_hash.asc(),)
 
     with database.engine.connect() as conn:
         total = conn.execute(
-            select(func.count()).select_from(adfilter_fingerprints).where(*where)
+            select(func.count()).select_from(fp).where(*where)
         ).scalar() or 0
         rows = conn.execute(
-            select(adfilter_fingerprints)
-            .where(*where)
-            .order_by(
-                adfilter_fingerprints.c.confidence.desc(),
-                adfilter_fingerprints.c.hit_count.desc(),
-            )
-            .limit(limit).offset(offset)
+            select(fp).where(*where).order_by(*order_by).limit(limit).offset(offset)
         ).mappings().all()
+
+    items = []
+    for r in rows:
+        item = _row_to_dict(r)
+        item["blocked_by"] = blocked_by_flags(
+            r["status"], int(r["distinct_users"] or 0),
+            int(r["distinct_urls"] or 0), int(r["hit_count"] or 0),
+        )
+        items.append(item)
     return {
         "total": int(total),
-        "items": [_row_to_dict(r) for r in rows],
+        "items": items,
         "limit": limit,
         "offset": offset,
     }
@@ -540,23 +610,51 @@ def get_fingerprint(fp_hash: str) -> Optional[dict]:
     return _row_to_dict(row) if row else None
 
 
+def _block_reason(status: str, miss_count: int, fp_hash: str = "") -> str:
+    """
+    解释「为什么没下发」："" | miss_threshold | not_confirmed | capped。
+    capped 需要结合下发排名，由调用方在列表场景额外判定（此处只判前两种）。
+
+    误杀达阈值优先于状态判断：disabled 若因误杀触发（miss_count 达阈值），
+    报 miss_threshold 才能向运营解释「止血的原因」，而不是笼统的 not_confirmed。
+    """
+    if miss_count >= config.ADFILTER_FP_MISS_DISABLE:
+        return "miss_threshold"
+    if status != STATUS_CONFIRMED:
+        return "not_confirmed"
+    return ""
+
+
 def _row_to_dict(m) -> dict:
+    status = m["status"]
+    miss_count = int(m["miss_count"] or 0)
+    run_hits = int(m["run_hits"] or 0)
+    reason = _block_reason(status, miss_count)
     return {
         "id": int(m["id"]),
         "fp_hash": m["fp_hash"],
         "host": m["host"],
         "pattern": _safe_json(m["pattern_json"]),
-        "status": m["status"],
+        "status": status,
         "confidence": round(float(m["confidence"] or 0), 4),
         "hit_count": int(m["hit_count"] or 0),
         "distinct_users": int(m["distinct_users"] or 0),
         "distinct_urls": int(m["distinct_urls"] or 0),
-        "run_hits": int(m["run_hits"] or 0),
-        "miss_count": int(m["miss_count"] or 0),
-        "downloadable": (
-            m["status"] == STATUS_CONFIRMED
-            and int(m["miss_count"] or 0) < config.ADFILTER_FP_MISS_DISABLE
-        ),
+        "run_hits": run_hits,
+        "miss_count": miss_count,
+        "downloadable": reason == "",
+        "block_reason": reason,
+        # 命中率：run_hits / (run_hits + miss_count)，无反馈时为 0
+        "hit_rate": round(run_hits / (run_hits + miss_count), 4) if (run_hits + miss_count) else 0,
+        # v1.18.0 运营字段
+        "locked": bool(m["locked"]) if "locked" in m.keys() else False,
+        "source": m["source"] if "source" in m.keys() else "auto",
+        "last_reset_at": (m["last_reset_at"].isoformat()
+                          if "last_reset_at" in m.keys() and m["last_reset_at"] else None),
+        "last_hit_at": (m["last_hit_at"].isoformat()
+                        if "last_hit_at" in m.keys() and m["last_hit_at"] else None),
+        "last_miss_at": (m["last_miss_at"].isoformat()
+                         if "last_miss_at" in m.keys() and m["last_miss_at"] else None),
         "first_seen_at": int(m["first_seen_at"] or 0) or None,
         "last_seen_at": int(m["last_seen_at"] or 0) or None,
         "reviewed_at": m["reviewed_at"].isoformat() if m["reviewed_at"] else None,
@@ -573,34 +671,156 @@ def _safe_json(raw: str) -> dict:
         return {}
 
 
-def review(fp_hash: str, status: str, note: str = "") -> dict:
+def _apply_review(conn, fp_hash: str, status: str, note: str, lock: bool, now) -> bool:
+    """
+    单条审核的实际写库（在调用方的事务里执行）。返回是否命中行。
+
+    lock=True（默认）：认为这是人工决定，写 locked=1 + status + reviewed_at。
+    lock=False：「交还自动」，写 locked=0、状态保持当前值由下次 rebuild 接管；
+               reviewed_at/note 仍写，保留操作留痕。
+    status=confirmed 时复位 miss_count + 写 last_reset_at（§2.2 止血后可解除）。
+    """
+    row = conn.execute(
+        select(adfilter_fingerprints.c.id).where(adfilter_fingerprints.c.fp_hash == fp_hash)
+    ).first()
+    if row is None:
+        return False
+    values = {
+        "note": (note or "")[:MAX_NOTE],
+        "reviewed_at": now,
+        "updated_at": now,
+    }
+    if lock:
+        values["status"] = status
+        values["locked"] = 1
+    else:
+        values["locked"] = 0
+        # 交还自动：不动 status，让 rebuild 依据样本重新判定
+    if status == STATUS_CONFIRMED:
+        # 人工确认 → 误杀计数归零，避免「disabled 后确认但仍不下发」的死结
+        values["miss_count"] = 0
+        values["last_reset_at"] = now
+    conn.execute(
+        adfilter_fingerprints.update()
+        .where(adfilter_fingerprints.c.fp_hash == fp_hash)
+        .values(**values)
+    )
+    return True
+
+
+def review(fp_hash: str, status: str, note: str = "", lock: bool = True) -> dict:
     """
     人工审核指纹（管理端）：把状态设为 confirmed / candidate / disabled 之一。
 
     人工 confirmed 不受样本门槛限制（运营判断优先），但要写 reviewed_at。
     disabled 是「止血」，永不自动恢复。
+    lock 缺省 True（向后兼容：老调用方语义等同「审核即锁定」，rebuild 不再覆盖）；
+    lock=False 表示交还自动判定。status=confirmed 时复位误杀计数（§2.2）。
     """
     if status not in STATUSES:
         raise FPError(f"status 必须是 {'/'.join(STATUSES)}", "status")
     fp_hash = (fp_hash or "").strip().lower()
+    now = datetime.now()
     with database.write_txn() as conn:
-        row = conn.execute(
-            select(adfilter_fingerprints.c.id)
-            .where(adfilter_fingerprints.c.fp_hash == fp_hash)
-        ).first()
-        if row is None:
+        if not _apply_review(conn, fp_hash, status, note, bool(lock), now):
             raise LookupError(f"不存在指纹 {fp_hash}")
-        conn.execute(
-            adfilter_fingerprints.update()
-            .where(adfilter_fingerprints.c.fp_hash == fp_hash)
-            .values(
-                status=status,
-                note=(note or "")[:MAX_NOTE],
-                reviewed_at=datetime.now(),
-                updated_at=datetime.now(),
-            )
-        )
     return get_fingerprint(fp_hash)
+
+
+def batch_review(fp_hashes: list, status: str, note: str = "", lock: bool = True) -> dict:
+    """
+    批量人工审核（§3.2）。单事务处理，返回 {updated, not_found, items}。
+    不存在的 hash 收集到 not_found 而不中断整批；status 非法抛 FPError。
+    """
+    if status not in STATUSES:
+        raise FPError(f"status 必须是 {'/'.join(STATUSES)}", "status")
+    hashes = []
+    for h in (fp_hashes or []):
+        hv = (h or "").strip().lower()
+        if hv and hv not in hashes:
+            hashes.append(hv)
+    if not hashes:
+        raise FPError("fp_hashes 不能为空", "fp_hashes")
+    now = datetime.now()
+    not_found = []
+    with database.write_txn() as conn:
+        for fp_hash in hashes:
+            if not _apply_review(conn, fp_hash, status, note, bool(lock), now):
+                not_found.append(fp_hash)
+    return {
+        "updated": len(hashes) - len(not_found),
+        "not_found": not_found,
+        "items": [get_fingerprint(h) for h in hashes if h not in not_found],
+    }
+
+
+def manual_create(host: str, dur_ms: int, size_b: int = 0, note: str = "") -> dict:
+    """
+    人工补录指纹（§2.3）：运营确认某站广告切片特征后直接录入 confirmed。
+
+    不接受调用方传入 fp_hash —— 必须由 signature() 按服务端口径计算，否则无法校验真伪。
+    幂等：fp_hash 已存在时只补确认（status=confirmed / locked=1 / source=manual /
+    confidence=1.0 / note），不返回 409，运营重复提交也安全；created=False 表示合并。
+
+    校验：host 非空、dur_ms ∈ [1, 3600000]、size_b ∈ [0, 2^31)，越界抛 FPError。
+    """
+    host = (host or "").strip().lower()
+    if not host:
+        raise FPError("host 不能为空", "host")
+    try:
+        dur = int(dur_ms)
+        size = int(size_b or 0)
+    except (TypeError, ValueError):
+        raise FPError("dur_ms / size_b 必须是整数", "dur_ms")
+    if not (1 <= dur <= 3_600_000):
+        raise FPError("dur_ms 必须在 1 ~ 3600000 之间", "dur_ms")
+    if not (0 <= size < 2 ** 31):
+        raise FPError("size_b 必须在 0 ~ 2147483647 之间", "size_b")
+
+    sig = signature(host, dur, size)
+    fp_hash = sig["fp_hash"]
+    pattern_json = json.dumps(sig["pattern"], ensure_ascii=False)[:MAX_PATTERN_JSON]
+    now = datetime.now()
+    with database.write_txn() as conn:
+        existing = conn.execute(
+            select(adfilter_fingerprints.c.id).where(adfilter_fingerprints.c.fp_hash == fp_hash)
+        ).first()
+        if existing is None:
+            conn.execute(adfilter_fingerprints.insert().values(
+                fp_hash=fp_hash, host=host, pattern_json=pattern_json,
+                status=STATUS_CONFIRMED, confidence=1.0,
+                hit_count=0, distinct_users=0, distinct_urls=0,
+                first_seen_at=0, last_seen_at=0,
+                source="manual", locked=1,
+                reviewed_at=now, note=(note or "")[:MAX_NOTE],
+                created_at=now, updated_at=now,
+            ))
+            created = True
+        else:
+            # 幂等合并：只补确认与来源，保留已有样本计数/命中时间。
+            conn.execute(
+                adfilter_fingerprints.update()
+                .where(adfilter_fingerprints.c.fp_hash == fp_hash)
+                .values(
+                    pattern_json=pattern_json, status=STATUS_CONFIRMED,
+                    confidence=1.0, source="manual", locked=1,
+                    miss_count=0, last_reset_at=now,
+                    reviewed_at=now, note=(note or "")[:MAX_NOTE],
+                    updated_at=now,
+                )
+            )
+            created = False
+    row = get_fingerprint(fp_hash)
+    return {"created": created, "fingerprint": row}
+
+
+def blocked_by_flags(status: str, users: int, urls: int, hits: int) -> dict:
+    """一条 candidate 卡在哪些门槛上（供列表/near_miss 用）。"""
+    return {
+        "users": bool(status == STATUS_CANDIDATE and users < config.ADFILTER_FP_MIN_USERS),
+        "urls": bool(status == STATUS_CANDIDATE and urls < config.ADFILTER_FP_MIN_URLS),
+        "hits": bool(status == STATUS_CANDIDATE and hits < config.ADFILTER_FP_MIN_HITS),
+    }
 
 
 def delete_fingerprint(fp_hash: str) -> dict:
@@ -646,25 +866,76 @@ def delete_fingerprint(fp_hash: str) -> dict:
 
 
 def stats() -> dict:
-    """指纹库概览（管理端面板用）：各状态数量 + 累计命中/误杀。"""
+    """
+    指纹库概览（管理端面板用，v1.18.0 扩展）：
+    各状态数量 + 累计命中/误杀 + 人工锁定/来源 + 达标阻断分桶 + 下发上限可见。
+    """
+    fp = adfilter_fingerprints
     with database.engine.connect() as conn:
         rows = conn.execute(
             select(
-                adfilter_fingerprints.c.status,
+                fp.c.status,
                 func.count().label("n"),
-                func.coalesce(func.sum(adfilter_fingerprints.c.hit_count), 0).label("hits"),
-                func.coalesce(func.sum(adfilter_fingerprints.c.run_hits), 0).label("runs"),
-                func.coalesce(func.sum(adfilter_fingerprints.c.miss_count), 0).label("miss"),
-            ).group_by(adfilter_fingerprints.c.status)
+                func.coalesce(func.sum(fp.c.hit_count), 0).label("hits"),
+                func.coalesce(func.sum(fp.c.run_hits), 0).label("runs"),
+                func.coalesce(func.sum(fp.c.miss_count), 0).label("miss"),
+            ).group_by(fp.c.status)
         ).mappings().all()
+        extras = conn.execute(
+            select(
+                func.count().label("total"),
+                func.coalesce(func.sum(case((fp.c.locked == 1, 1), else_=0)), 0).label("locked"),
+                func.coalesce(func.sum(case((fp.c.source == "manual", 1), else_=0)), 0).label("manual"),
+                # candidate 中各项未达标的数量（blocked_by 分桶）
+                func.coalesce(func.sum(case((
+                    (fp.c.status == STATUS_CANDIDATE) & (fp.c.distinct_users < config.ADFILTER_FP_MIN_USERS), 1), else_=0)), 0).label("b_users"),
+                func.coalesce(func.sum(case((
+                    (fp.c.status == STATUS_CANDIDATE) & (fp.c.distinct_urls < config.ADFILTER_FP_MIN_URLS), 1), else_=0)), 0).label("b_urls"),
+                func.coalesce(func.sum(case((
+                    (fp.c.status == STATUS_CANDIDATE) & (fp.c.hit_count < config.ADFILTER_FP_MIN_HITS), 1), else_=0)), 0).label("b_hits"),
+                # confirmed 但被误杀阈值挡住（不下发）的数量
+                func.coalesce(func.sum(case((
+                    (fp.c.status == STATUS_CONFIRMED) & (fp.c.miss_count >= config.ADFILTER_FP_MISS_DISABLE), 1), else_=0)), 0).label("c_blocked"),
+            )
+        ).mappings().first()
+        # 明细体量与最早时间（§3.4 面板概览）
+        detail = conn.execute(
+            select(
+                func.count().label("segments"),
+                func.min(adfilter_segments.c.at).label("oldest"),
+            ).select_from(adfilter_segments)
+        ).mappings().first()
+
     by_status = {r["status"]: int(r["n"]) for r in rows}
+    e = extras or {}
+    confirmed_total = by_status.get(STATUS_CONFIRMED, 0)
+    dl_count = len(downloadable())  # 实际下发数（已按 cap 截断）
+    not_delivered_by_cap = max(0, confirmed_total - dl_count)
     return {
         "total": sum(by_status.values()),
         "by_status": {s: by_status.get(s, 0) for s in STATUSES},
-        "downloadable": len(downloadable()),
+        "downloadable": dl_count,
         "total_hits": sum(int(r["hits"] or 0) for r in rows),
         "total_run_hits": sum(int(r["runs"] or 0) for r in rows),
         "total_miss": sum(int(r["miss"] or 0) for r in rows),
+        # v1.18.0 新增
+        "manual_count": int(e.get("manual") or 0),
+        "locked_count": int(e.get("locked") or 0),
+        "confirmed_total": confirmed_total,
+        "not_delivered_by_cap": not_delivered_by_cap,
+        "capped": not_delivered_by_cap > 0,
+        "confirmed_but_blocked": int(e.get("c_blocked") or 0),
+        "blocked_by": {
+            "users": int(e.get("b_users") or 0),
+            "urls": int(e.get("b_urls") or 0),
+            "hits": int(e.get("b_hits") or 0),
+        },
+        "detail": {
+            "segments": int((detail or {}).get("segments") or 0),
+            "oldest_at": int((detail or {}).get("oldest") or 0) or None,
+            "segment_retention_days": config.ADFILTER_SEGMENT_RETENTION_DAYS,
+            "report_retention_days": config.ADFILTER_REPORT_RETENTION_DAYS,
+        },
         "config": {
             "dur_bucket_ms": config.ADFILTER_FP_DUR_BUCKET_MS,
             "size_bucket_b": config.ADFILTER_FP_SIZE_BUCKET_B,
@@ -676,3 +947,75 @@ def stats() -> dict:
             "enabled": config.ADFILTER_FP_ENABLED,
         },
     }
+
+
+def miss_samples(days: int = 7, limit: int = 50) -> dict:
+    """
+    漏判样本明细（§3.3）：按 host 聚合「上报了但没过滤掉」（removed_runs=0）的举报，
+    left join 指纹库给出覆盖度与判定，帮助运营回答「这个站为什么还在漏」。
+
+    verdict:
+      - uncovered      该 host 无任何指纹
+      - candidate_only 有指纹但无可下发（未达标/未发布）
+      - covered        有下发中指纹却仍被举报 → 指纹不准或广告换了切片
+    **不返回 url 原文**，沿用隐私口径（host 级聚合）。
+    """
+    from .models import adfilter_reports  # 局部导入避免顶部循环依赖噪音
+
+    days = max(1, min(int(days), 365))
+    limit = max(1, min(int(limit), 200))
+    cutoff = int(time_module.time()) - days * 86400
+    with database.engine.connect() as conn:
+        hosts = conn.execute(
+            select(
+                adfilter_reports.c.host,
+                func.count().label("reports"),
+                func.count(func.distinct(adfilter_reports.c.url_hash)).label("urls"),
+                func.max(adfilter_reports.c.at).label("last_at"),
+            )
+            .where(
+                adfilter_reports.c.removed_runs == 0,
+                adfilter_reports.c.at >= cutoff,
+                adfilter_reports.c.host != "",
+            )
+            .group_by(adfilter_reports.c.host)
+            .order_by(func.count().desc())
+            .limit(limit)
+        ).mappings().all()
+        host_names = [h["host"] for h in hosts]
+        fps = []
+        if host_names:
+            fps = conn.execute(
+                select(
+                    adfilter_fingerprints.c.host,
+                    func.count().label("n"),
+                    func.sum(case((adfilter_fingerprints.c.status == STATUS_CONFIRMED, 1), else_=0)).label("confirmed"),
+                    func.sum(case((
+                        (adfilter_fingerprints.c.status == STATUS_CONFIRMED)
+                        & (adfilter_fingerprints.c.miss_count < config.ADFILTER_FP_MISS_DISABLE), 1), else_=0)).label("dl"),
+                )
+                .where(adfilter_fingerprints.c.host.in_(host_names))
+                .group_by(adfilter_fingerprints.c.host)
+            ).mappings().all()
+    fp_by_host = {f["host"]: f for f in fps}
+    items = []
+    for h in hosts:
+        f = fp_by_host.get(h["host"])
+        n = int(f["n"] or 0) if f else 0
+        confirmed = int(f["confirmed"] or 0) if f else 0
+        dl = int(f["dl"] or 0) if f else 0
+        if dl > 0:
+            verdict = "covered"
+        elif n > 0:
+            verdict = "candidate_only"
+        else:
+            verdict = "uncovered"
+        items.append({
+            "host": h["host"],
+            "reports": int(h["reports"] or 0),
+            "distinct_urls": int(h["urls"] or 0),
+            "last_at": int(h["last_at"] or 0) or None,
+            "fingerprints": {"total": n, "confirmed": confirmed, "downloadable": dl},
+            "verdict": verdict,
+        })
+    return {"days": days, "total": len(items), "items": items}

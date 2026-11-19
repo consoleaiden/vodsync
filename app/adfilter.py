@@ -380,6 +380,7 @@ def get(version: int, channel: str = DEFAULT_CHANNEL):
             select(
                 adfilter_rule_packs.c.version, adfilter_rule_packs.c.rules_json,
                 adfilter_rule_packs.c.note, adfilter_rule_packs.c.created_at,
+                adfilter_rule_packs.c.fingerprint_count,
             )
             .where(
                 adfilter_rule_packs.c.channel == ch,
@@ -388,12 +389,17 @@ def get(version: int, channel: str = DEFAULT_CHANNEL):
         ).mappings().first()
     if not row:
         return None
+    rules = _loads(row["rules_json"])
+    fp_count = row["fingerprint_count"]
+    if fp_count is None:  # 历史行兜底：从 rules_json 解析
+        fp_count = len(rules.get("fingerprints") or [])
     return {
         "channel": ch,
         "version": int(row["version"]),
-        "rules": _loads(row["rules_json"]),
+        "rules": rules,
         "note": row["note"] or "",
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "fingerprint_count": int(fp_count or 0),
     }
 
 
@@ -404,33 +410,43 @@ def list_versions(channel: str = DEFAULT_CHANNEL, limit: int = 20) -> list:
         rows = conn.execute(
             select(
                 adfilter_rule_packs.c.version, adfilter_rule_packs.c.note,
-                adfilter_rule_packs.c.created_at,
+                adfilter_rule_packs.c.created_at, adfilter_rule_packs.c.rules_json,
+                adfilter_rule_packs.c.fingerprint_count,
                 func.length(adfilter_rule_packs.c.rules_json).label("size"),
             )
             .where(adfilter_rule_packs.c.channel == ch)
             .order_by(adfilter_rule_packs.c.version.desc())
             .limit(max(1, int(limit)))
         ).mappings().all()
-    return [{
-        "version": int(r["version"]),
-        "note": r["note"] or "",
-        "size": int(r["size"] or 0),
-        "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-    } for r in rows]
+    out = []
+    for r in rows:
+        fp_count = r["fingerprint_count"]
+        if fp_count is None:  # 历史行兜底
+            fp_count = len((_loads(r["rules_json"]).get("fingerprints") or []))
+        out.append({
+            "version": int(r["version"]),
+            "note": r["note"] or "",
+            "size": int(r["size"] or 0),
+            "fingerprint_count": int(fp_count or 0),
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        })
+    return out
 
 
 # ---------------------------------------------------------------------------
 # 发布 / 回滚
 # ---------------------------------------------------------------------------
-def _insert_next(ch: str, rules: dict, note: str) -> int:
+def _insert_next(ch: str, rules: dict, note: str, fingerprint_count: int = 0) -> int:
     """
     插入「当前最大版本 +1」的一行，返回新版本号。
 
     用一条 INSERT ... SELECT MAX(version)+1 完成递增，避免「先读后写」的竞态；
     并发发布撞唯一索引时由调用方转成 409（管理员操作，重试一次即可）。
+    fingerprint_count（v1.18.0）单独存列，publish-state 无需解析 rules_json。
     """
     payload = dumps(rules)
     now = datetime.now()
+    fp_count = max(0, int(fingerprint_count or 0))
     with database.write_txn() as conn:
         if database.is_sqlite():
             # SQLite 的 INSERT..SELECT 不能引用同表做聚合写入的语义差异较大，
@@ -443,59 +459,106 @@ def _insert_next(ch: str, rules: dict, note: str) -> int:
             conn.execute(adfilter_rule_packs.insert().values(
                 channel=ch, version=version, rules_json=payload,
                 note=(note or "")[:255], created_at=now,
+                fingerprint_count=fp_count,
             ))
             return version
         version = conn.execute(
             text(
-                "INSERT INTO adfilter_rule_packs (channel, version, rules_json, note, created_at) "
-                "SELECT :ch, COALESCE(MAX(version), 0) + 1, :rules, :note, :ts "
+                "INSERT INTO adfilter_rule_packs "
+                "(channel, version, rules_json, note, created_at, fingerprint_count) "
+                "SELECT :ch, COALESCE(MAX(version), 0) + 1, :rules, :note, :ts, :fp_count "
                 "FROM adfilter_rule_packs WHERE channel = CAST(:ch AS VARCHAR(16)) "
                 "RETURNING version"
             ),
-            {"ch": ch, "rules": payload, "note": (note or "")[:255], "ts": now},
+            {"ch": ch, "rules": payload, "note": (note or "")[:255],
+             "ts": now, "fp_count": fp_count},
         ).scalar()
     return int(version)
 
 
-def publish(rules, channel: str = DEFAULT_CHANNEL, note: str = "") -> dict:
+def bucket_drift() -> bool:
     """
-    发布新版本：校验 → 版本 +1 入库。返回 {version, rules, warnings, channel}。
+    桶宽漂移检测（§4.5）：库内任一指纹的 pattern.dur_bucket_ms / size_bucket_b
+    与当前 config 不一致时为 True。桶宽一改，fp_hash 全失效（fp_hash 由桶算），
+    历史指纹会与客户端算出的值对不上——此时必须拒绝发布并提示运维迁移。
+    """
+    try:
+        with database.engine.connect() as conn:
+            rows = conn.execute(
+                select(adfilter_fp.adfilter_fingerprints.c.pattern_json)
+            ).scalars().all()
+        for raw in rows:
+            pat = adfilter_fp._safe_json(raw)
+            if (pat and "dur_bucket_ms" in pat
+                    and int(pat.get("dur_bucket_ms", 0)) != config.ADFILTER_FP_DUR_BUCKET_MS):
+                return True
+            if (pat and "size_bucket_b" in pat
+                    and int(pat.get("size_bucket_b", 0)) != config.ADFILTER_FP_SIZE_BUCKET_B):
+                return True
+        return False
+    except Exception as e:  # noqa: BLE001 —— 检测失败保守当作无漂移，不阻断发布
+        log.warning("[adfilter] 桶宽漂移检测失败: %s", str(e)[:160])
+        return False
+
+
+def publish(rules, channel: str = DEFAULT_CHANNEL, note: str = "",
+            allow_bucket_drift: bool = False) -> dict:
+    """
+    发布新版本：校验 → 版本 +1 入库。返回 {version, rules, warnings, channel, fingerprint_count}。
 
     校验失败抛 RuleError（调用方转 400），并发撞版本抛 IntegrityError（转 409）。
+    桶宽漂移时拒绝发布（§4.5），除非显式 allow_bucket_drift=True（运维迁移脚本用）。
     """
     ch = normalize_channel(channel)
+    if not allow_bucket_drift and bucket_drift():
+        raise RuleError(
+            "桶宽已变更，全库指纹失效，需先按 segments.dur_ms 重算迁移后再发布",
+            "bucket_drift",
+        )
     clean = normalize(rules)
     clean = _inject_fingerprints(clean)
+    fp_count = len(clean.get("fingerprints") or [])
     # 唯一索引冲突（并发发布撞同一个 version）不在这里吞：交给路由层转 409，
     # 让管理员知道「重试一次」而不是看到一个笼统的 500。
-    version = _insert_next(ch, clean, note)
-    log.info("[adfilter] 规则包已发布 channel=%s version=%s（%s）", ch, version, note or "无备注")
+    version = _insert_next(ch, clean, note, fingerprint_count=fp_count)
+    log.info("[adfilter] 规则包已发布 channel=%s version=%s（%s，指纹 %d 条）",
+             ch, version, note or "无备注", fp_count)
     return {
         "channel": ch,
         "version": version,
         "rules": clean,
         "warnings": warnings_for(clean),
+        "fingerprint_count": fp_count,
     }
 
 
-def rollback(version: int, channel: str = DEFAULT_CHANNEL, note: str = "") -> dict:
+def rollback(version: int, channel: str = DEFAULT_CHANNEL, note: str = "",
+             allow_bucket_drift: bool = False) -> dict:
     """
     回滚到历史版本：**不修改历史行**，用旧内容发一个新版本（version+1）。
 
     这样客户端只按「版本号变大就换」处理，不需要「服务端版本变小」的分支；
     回滚本身也可再回滚（历史全在）。
+
+    注意（§2.5）：回滚只恢复 thresholds / url_patterns / site_overrides，
+    **指纹永远取当前库快照**（不恢复旧包的指纹集合）——这是合理设计，避免把
+    已知误杀的指纹放回来。fingerprint_count 返回本次实际携带的指纹条数，
+    供面板确认框如实提示运营。
     """
     ch = normalize_channel(channel)
+    if not allow_bucket_drift and bucket_drift():
+        raise RuleError("桶宽已变更，全库指纹失效，需先重算迁移后再回滚发布", "bucket_drift")
     src = get(version, ch)
     if not src:
         raise LookupError(f"渠道 {ch} 不存在版本 {version}")
     clean = normalize(src["rules"])
     clean = _inject_fingerprints(clean)
+    fp_count = len(clean.get("fingerprints") or [])
     label = (note or f"回滚至 v{version}")[:255]
-    new_version = _insert_next(ch, clean, label)
+    new_version = _insert_next(ch, clean, label, fingerprint_count=fp_count)
     log.info(
-        "[adfilter] 规则包已回滚 channel=%s v%s -> 新版本 v%s（%s）",
-        ch, version, new_version, label,
+        "[adfilter] 规则包已回滚 channel=%s v%s -> 新版本 v%s（%s，指纹 %d 条）",
+        ch, version, new_version, label, fp_count,
     )
     return {
         "channel": ch,
@@ -503,7 +566,132 @@ def rollback(version: int, channel: str = DEFAULT_CHANNEL, note: str = "") -> di
         "rolled_back_from": int(version),
         "rules": clean,
         "warnings": warnings_for(clean),
+        "fingerprint_count": fp_count,
     }
+
+
+def publish_state(channel: str = DEFAULT_CHANNEL) -> dict:
+    """
+    发布状态与差异预览（§2.4）：运营发布前判断「指纹库是否有未发布的变更」。
+
+    pack     当前规则包（版本/时间/指纹条数）
+    library  指纹库现状（总数/确认/可下发/人工/被阻断/是否截断）
+    pending  相对当前包是否有未发布变更（集合差 + 审核/自动停用时间比较）
+    rebuild  最近一次重算结果（从审计表读）
+    bucket   当前桶宽 + 是否漂移
+
+    全部只读，不改库；任何一步失败都降级为空差异，绝不 500（管理面板首屏用）。
+    """
+    ch = normalize_channel(channel)
+    empty_pending = {"dirty": False, "fp_added": 0, "fp_removed": 0,
+                     "reviewed_since_publish": 0, "auto_disabled_since_publish": 0}
+    empty_rebuild = {"last_at": None, "created": 0, "confirmed": 0,
+                     "demoted": 0, "locked_kept": 0}
+    try:
+        pack = current(ch)
+        pack_version = int(pack.get("version") or 0)
+        pack_rules = pack.get("rules") or {}
+        pack_created = None
+        pack_note = ""
+        pack_fp_count = len(pack_rules.get("fingerprints") or [])
+        with database.engine.connect() as conn:
+            prow = conn.execute(
+                select(
+                    adfilter_rule_packs.c.created_at, adfilter_rule_packs.c.note,
+                    adfilter_rule_packs.c.fingerprint_count,
+                )
+                .where(adfilter_rule_packs.c.channel == ch,
+                       adfilter_rule_packs.c.version == pack_version)
+            ).mappings().first()
+            if prow:
+                pack_created = prow["created_at"]
+                pack_note = prow["note"] or ""
+                if prow["fingerprint_count"] is not None:
+                    pack_fp_count = int(prow["fingerprint_count"])
+
+            # 当前 downloadable 集合 vs 包内指纹集合
+            dl = adfilter_fp.downloadable()
+            dl_hashes = {f["fp_hash"] for f in dl}
+            pack_hashes = {
+                str(f.get("fp_hash") or "") for f in (pack_rules.get("fingerprints") or [])
+            }
+            fp_added = len(dl_hashes - pack_hashes)
+            fp_removed = len(pack_hashes - dl_hashes)
+
+            reviewed_since = 0
+            auto_disabled_since = 0
+            if pack_created is not None:
+                reviewed_since = conn.execute(
+                    select(func.count()).select_from(adfilter_fp.adfilter_fingerprints)
+                    .where(adfilter_fp.adfilter_fingerprints.c.reviewed_at > pack_created)
+                ).scalar() or 0
+                auto_disabled_since = conn.execute(
+                    select(func.count()).select_from(adfilter_fp.adfilter_fingerprints)
+                    .where(
+                        adfilter_fp.adfilter_fingerprints.c.status == adfilter_fp.STATUS_DISABLED,
+                        adfilter_fp.adfilter_fingerprints.c.updated_at > pack_created,
+                    )
+                ).scalar() or 0
+
+        st = adfilter_fp.stats()
+        pending = {
+            "dirty": bool(fp_added or fp_removed or reviewed_since or auto_disabled_since),
+            "fp_added": fp_added,
+            "fp_removed": fp_removed,
+            "reviewed_since_publish": int(reviewed_since),
+            "auto_disabled_since_publish": int(auto_disabled_since),
+        }
+
+        # 最近一次 rebuild 结果（审计表）
+        from . import audit  # 局部导入避免潜在循环
+        rebuild_info = dict(empty_rebuild)
+        ra = audit.list_audit(limit=1, action="rebuild")
+        if ra["items"]:
+            r0 = ra["items"][0]
+            d0 = r0.get("detail") or {}
+            rebuild_info.update({
+                "last_at": r0.get("at"),
+                "created": int(d0.get("created") or 0),
+                "confirmed": int(d0.get("confirmed") or 0),
+                "demoted": int(d0.get("demoted") or 0),
+                "locked_kept": int(d0.get("locked_kept") or 0),
+            })
+
+        return {
+            "channel": ch,
+            "pack": {
+                "version": pack_version,
+                "created_at": pack_created.isoformat() if pack_created else None,
+                "note": pack_note,
+                "fingerprint_count": pack_fp_count,
+            },
+            "library": {
+                "total": int(st.get("total") or 0),
+                "confirmed": int((st.get("by_status") or {}).get("confirmed") or 0),
+                "downloadable": int(st.get("downloadable") or 0),
+                "manual": int(st.get("manual_count") or 0),
+                "confirmed_but_blocked": int(st.get("confirmed_but_blocked") or 0),
+                "capped": bool(st.get("capped")),
+                "max_download": config.ADFILTER_FP_MAX_DOWNLOAD,
+            },
+            "pending": pending,
+            "rebuild": rebuild_info,
+            "bucket": {
+                "dur_bucket_ms": config.ADFILTER_FP_DUR_BUCKET_MS,
+                "size_bucket_b": config.ADFILTER_FP_SIZE_BUCKET_B,
+                "drift": bucket_drift(),
+            },
+        }
+    except Exception as e:  # noqa: BLE001 —— 管理面板首屏，失败降级不 500
+        log.warning("[adfilter] publish_state 计算失败，降级空差异: %s", str(e)[:160])
+        return {
+            "channel": ch,
+            "pack": {"version": 0, "created_at": None, "note": "", "fingerprint_count": 0},
+            "library": {}, "pending": empty_pending,
+            "rebuild": dict(empty_rebuild),
+            "bucket": {"dur_bucket_ms": config.ADFILTER_FP_DUR_BUCKET_MS,
+                       "size_bucket_b": config.ADFILTER_FP_SIZE_BUCKET_B, "drift": False},
+        }
 
 
 def ensure_seed() -> None:

@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import and_, delete, func, select, text
 
 from . import config, database
-from .models import sync_logs
+from .models import adfilter_reports, adfilter_segments, sync_logs
 
 log = logging.getLogger("vodsync.housekeeping")
 
@@ -136,10 +136,47 @@ def checkpoint_wal() -> dict:
     return result
 
 
+def prune_adfilter_details(
+    segment_days: int = None,
+    report_days: int = None,
+) -> dict:
+    """
+    清理去广告上报明细（v1.18.0 §3.4）：adfilter_segments / adfilter_reports 按 at 保留 N 天。
+
+    两个保留天数默认读 config，值为 0 时关闭该类清理（默认关闭，先观察体量）。
+    删除后下次 rebuild 会因样本证据减少自动 demote 对应指纹（符合设计）。
+    返回 {"segments_deleted", "reports_deleted", "segment_days", "report_days"}。
+    """
+    segment_days = config.ADFILTER_SEGMENT_RETENTION_DAYS if segment_days is None else segment_days
+    report_days = config.ADFILTER_REPORT_RETENTION_DAYS if report_days is None else report_days
+    segment_days = max(0, int(segment_days))
+    report_days = max(0, int(report_days))
+    now_ms = int(datetime.now().timestamp())
+    out = {"segments_deleted": 0, "reports_deleted": 0,
+           "segment_days": segment_days, "report_days": report_days}
+    if segment_days <= 0 and report_days <= 0:
+        return out
+    with database.write_txn() as conn:
+        if segment_days > 0:
+            cutoff = now_ms - segment_days * 86400
+            out["segments_deleted"] = conn.execute(
+                delete(adfilter_segments).where(adfilter_segments.c.at < cutoff)
+            ).rowcount or 0
+        if report_days > 0:
+            cutoff = now_ms - report_days * 86400
+            out["reports_deleted"] = conn.execute(
+                delete(adfilter_reports).where(adfilter_reports.c.at < cutoff)
+            ).rowcount or 0
+    if out["segments_deleted"] or out["reports_deleted"]:
+        log.info("[housekeeping] 去广告明细清理: segments=%d reports=%d",
+                 out["segments_deleted"], out["reports_deleted"])
+    return out
+
+
 def run_all() -> dict:
     """维护任务总入口（调度器 / 启动引导调用）。"""
     started = datetime.now()
-    result = {"logs": None, "wal": None}
+    result = {"logs": None, "wal": None, "adfilter_details": None}
     try:
         result["logs"] = prune_sync_logs()
     except Exception:
@@ -148,5 +185,9 @@ def run_all() -> dict:
         result["wal"] = checkpoint_wal()
     except Exception:
         log.exception("WAL checkpoint 失败（下个周期重试）")
+    try:
+        result["adfilter_details"] = prune_adfilter_details()
+    except Exception:
+        log.exception("清理去广告明细失败（下个周期重试）")
     result["elapsed_ms"] = int((datetime.now() - started).total_seconds() * 1000)
     return result

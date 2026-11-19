@@ -516,8 +516,12 @@
           <code>url_patterns</code> ≤64 条（每项 ≤64 字符）· <code>site_overrides</code> ≤256 条（<code>mode</code> 目前只支持 <code>off</code>）。
           字段缺省 = 客户端用自己的内置默认值。
         </div>
+        <div id="adPublishState" class="muted" style="font-size:12px;padding:7px 10px;margin-bottom:8px;border-radius:6px;background:#f8fafc;border:1px solid var(--line)">
+          指纹库发布状态加载中…
+        </div>
         <textarea id="adRules" rows="11" class="star-input" spellcheck="false"
           placeholder='{ "thresholds": { "relative_max_ratio": 0.5, "absolute_max_sec": 300, "safety_floor": 0.8, "safety_floor_high_confidence": 0.5, "duplicate_max_ratio": 0.8 },&#10;  "url_patterns": ["/ad/", "/ads/"],&#10;  "site_overrides": [ { "host": "some-ad-heavy-site.com", "mode": "off" } ] }'></textarea>
+        <div id="adFpSnapshot" class="muted" style="font-size:12px;margin-top:4px"></div>
         <div class="row" style="margin-top:8px">
           <select class="tbSel" id="adChannel" title="规则渠道：stable=全量，beta=内测（客户端传入 channel 才用）">
             <option value="stable">stable</option>
@@ -561,8 +565,8 @@
         <div class="muted" style="font-size:12px;line-height:1.75;margin-bottom:8px">
           指纹 = <code>站点 + 归一化时长桶 + 大小桶</code>，由客户端上报的片段特征跨用户聚合而来。
           样本达到门槛（<code id="fpThresholds">-</code>）自动晋升 <b>confirmed</b> 并随规则包下发；
-          客户端回报「误杀」累计达阈值会自动 <b>disabled</b> 止血。人工审核优先于门槛，
-          <code>disabled</code> 永不自动恢复。下方改动需点「发布指纹到规则包」才对客户端生效。
+          客户端回报「误杀」累计达阈值会自动 <b>disabled</b> 止血。人工审核默认<b>锁定</b>（✕ 图标）
+          ——锁定后重算不再覆盖该状态；点「交还自动」才恢复自动判定。改动需点「发布指纹到规则包」才生效。
         </div>
         <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:6px">
           <select class="tbSel" id="fpStatusFilter" title="按状态筛选">
@@ -571,13 +575,43 @@
             <option value="confirmed">confirmed（下发中）</option>
             <option value="disabled">disabled（已停用）</option>
           </select>
-          <input id="fpHostFilter" placeholder="按站点 host 筛选" style="width:180px">
+          <select class="tbSel" id="fpSourceFilter" title="按来源筛选">
+            <option value="">全部来源</option>
+            <option value="auto">自动聚合</option>
+            <option value="manual">人工录入</option>
+          </select>
+          <select class="tbSel" id="fpOrder" title="排序方式">
+            <option value="">置信度 ↓</option>
+            <option value="hit_desc">命中段 ↓</option>
+            <option value="miss_desc">误杀 ↓</option>
+            <option value="updated_desc">最近更新 ↓</option>
+          </select>
+          <label class="muted" style="font-size:12px;display:inline-flex;align-items:center;gap:3px">
+            <input type="checkbox" id="fpNearMiss" title="只看恰好差一项达标的候选，配合批量确认">
+            差一项达标
+          </label>
+          <input id="fpHostFilter" placeholder="按站点 host 筛选" style="width:150px">
           <button class="primary" id="btnFpPublish" title="把当前 confirmed 指纹发布为新规则包版本">发布指纹到规则包</button>
-          <button id="btnFpRebuild" title="从片段明细全量重算聚合（幂等）">↻ 重算聚合</button>
+          <button id="btnFpRebuild" title="从片段明细全量重算聚合（幂等，后台执行）">↻ 重算聚合</button>
           <button id="btnFpReload" title="重新拉取列表">刷新</button>
+          <button id="btnFpBatchConfirm" title="把当前筛选结果中差一项达标的候选批量确认">批量确认</button>
         </div>
+        <div class="row" style="margin-top:6px;flex-wrap:wrap;gap:6px;align-items:center">
+          <button id="btnFpManual" title="人工补录一条 confirmed 指纹（无需等样本）">+ 人工补指纹</button>
+          <input id="fpManualHost" placeholder="host，如 2609.lbsl2026.com" style="width:210px">
+          <input id="fpManualDur" placeholder="时长 ms，如 2600" style="width:130px" type="number" min="1">
+          <input id="fpManualSize" placeholder="大小 B（可空）" style="width:120px" type="number" min="0">
+          <input id="fpManualNote" placeholder="备注（可选）" style="width:180px">
+        </div>
+        <div id="fpPager" class="tb-pager" style="margin-top:6px"></div>
       </div>
       <div id="fpList"><div class="empty">展开时加载指纹…</div></div>
+      <div class="body pad" style="border-top:1px solid var(--line)">
+        <details id="fpAuditBox">
+          <summary class="muted" style="cursor:pointer;font-size:12px">最近操作 / 事件（点击展开）</summary>
+          <div id="fpAuditList" style="margin-top:8px"><div class="empty">展开时加载…</div></div>
+        </details>
+      </div>
     </div>
   </section>
 
@@ -2445,11 +2479,12 @@ function renderAdHistory() {
   }
   box.innerHTML = `<table>
     <thead><tr><th style="width:110px">版本</th><th>备注</th><th style="width:150px">发布时间</th>
-      <th style="width:90px">大小</th><th style="width:150px">操作</th></tr></thead>
+      <th style="width:70px">指纹</th><th style="width:90px">大小</th><th style="width:150px">操作</th></tr></thead>
     <tbody>${rows.map((r) => `<tr>
       <td>v${r.version}${r.version === adState.current ? ' <span class="badge ok">生效中</span>' : ""}</td>
       <td>${esc(r.note) || "-"}</td>
       <td class="muted">${fmtTime(r.created_at)}</td>
+      <td class="muted">${fmtNum(r.fingerprint_count || 0)} 条</td>
       <td class="muted">${fmtNum(r.size)} B</td>
       <td style="white-space:nowrap">
         <button class="sm" data-ad-act="load" data-ver="${r.version}">载入</button>
@@ -2556,11 +2591,47 @@ async function adLoad() {
     adState = { channel: data.channel, current: Number(data.current || 0), packs: data.packs || [] };
     $("#adVersion").textContent = `${data.channel} v${data.current}`;
     $("#adVersion").className = "badge " + (Number(data.current) > 0 ? "ok" : "mute");
-    $("#adRules").value = JSON.stringify(data.rules || {}, null, 2);
+    // 编辑框不展示 fingerprints：它由服务端注入，手填会被 normalize() 丢弃（误导 UI）
+    const editable = Object.assign({}, data.rules || {});
+    delete editable.fingerprints;
+    $("#adRules").value = JSON.stringify(editable, null, 2);
     renderAdHistory();
     adLoadStats();
+    adLoadPublishState(ch, data.rules || {});
   } catch (e) {
     $("#adHistory").innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+// 指纹库发布状态横幅（v1.18.0 §2.4）：运营一眼看出有没有未发布的指纹变更。
+async function adLoadPublishState(ch, rules) {
+  const box = $("#adPublishState");
+  if (!box) return;
+  try {
+    const ps = await api("/api/v1/adfilter/admin/publish-state?channel=" + encodeURIComponent(ch));
+    const lib = ps.library || {}, pend = ps.pending || {}, bucket = ps.bucket || {};
+    let cls = "badge ok", msg;
+    if (bucket.drift) {
+      cls = "badge warn";
+      msg = "⛔ 桶宽已变更，全库指纹失效——发布被拒绝，请先按 segments 重算迁移";
+    } else if (pend.dirty) {
+      cls = "badge warn";
+      msg = `⚠ 指纹库有未发布变更：新增 ${fmtNum(pend.fp_added)} / 移除 ${fmtNum(pend.fp_removed)} / 审核 ${fmtNum(pend.reviewed_since_publish)} 条`
+        + ` · 当前包 ${fmtNum((ps.pack || {}).fingerprint_count || 0)} 条 → 可下发 ${fmtNum(lib.downloadable)} 条`;
+    } else {
+      msg = `✓ 指纹已与 v${(ps.pack || {}).version || 0} 同步（${fmtNum((ps.pack || {}).fingerprint_count || 0)} 条）`;
+    }
+    box.innerHTML = `<span class="${cls}">${msg}</span>`;
+    // 只读快照提示：编辑框下方说明本次发布将携带的指纹数
+    const snap = $("#adFpSnapshot");
+    if (snap) {
+      const fpCount = (lib.downloadable || 0);
+      snap.textContent = `本次发布将携带 ${fmtNum(fpCount)} 条指纹（来自指纹库快照，非编辑框内容）`
+        + (lib.manual ? ` · 其中人工录入 ${fmtNum(lib.manual)} 条` : "")
+        + (lib.capped ? ` · 已达上限 ${fmtNum(lib.max_download)}，超出部分不下发` : "");
+    }
+  } catch (e) {
+    box.textContent = "指纹发布状态加载失败：" + e.message;
   }
 }
 
@@ -2617,10 +2688,10 @@ $("#adHistory").addEventListener("click", async (ev) => {
     }
     return;
   }
-  if (!confirm(`确认把 v${ver} 的内容发布为新版本（版本号 +1）？\n客户端下次拉取后生效（TTL 30 分钟，起播也会触发）。`)) return;
+  if (!confirm(`确认把 v${ver} 的内容发布为新版本（版本号 +1）？\n\n注意：回滚只恢复阈值/URL 模式/站点例外，不会恢复旧指纹集合——指纹将使用当前指纹库快照。\n客户端下次拉取后生效。`)) return;
   try {
     const res = await api(`/api/v1/adfilter/admin/packs/rollback?version=${ver}&channel=${ch}`, { method: "POST" });
-    toast(res.msg || "已回滚");
+    toast((res.msg || "已回滚") + `（含指纹 ${fmtNum(res.fingerprint_count || 0)} 条，取自当前指纹库）`);
     await adLoad();
   } catch (e) {
     toast("回滚失败：" + e.message, true);
@@ -2629,10 +2700,20 @@ $("#adHistory").addEventListener("click", async (ev) => {
 
 // ---------------- 广告指纹库（v1.17.0 / Phase 2） ----------------
 // 只读聚合 + 审核启停 + 发布下发。不做播放数据面，过滤仍在客户端。
-function fpStatusBadge(s) {
-  if (s === "confirmed") return '<span class="badge ok">下发中</span>';
-  if (s === "disabled") return '<span class="badge warn">已停用</span>';
-  return '<span class="badge mute">样本不足</span>';
+function fpStatusBadge(s, locked, downloadable, blockReason) {
+  let badge;
+  if (s === "confirmed") {
+    badge = downloadable
+      ? '<span class="badge ok">下发中</span>'
+      : '<span class="badge warn" title="状态是确认，但因误杀阈值未下发">确认·未下发</span>';
+  } else if (s === "disabled") {
+    badge = '<span class="badge warn">已停用</span>';
+  } else {
+    badge = '<span class="badge mute">样本不足</span>';
+  }
+  const lock = locked ? ' <span title="人工锁定：重算不会覆盖此状态">🔒</span>' : '';
+  const why = blockReason ? ` title="未下发原因：${{miss_threshold:'误杀达阈值',not_confirmed:'未确认',capped:'超出下发上限'}[blockReason] || blockReason}"` : '';
+  return badge + lock + (why || '');
 }
 
 function renderFpList(data) {
@@ -2643,80 +2724,167 @@ function renderFpList(data) {
     box.innerHTML = '<div class="empty">暂无指纹（客户端上报带 segments 的过滤明细后，点「重算聚合」生成）</div>';
     return;
   }
+  const blocked = r => r.blocked_by || {};
   box.innerHTML = `<table>
-    <thead><tr><th style="width:120px">指纹</th><th>站点 host</th><th class="num">时长桶</th>
+    <thead><tr><th style="width:110px">指纹</th><th>站点 host</th><th class="num">时长桶</th>
       <th class="num">大小桶</th><th class="num">置信度</th><th class="num">命中段</th>
-      <th class="num">去重用户</th><th class="num">去重地址</th><th class="num">误杀</th>
-      <th style="width:90px">状态</th><th style="width:210px">操作</th></tr></thead>
+      <th class="num">去重地址</th><th class="num">误杀</th><th class="num">真实命中</th>
+      <th>下发</th><th>来源</th><th style="width:100px">状态</th><th style="width:230px">操作</th></tr></thead>
     <tbody>${rows.map((r) => {
       const p = r.pattern || {};
+      const bb = blocked(r);
+      const stuck = r.status === "candidate"
+        ? [bb.users && "用户", bb.urls && "地址", bb.hits && "命中"].filter(Boolean).join("/")
+        : "";
+      const confirmLabel = (Number(r.miss_count || 0) >= (window._fpMissDisable || 5))
+        ? "确认并重置误杀" : "确认";
       return `<tr>
         <td title="${esc(r.fp_hash)}"><code>${esc((r.fp_hash || "").slice(0, 10))}…</code></td>
-        <td title="${esc(r.host)}">${esc(r.host) || "-"}</td>
+        <td title="${esc(r.host)}">${esc(r.host) || "-"} ${stuck ? `<span class="muted" style="font-size:11px" title="卡在：${stuck}">(${stuck}不足)</span>` : ""}</td>
         <td class="num">${fmtNum(p.dur_bucket || 0)}</td>
         <td class="num">${fmtNum(p.size_bucket || 0)}</td>
         <td class="num">${(Number(r.confidence || 0) * 100).toFixed(0)}%</td>
         <td class="num">${fmtNum(r.hit_count)}</td>
-        <td class="num">${fmtNum(r.distinct_users)}</td>
         <td class="num">${fmtNum(r.distinct_urls)}</td>
         <td class="num">${fmtNum(r.miss_count)}</td>
-        <td>${fpStatusBadge(r.status)}</td>
+        <td class="num" title="最后命中：${esc(r.last_hit_at || "无")}">${fmtNum(r.run_hits)}</td>
+        <td>${r.downloadable ? '<span class="badge ok">是</span>' : '<span class="badge mute">否</span>'}</td>
+        <td>${r.source === "manual" ? '<span class="badge" title="人工录入">人工</span>' :'<span class="muted">自动</span>'}</td>
+        <td>${fpStatusBadge(r.status, r.locked, r.downloadable, r.block_reason)}</td>
         <td style="white-space:nowrap">
-          <button class="sm" data-fp-act="confirmed" data-hash="${esc(r.fp_hash)}" title="人工确认并下发">确认</button>
+          <button class="sm" data-fp-act="confirmed" data-hash="${esc(r.fp_hash)}" title="人工确认并下发${r.miss_count >= (window._fpMissDisable||5) ? '（将重置误杀计数）' : ''}">${confirmLabel}</button>
           <button class="sm warn" data-fp-act="disabled" data-hash="${esc(r.fp_hash)}" title="止血：停用且不再下发">停用</button>
           <button class="sm" data-fp-act="candidate" data-hash="${esc(r.fp_hash)}" title="退回样本不足">退回</button>
+          ${r.locked ? `<button class="sm" data-fp-act="unlock" data-hash="${esc(r.fp_hash)}" title="交还自动判定：下次重算按样本重新决定状态">交还自动</button>` : ""}
           <button class="sm danger" data-fp-act="delete" data-hash="${esc(r.fp_hash)}" title="物理删除指纹及上报明细，不可恢复">删除</button>
         </td></tr>`;
     }).join("")}</tbody></table>`;
 }
 
+let fpPage = 0;
+const fpPageSize = 50;
+
 async function fpLoad() {
   try {
     const ov = await api("/api/v1/adfilter/admin/fingerprints/overview");
     const c = ov.config || {};
+    window._fpMissDisable = c.miss_disable || 5;
     $("#fpThresholds").textContent = `用户 ≥ ${fmtNum(c.min_users)} / 地址 ≥ ${fmtNum(c.min_urls)} / 命中 ≥ ${fmtNum(c.min_hits)}，误杀 ≥ ${fmtNum(c.miss_disable)} 停用`;
+    const bb = ov.blocked_by || {};
     $("#fpStats").textContent = `共 ${fmtNum(ov.total)} 条`
-      + ` · 下发中 ${fmtNum((ov.by_status || {}).confirmed || 0)}`
       + ` · 可下发 ${fmtNum(ov.downloadable)}`
-      + ` · 命中段 ${fmtNum(ov.total_hits)}`
-      + (ov.total_miss ? ` · 误杀 ${fmtNum(ov.total_miss)}` : "");
+      + ` · 人工锁定 ${fmtNum(ov.locked_count || 0)}`
+      + ` · 误杀停用 ${fmtNum(ov.confirmed_but_blocked || 0)}`
+      + ((bb.urls || bb.users || bb.hits) ? ` · 卡门槛(用户${fmtNum(bb.users)}/地址${fmtNum(bb.urls)}/命中${fmtNum(bb.hits)})` : "");
+    const q = new URLSearchParams({ limit: String(fpPageSize), offset: String(fpPage * fpPageSize) });
     const st = $("#fpStatusFilter").value || "";
     const host = ($("#fpHostFilter").value || "").trim();
-    const q = new URLSearchParams({ limit: "100", offset: "0" });
+    const src = $("#fpSourceFilter").value || "";
+    const order = $("#fpOrder").value || "";
     if (st) q.set("status", st);
     if (host) q.set("host", host);
+    if (src) q.set("source", src);
+    if (order) q.set("order", order);
+    if ($("#fpNearMiss").checked) q.set("near_miss", "1");
     const data = await api("/api/v1/adfilter/admin/fingerprints?" + q.toString());
     renderFpList(data);
+    // 分页控件
+    const total = Number(data.total || 0);
+    const pages = Math.max(1, Math.ceil(total / fpPageSize));
+    const pager = $("#fpPager");
+    if (pager) pager.innerHTML = total > fpPageSize
+      ? `共 ${fmtNum(total)} 条 · 第 ${fpPage + 1}/${pages} 页 `
+        + `<button class="sm" data-fp-page="prev" ${fpPage === 0 ? "disabled" : ""}>上一页</button> `
+        + `<button class="sm" data-fp-page="next" ${fpPage + 1 >= pages ? "disabled" : ""}>下一页</button>`
+      : "";
   } catch (e) {
     $("#fpList").innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
   }
 }
 
+async function fpLoadAudit(force) {
+  const box = $("#fpAuditList");
+  if (!box || (box.dataset.loaded === "1" && !force)) return;
+  try {
+    const d = await api("/api/v1/adfilter/admin/audit?limit=30");
+    const rows = d.items || [];
+    if (!rows.length) { box.innerHTML = '<div class="empty">暂无操作记录</div>'; box.dataset.loaded = "1"; return; }
+    box.innerHTML = `<table><thead><tr><th>时间</th><th>动作</th><th>对象</th><th>操作者</th><th>详情</th></tr></thead><tbody>`
+      + rows.map(r => `<tr><td class="muted">${esc(r.at || "-")}</td><td><code>${esc(r.action)}</code></td>`
+        + `<td title="${esc(r.target)}"><code>${esc((r.target || "").slice(0, 14))}</code></td>`
+        + `<td>${esc(r.actor || "-")}</td>`
+        + `<td class="muted" style="font-size:11px">${esc(JSON.stringify(r.detail || {}).slice(0, 90))}</td></tr>`).join("")
+      + `</tbody></table>`;
+    box.dataset.loaded = "1";
+  } catch (e) { box.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+
+$("#fpPager").addEventListener("click", (ev) => {
+  const b = ev.target.closest("button[data-fp-page]");
+  if (!b || b.disabled) return;
+  fpPage = Math.max(0, fpPage + (b.dataset.fpPage === "next" ? 1 : -1));
+  fpLoad();
+});
+const fpAuditBox = document.getElementById("fpAuditBox");
+if (fpAuditBox) fpAuditBox.addEventListener("toggle", () => { if (fpAuditBox.open) fpLoadAudit(); });
+
 $("#btnFpReload").onclick = () => fpLoad();
-$("#fpStatusFilter").onchange = () => fpLoad();
-$("#fpHostFilter").addEventListener("keydown", (ev) => { if (ev.key === "Enter") fpLoad(); });
+$("#fpStatusFilter").onchange = () => { fpPage = 0; fpLoad(); };
+$("#fpSourceFilter").onchange = () => { fpPage = 0; fpLoad(); };
+$("#fpOrder").onchange = () => { fpPage = 0; fpLoad(); };
+$("#fpNearMiss").onchange = () => { fpPage = 0; fpLoad(); };
+$("#fpHostFilter").addEventListener("keydown", (ev) => { if (ev.key === "Enter") { fpPage = 0; fpLoad(); } });
 
 $("#btnFpRebuild").onclick = async () => {
   const btn = $("#btnFpRebuild");
   btn.disabled = true;
+  const original = btn.textContent;
   try {
     const res = await api("/api/v1/adfilter/admin/fingerprints/rebuild", { method: "POST" });
-    toast(`重算完成：扫描 ${fmtNum(res.scanned)}，新建 ${fmtNum(res.created)}，晋升 ${fmtNum(res.confirmed)}`);
+    if (res.job_id) {
+      btn.textContent = "重算中…";
+      toast("重算任务已提交，后台执行中");
+      // 轮询任务状态
+      for (let i = 0; i < 60; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        const st = await api("/api/v1/adfilter/admin/fingerprints/rebuild/status?job_id=" + encodeURIComponent(res.job_id));
+        if (st.status === "done") {
+          const r = st.result || {};
+          toast(`重算完成：扫描 ${fmtNum(r.scanned)}，新建 ${fmtNum(r.created)}，晋升 ${fmtNum(r.confirmed)}，锁定保留 ${fmtNum(r.locked_kept)}`);
+          break;
+        }
+        if (st.status === "failed") { toast("重算失败：" + (st.error || "未知错误"), true); break; }
+      }
+    } else {
+      toast(`重算完成：扫描 ${fmtNum(res.scanned)}，新建 ${fmtNum(res.created)}，晋升 ${fmtNum(res.confirmed)}`);
+    }
     await fpLoad();
+    if (typeof adLoad === "function") await adLoad();
+    if ($("#fpAuditBox") && $("#fpAuditBox").open) await fpLoadAudit(true);
   } catch (e) {
     toast("重算失败：" + e.message, true);
-  } finally { btn.disabled = false; }
+  } finally { btn.disabled = false; btn.textContent = original; }
 };
 
 $("#btnFpPublish").onclick = async () => {
-  if (!confirm("把当前 confirmed 指纹发布为新规则包版本？\n客户端下次拉取规则后生效（TTL 30 分钟，起播也会触发）。")) return;
+  const chSel = document.getElementById("adChannel");
+  const channel = chSel ? chSel.value : "stable";
+  let hint = "";
+  try {
+    const ps = await api("/api/v1/adfilter/admin/publish-state?channel=" + encodeURIComponent(channel));
+    const p = ps.pending || {};
+    hint = p.dirty
+      ? `\n\n检测到未发布变更：新增 ${fmtNum(p.fp_added)} / 移除 ${fmtNum(p.fp_removed)} / 审核 ${fmtNum(p.reviewed_since_publish)} 条。`
+      : "\n\n当前指纹库与已发布版本一致。";
+  } catch (e) { /* publish-state 失败不阻断发布 */ }
+  if (!confirm(`把当前 confirmed 指纹发布到渠道 ${channel} 的新版本？${hint}\n客户端下次拉取规则后生效。`)) return;
   const btn = $("#btnFpPublish");
   btn.disabled = true;
   try {
     const res = await api("/api/v1/adfilter/admin/fingerprints/publish", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ channel: "stable", note: "发布指纹库快照" }),
+      body: JSON.stringify({ channel, note: "发布指纹库快照" }),
     });
     toast(res.msg || "已发布");
     await fpLoad();
@@ -2724,6 +2892,45 @@ $("#btnFpPublish").onclick = async () => {
   } catch (e) {
     toast("发布失败：" + e.message, true);
   } finally { btn.disabled = false; }
+};
+
+$("#btnFpManual").onclick = async () => {
+  const host = ($("#fpManualHost").value || "").trim();
+  const durMs = ($("#fpManualDur").value || "").trim();
+  const sizeB = ($("#fpManualSize").value || "").trim();
+  const note = ($("#fpManualNote").value || "").trim();
+  if (!host || !durMs) { toast("请填写 host 和时长 ms", true); return; }
+  if (!confirm(`人工补录指纹？\nhost=${host}  时长=${durMs}ms${sizeB ? `  大小=${sizeB}B` : ""}\n将直接 confirmed 并锁定（重算不覆盖），重复提交会合并。`)) return;
+  const btn = $("#btnFpManual");
+  btn.disabled = true;
+  try {
+    const body = { host, dur_ms: Number(durMs), note };
+    if (sizeB) body.size_b = Number(sizeB);
+    const res = await api("/api/v1/adfilter/admin/fingerprints/manual", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    toast(res.msg || (res.created ? "已补录" : "已合并到现有指纹"));
+    $("#fpManualHost").value = ""; $("#fpManualDur").value = "";
+    $("#fpManualSize").value = ""; $("#fpManualNote").value = "";
+    await fpLoad();
+  } catch (e) { toast("补录失败：" + e.message, true); }
+  finally { btn.disabled = false; }
+};
+
+$("#btnFpBatchConfirm").onclick = async () => {
+  if (!$("#fpNearMiss").checked) { toast("请先勾选「差一项达标」筛选", true); return; }
+  try {
+    const list = await api("/api/v1/adfilter/admin/fingerprints?near_miss=1&limit=200&status=candidate");
+    const hashes = (list.items || []).map(r => r.fp_hash);
+    if (!hashes.length) { toast("当前没有差一项达标的候选"); return; }
+    if (!confirm(`批量确认 ${hashes.length} 条候选指纹？\n将全部设为 confirmed 并锁定，发布后对客户端生效。`)) return;
+    const res = await api("/api/v1/adfilter/admin/fingerprints/review", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fp_hashes: hashes, status: "confirmed", note: "批量人工确认", lock: true }),
+    });
+    toast(`已确认 ${res.updated} 条${res.not_found && res.not_found.length ? `，${res.not_found.length} 条未找到` : ""}`);
+    await fpLoad();
+  } catch (e) { toast("批量确认失败：" + e.message, true); }
 };
 
 $("#fpList").addEventListener("click", async (ev) => {
@@ -2749,16 +2956,35 @@ $("#fpList").addEventListener("click", async (ev) => {
     return;
   }
 
+  // 交还自动（v1.18.0）：locked=0，状态保持当前值，由下次 rebuild 接管
+  if (status === "unlock") {
+    if (!confirm(`交还自动判定：指纹 ${fpHash.slice(0, 10)}… 将解除锁定，\n下次重算按样本重新决定状态（可能被降级）。`)) return;
+    btn.disabled = true;
+    try {
+      await api("/api/v1/adfilter/admin/fingerprints/review", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fp_hash: fpHash, status: "candidate", note: "交还自动", lock: false }),
+      });
+      toast("已交还自动判定");
+      await fpLoad();
+    } catch (e) { toast("操作失败：" + e.message, true); }
+    finally { btn.disabled = false; }
+    return;
+  }
+
   const labels = { confirmed: "确认下发", disabled: "停用止血", candidate: "退回样本不足" };
-  if (!confirm(`确认将指纹 ${fpHash.slice(0, 10)}… 设为「${labels[status]}」？\n发布规则包后对客户端生效。`)) return;
+  const isConfirm = status === "confirmed";
+  const missHint = isConfirm && Number(btn.closest("tr").querySelectorAll("td")[7]?.textContent || 0) >= (window._fpMissDisable || 5)
+    ? "\n\n该指纹误杀已达阈值，确认将同时重置误杀计数。" : "";
+  if (!confirm(`确认将指纹 ${fpHash.slice(0, 10)}… 设为「${labels[status]}」并锁定（重算不覆盖）？${missHint}\n发布规则包后对客户端生效。`)) return;
   btn.disabled = true;
   try {
     await api("/api/v1/adfilter/admin/fingerprints/review", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fp_hash: fpHash, status, note: labels[status] }),
+      body: JSON.stringify({ fp_hash: fpHash, status, note: labels[status], lock: true }),
     });
-    toast("已更新：" + labels[status]);
+    toast("已更新并锁定：" + labels[status]);
     await fpLoad();
   } catch (e) {
     toast("更新失败：" + e.message, true);

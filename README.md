@@ -587,6 +587,38 @@ vodsync/
 
 > 按版本号**从新到旧**排列，最新版本在最前。历史版本只做归档记录，细节以对应版本的代码与文档为准。
 
+### v1.18.0
+**广告过滤运营管理升级**（据前端分析需求文档，P0/P1/P2 后端项；规则包与客户端协议不变、客户端零改动）：
+
+**P0 — 打通运营闭环**
+- **`locked` 人工锁定语义**：`review()` 默认锁定了状态，重算只更新证据字段（命中/地址/置信度/pattern/时间），
+  不再覆盖人工决定的 `status`；`lock:false` 显式交还自动判定。这解决了「人工确认低样本指纹后
+  6 小时内被打回」的断链——当前线上 8 条卡在地址数的 candidate 终于能人工放行且保持住。
+  概览补 `locked_count`，重算返回 `locked_kept`。
+- **误杀计数可复位 + 下发可见**：`review(confirmed)` 归零 `miss_count` 并写 `last_reset_at`，
+  解除「止血后无法下发」的死结。列表/详情补 `downloadable` / `block_reason` /
+  命中率，面板下发列与状态不再矛盾。
+- **人工补指纹接口** `POST /fingerprints/manual`：服务端按 `signature()` 算 fp_hash（不接受调用方传入），
+  幂等合并；`source=manual` / `confidence=1.0` / 自动锁定。运营无需再等 10 命中 + 3 地址。
+- **发布状态预览** `GET /publish-state`：pack/library/pending/rebuild/bucket 五段式，面板常驻横幅提示
+  「指纹库有 N 条变更未发布」，发布前可看差异；规则编辑框不再展示 fingerprints（避免误导）。
+- **回滚文案**：确认框明确「不恢复旧指纹、取当前库快照」，版本历史显示各版本指纹条数。
+
+**P1 — 运营效率**
+- 列表支持 `source/downloadable/miss_gt/near_miss/order` 筛选排序、分页稳定；补真实命中 `run_hits` /
+  最后命中时间 / 来源 / `blocked_by`（卡在哪个门槛）。概览补 `blocked_by` 分桶。
+- 批量审核（`fp_hashes` 数组）、漏判样本明细 `GET /miss-samples`（host 级、判定 uncovered/candidate_only/covered）。
+- 明细保留策略（segments 默认 90 天 / reports 180 天，**默认关闭**先观察体量），接入 housekeeping。
+- 操作审计表 `adfilter_admin_audit` + `GET /audit` / `GET /events`，覆盖 publish/rollback/review/delete/manual/rebuild。
+
+**P2 — 一致性与规模化**
+- 下发上限可见（`confirmed_total` / `not_delivered_by_cap` / `capped`）。
+- 重算改为异步（202 + job_id + `GET /rebuild/status` 轮询，`sync=true` 保留老同步语义）。
+- 桶宽漂移保护：库内桶宽与配置不一致时**拒绝发布**，提示先迁移（§4.6 `reason` 跨端口径排除）。
+
+数据模型：加列全部走 `database._migrate()` 存量兼容（SQLite/PG 双支持），老库升级自动补列补索引。
+测试：新增 `test_v1180_ops_upgrade.py`（全验收点），**12 套回归全绿** + compileall，openapi 81 paths。
+
 ### v1.17.5
 **广告指纹库支持物理删除**：
 

@@ -298,6 +298,9 @@ adfilter_rule_packs = Table(
     Column("rules_json", Text, nullable=False),          # 已规范化的规则 JSON（sort_keys）
     Column("note", String(255), default=""),             # 发布备注 / 回滚来源
     Column("created_at", DateTime, server_default=func.now()),
+    # v1.18.0：发布时写入的指纹快照条数。避免在 publish-state 里每次解析 rules_json；
+    # 历史行为空（NULL），读取侧按需从 rules_json 解析兜底。
+    Column("fingerprint_count", Integer, nullable=False, server_default="0"),
 )
 # 同一渠道内版本唯一：并发发布时靠它兜底（重复即 409，不会出现两个 v3）
 Index("uq_adfilter_pack_ver", adfilter_rule_packs.c.channel,
@@ -402,8 +405,40 @@ adfilter_fingerprints = Table(
     Column("note", String(255), server_default=""),
     Column("created_at", DateTime, server_default=func.now()),
     Column("updated_at", DateTime, server_default=func.now()),
+    # v1.18.0 运营管理升级：
+    #   locked=1 表示人工审核锁定——rebuild 照常更新证据字段（命中/地址/置信度/
+    #   pattern/时间），但绝不覆盖 status 与 reviewed_at（机器不能推翻人的决定）。
+    #   disabled 是隐式 locked（状态机里永不自动恢复），locked 列主要保护 confirmed/candidate。
+    Column("locked", Integer, nullable=False, server_default="0"),
+    #   source: auto（rebuild 自动聚合）/ manual（运营手工录入，confidence=1.0）
+    Column("source", String(8), nullable=False, server_default="auto"),
+    #   last_reset_at：人工确认时误杀计数复位的时间（§2.2）
+    Column("last_reset_at", DateTime),
+    #   last_hit_at / last_miss_at：反馈闭环最近一次命中/误杀时间（§3.1）
+    Column("last_hit_at", DateTime),
+    Column("last_miss_at", DateTime),
 )
 Index("idx_adfilter_fp_status", adfilter_fingerprints.c.status, adfilter_fingerprints.c.confidence)
+Index("idx_adfilter_fp_host_status", adfilter_fingerprints.c.host, adfilter_fingerprints.c.status)
+Index("idx_adfilter_fp_locked", adfilter_fingerprints.c.locked)
+
+# adfilter_admin_audit（v1.18.0）：运营操作审计 + 事件流（§3.5 / §4.3）。
+#   action: publish / rollback / review / delete / manual / rebuild / hit / miss 等；
+#   target: fp_hash / 版本号 / host，便于按对象过滤；
+#   detail_json: 变更前后的关键字段（状态、数量等），不含 url 原文；
+#   actor: auth.request_identity() 的整数身份字符串（0=单Token, -2=面板会话, >0=具名Token）。
+#   一张表同时服务「操作审计」和「事件流」，用 action 过滤即可，不必建两张表。
+adfilter_admin_audit = Table(
+    "adfilter_admin_audit",
+    META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("action", String(32), nullable=False),
+    Column("target", String(128), nullable=False, server_default=""),
+    Column("detail_json", Text, nullable=False, server_default="{}"),
+    Column("actor", String(32), nullable=False, server_default=""),
+    Column("at", DateTime, server_default=func.now()),
+)
+Index("idx_adfilter_audit_action_at", adfilter_admin_audit.c.action, adfilter_admin_audit.c.at)
 
 # ---------------------------------------------------------------------------
 # vod_{slug} 动态表缓存：避免重复构建 Table 对象

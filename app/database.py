@@ -161,6 +161,16 @@ def _migrate():
         # 去广告上报按站点聚合（v1.16.1）：空串表示「老行待回填」，
         # 回填在 adfilter.ensure_seed() 里用 Python 解析 url，避免方言差异。
         ("adfilter_reports", "host", "VARCHAR(255) DEFAULT ''"),
+        # ---- v1.18.0 运营管理升级：指纹人工锁定 / 来源 / 复位与命中时间 ----
+        # locked 默认 0，存量指纹保持「自动判定」语义，直到人工审核过；
+        # source 默认 auto，与存量数据的实际来源一致。
+        ("adfilter_fingerprints", "locked", "INTEGER DEFAULT 0"),
+        ("adfilter_fingerprints", "source", "VARCHAR(8) DEFAULT 'auto'"),
+        ("adfilter_fingerprints", "last_reset_at", "TIMESTAMP"),
+        ("adfilter_fingerprints", "last_hit_at", "TIMESTAMP"),
+        ("adfilter_fingerprints", "last_miss_at", "TIMESTAMP"),
+        # 规则包指纹快照条数（历史行为 0，读取侧按需解析 rules_json 兜底）
+        ("adfilter_rule_packs", "fingerprint_count", "INTEGER DEFAULT 0"),
     ]
     insp = inspect(engine)
     existing_tables = set(insp.get_table_names())
@@ -205,6 +215,20 @@ def _migrate():
             "数据库迁移: %s 已补推荐信号字段 %s",
             tname, ",".join(c for c, _ in missing),
         )
+
+    # ---- v1.18.0：为存量表补新索引 ----
+    # create_all(checkfirst=True) 对已存在的表不会补建索引，这里显式 IF NOT EXISTS。
+    new_indexes = [
+        ("idx_adfilter_fp_host_status", "adfilter_fingerprints", "host, status"),
+        ("idx_adfilter_fp_locked", "adfilter_fingerprints", "locked"),
+        ("idx_adfilter_audit_action_at", "adfilter_admin_audit", "action, at"),
+    ]
+    for idx_name, table, columns in new_indexes:
+        if table not in existing_tables:
+            continue
+        with write_txn() as conn:
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table} ({columns})"))
+        log.info("数据库迁移: 索引 %s 已就绪", idx_name)
 
 
 def table_exists(name: str) -> bool:

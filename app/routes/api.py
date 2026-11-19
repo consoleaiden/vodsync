@@ -25,7 +25,7 @@ from sqlalchemy import bindparam, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 
 from .. import (
-    __version__, adfilter, adfilter_fp, apiresp, auth, config, database, minor_mode,
+    __version__, adfilter, adfilter_fp, apiresp, audit, auth, config, database, minor_mode,
 )
 from ..models import build_vod_table, sources, sync_logs
 from ..syncer import (
@@ -1122,7 +1122,7 @@ def adfilter_admin_pack(version: int, channel: str = Query("stable")):
 
 
 @router.post("/api/v1/adfilter/admin/packs", summary="发布规则包新版本（管理端）")
-def adfilter_admin_publish(payload: dict = None):
+def adfilter_admin_publish(request: Request, payload: dict = None):
     """
     发布新版本：服务端先校验再入库，版本号在本渠道内严格 +1。
 
@@ -1149,6 +1149,10 @@ def adfilter_admin_publish(payload: dict = None):
     except IntegrityError:
         # 两个人同时点发布，后一个撞唯一索引：明确告诉他是版本冲突，不是代码坏了
         raise HTTPException(status_code=409, detail="版本号冲突（有并发发布），请重试一次")
+    audit.record("publish", f"v{result['version']}",
+                 {"channel": result["channel"], "note": (body.get("note") or "")[:120],
+                  "fingerprint_count": result.get("fingerprint_count", 0)},
+                 actor=str(auth.request_identity(request)))
     return {
         "code": SUCCESS_CODE,
         "msg": f"已发布 v{result['version']}",
@@ -1158,6 +1162,7 @@ def adfilter_admin_publish(payload: dict = None):
 
 @router.post("/api/v1/adfilter/admin/packs/rollback", summary="回滚规则包（管理端）")
 def adfilter_admin_rollback(
+    request: Request,
     version: int = Query(..., ge=1, description="要回滚到的历史版本号"),
     channel: str = Query("stable"),
     note: str = Query("", description="回滚备注，缺省写「回滚至 vN」"),
@@ -1172,6 +1177,12 @@ def adfilter_admin_rollback(
         result = adfilter.rollback(version, channel, note)
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except adfilter.RuleError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    audit.record("rollback", f"v{result['version']}",
+                 {"rolled_back_from": version, "channel": result["channel"],
+                  "fingerprint_count": result.get("fingerprint_count", 0)},
+                 actor=str(auth.request_identity(request)))
     return {
         "code": SUCCESS_CODE,
         "msg": f"已回滚至 v{version} 的内容，发布为 v{result['version']}",
@@ -1256,13 +1267,22 @@ def adfilter_admin_fingerprints(
     fp_hash: Optional[str] = Query(None, description="按 fp_hash 取单条详情"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    source: str = Query("", description="按来源筛：auto/manual，空=全部"),
+    downloadable: Optional[bool] = Query(None, description="按是否可下发筛"),
+    miss_gt: Optional[int] = Query(None, ge=0, description="仅误杀数大于该值"),
+    near_miss: bool = Query(False, description="仅返回恰好差一项达标的 candidate"),
+    order: str = Query("", description="排序：confidence_desc/hit_desc/miss_desc/updated_desc"),
 ):
-    """指纹分页列表；带 fp_hash 时只返回该条（total=1 或 0），便于面板详情。"""
+    """指纹分页列表（v1.18.0 扩展筛选/排序/分页）；带 fp_hash 时只返回该条。"""
     if fp_hash:
         row = adfilter_fp.get_fingerprint(fp_hash)
         return {"code": SUCCESS_CODE, "total": 1 if row else 0,
                 "items": [row] if row else [], "limit": 1, "offset": 0}
-    return {"code": SUCCESS_CODE, **adfilter_fp.list_fingerprints(status, host, limit, offset)}
+    return {"code": SUCCESS_CODE, **adfilter_fp.list_fingerprints(
+        status, host, limit, offset,
+        source=source, downloadable=downloadable, miss_gt=miss_gt,
+        near_miss=near_miss, order=order,
+    )}
 
 
 @router.get("/api/v1/adfilter/admin/fingerprints/overview", summary="指纹库概览（管理端）")
@@ -1271,34 +1291,124 @@ def adfilter_admin_fp_overview():
     return {"code": SUCCESS_CODE, **adfilter_fp.stats()}
 
 
+# ---- 指纹 rebuild 异步任务（v1.18.0 §4.2）----
+# 明细上量后全量 group by 可能超时，接口改为「提交即返回 job_id，进度可查」。
+# 轻量实现：模块级字典 + 线程池，单进程内足够；多进程部署时各进程独立（管理端单人操作，可接受）。
+import threading as _threading
+_rebuild_lock = _threading.Lock()
+_rebuild_jobs = {}          # job_id -> {status, started_at, result, error, duration_ms}
+_rebuild_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fp_rebuild")
+
+
+def _run_rebuild_job(job_id: str, actor: str):
+    import time as _t
+    started = _t.monotonic()
+    with _rebuild_lock:
+        _rebuild_jobs[job_id].update(status="running", started_at=datetime.now().isoformat())
+    try:
+        result = adfilter_fp.rebuild()
+        duration = int((_t.monotonic() - started) * 1000)
+        audit.record("rebuild", "fingerprints", {**result, "duration_ms": duration}, actor=actor)
+        with _rebuild_lock:
+            _rebuild_jobs[job_id].update(
+                status="done", result=result, duration_ms=duration,
+                finished_at=datetime.now().isoformat(),
+            )
+    except Exception as e:  # noqa: BLE001
+        with _rebuild_lock:
+            _rebuild_jobs[job_id].update(
+                status="failed", error=str(e)[:300],
+                finished_at=datetime.now().isoformat(),
+            )
+        log.warning("[fp_rebuild] job %s 失败: %s", job_id, str(e)[:160])
+
+
 @router.post("/api/v1/adfilter/admin/fingerprints/rebuild", summary="重算指纹聚合（管理端）")
-def adfilter_admin_fp_rebuild():
-    """从 segments 明细全量重算指纹（幂等，可反复调用）。人工审核过的 disabled 不受影响。"""
-    return {"code": SUCCESS_CODE, "msg": "重算完成", **adfilter_fp.rebuild()}
+def adfilter_admin_fp_rebuild(
+    request: Request,
+    sync: bool = Query(False, description="true=同步执行并返回结果（兼容老调用）；默认异步"),
+):
+    """
+    从 segments 明细全量重算（幂等）。默认异步：返回 202 + job_id，
+    进度查 GET /admin/fingerprints/rebuild/status。sync=true 走老同步语义。
+    """
+    actor = str(auth.request_identity(request))
+    if sync:
+        result = adfilter_fp.rebuild()
+        audit.record("rebuild", "fingerprints", result, actor=actor)
+        return {"code": SUCCESS_CODE, "msg": "重算完成", **result}
+    import uuid
+    job_id = uuid.uuid4().hex[:12]
+    with _rebuild_lock:
+        _rebuild_jobs[job_id] = {
+            "status": "queued", "started_at": None, "result": None,
+            "error": None, "duration_ms": None, "finished_at": None,
+        }
+    _rebuild_executor.submit(_run_rebuild_job, job_id, actor)
+    return JSONResponse(
+        status_code=202,
+        content={"code": SUCCESS_CODE, "msg": "重算任务已提交", "job_id": job_id,
+                 "status_url": f"/api/v1/adfilter/admin/fingerprints/rebuild/status?job_id={job_id}"},
+    )
+
+
+@router.get("/api/v1/adfilter/admin/fingerprints/rebuild/status", summary="重算任务进度（管理端）")
+def adfilter_admin_fp_rebuild_status(
+    job_id: str = Query(..., description="rebuild 返回的 job_id"),
+):
+    """查询 rebuild 任务状态：queued / running / done / failed。"""
+    with _rebuild_lock:
+        job = _rebuild_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"不存在任务 {job_id}")
+    last = audit.list_audit(limit=1, action="rebuild")
+    return {
+        "code": SUCCESS_CODE, "job_id": job_id,
+        "status": job["status"],
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "duration_ms": job.get("duration_ms"),
+        "result": job.get("result"),
+        "error": job.get("error"),
+        "last_result": (last["items"][0].get("detail") if last["items"] else None),
+    }
 
 
 @router.post("/api/v1/adfilter/admin/fingerprints/review", summary="人工审核指纹（管理端）")
-def adfilter_admin_fp_review(payload: dict = None):
+def adfilter_admin_fp_review(request: Request, payload: dict = None):
     """
-    把某条指纹设为 candidate / confirmed / disabled。
+    把一条或多条指纹设为 candidate / confirmed / disabled（v1.18.0 支持批量 + lock）。
 
-    body：`{"fp_hash": "...", "status": "confirmed", "note": "人工确认"}`
-    人工 confirmed 不受样本门槛限制（运营判断优先）；disabled 是止血，永不自动恢复。
+    body 单条：`{"fp_hash": "...", "status": "confirmed", "note": "...", "lock": true}`
+    body 批量：`{"fp_hashes": ["...", "..."], "status": "confirmed", ...}`
+    lock 缺省 true：审核即锁定，rebuild 不再覆盖；false = 交还自动判定。
+    status=confirmed 时误杀计数复位。
     """
     body = payload if isinstance(payload, dict) else {}
+    status = body.get("status", "")
+    note = body.get("note", "")
+    lock = body.get("lock", True)
+    actor = str(auth.request_identity(request))
+    detail = {"status": status, "lock": bool(lock), "note": note[:120]}
     try:
-        row = adfilter_fp.review(
-            body.get("fp_hash", ""), body.get("status", ""), body.get("note", ""),
-        )
+        if body.get("fp_hashes"):
+            result = adfilter_fp.batch_review(body.get("fp_hashes"), status, note, lock)
+            detail.update(updated=result["updated"], not_found=result["not_found"],
+                          fp_hashes=result["not_found"] or [h for h in body["fp_hashes"]][:20])
+            audit.record("review", f"batch:{result['updated']}", detail, actor=actor)
+            return {"code": SUCCESS_CODE, "msg": f"已更新 {result['updated']} 条", **result}
+        row = adfilter_fp.review(body.get("fp_hash", ""), status, note, lock)
+        detail["from"] = row["status"]
+        audit.record("review", row["fp_hash"], detail, actor=actor)
+        return {"code": SUCCESS_CODE, "msg": "已更新指纹状态", "fingerprint": row}
     except adfilter_fp.FPError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    return {"code": SUCCESS_CODE, "msg": "已更新指纹状态", "fingerprint": row}
 
 
 @router.delete("/api/v1/adfilter/admin/fingerprints/{fp_hash}", summary="彻底删除指纹（管理端，v1.17.5）")
-def adfilter_admin_fp_delete(fp_hash: str):
+def adfilter_admin_fp_delete(fp_hash: str, request: Request):
     """
     物理删除一条指纹：同时删聚合表与上报明细，避免 rebuild 后复活。
 
@@ -1306,6 +1416,7 @@ def adfilter_admin_fp_delete(fp_hash: str):
     """
     try:
         result = adfilter_fp.delete_fingerprint(fp_hash)
+        audit.record("delete", fp_hash, result, actor=str(auth.request_identity(request)))
     except adfilter_fp.FPError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except LookupError as e:
@@ -1319,7 +1430,7 @@ def adfilter_admin_fp_delete(fp_hash: str):
 
 
 @router.post("/api/v1/adfilter/admin/fingerprints/publish", summary="发布指纹到规则包（管理端）")
-def adfilter_admin_fp_publish(payload: dict = None):
+def adfilter_admin_fp_publish(request: Request, payload: dict = None):
     """
     把当前 confirmed 指纹快照注入规则包，发布为新版本（版本号 +1）。
 
@@ -1336,13 +1447,83 @@ def adfilter_admin_fp_publish(payload: dict = None):
         )
     except IntegrityError:
         raise HTTPException(status_code=409, detail="版本号冲突（有并发发布），请重试一次")
+    except adfilter.RuleError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     fp_count = len(result["rules"].get("fingerprints") or [])
+    audit.record("publish", f"v{result['version']}",
+                 {"channel": result["channel"], "fingerprint_count": fp_count,
+                  "via": "fingerprints_publish"},
+                 actor=str(auth.request_identity(request)))
     return {
         "code": SUCCESS_CODE,
         "msg": f"已发布 v{result['version']}（含 {fp_count} 条指纹）",
         **result,
         "fingerprint_count": fp_count,
     }
+
+
+@router.post("/api/v1/adfilter/admin/fingerprints/manual", summary="人工补录指纹（管理端，v1.18.0）")
+def adfilter_admin_fp_manual(request: Request, payload: dict = None):
+    """
+    人工补录一条 confirmed 指纹（§2.3）：运营确认某站广告切片特征后直接录入。
+
+    body：`{"host": "2609.lbsl2026.com", "dur_ms": 2600, "size_b": 0, "note": "..."}`
+    fp_hash 由服务端 signature() 计算，不接受调用方传入。幂等：重复提交合并而非 409。
+    """
+    body = payload if isinstance(payload, dict) else {}
+    try:
+        result = adfilter_fp.manual_create(
+            body.get("host", ""), body.get("dur_ms"), body.get("size_b", 0),
+            body.get("note", ""),
+        )
+    except adfilter_fp.FPError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    fp = result["fingerprint"]
+    audit.record("manual", fp["fp_hash"],
+                 {"created": result["created"], "host": fp["host"],
+                  "pattern": fp.get("pattern"), "note": body.get("note", "")[:120]},
+                 actor=str(auth.request_identity(request)))
+    return {
+        "code": SUCCESS_CODE,
+        "msg": "已生成人工指纹，发布规则包后生效",
+        **result,
+    }
+
+
+@router.get("/api/v1/adfilter/admin/publish-state", summary="发布状态与差异预览（管理端，v1.18.0）")
+def adfilter_admin_publish_state(
+    channel: str = Query("stable", description="规则渠道：stable / beta"),
+):
+    """运营发布前判断指纹库变更：pack/library/pending/rebuild/bucket（§2.4）。"""
+    return {"code": SUCCESS_CODE, **adfilter.publish_state(channel)}
+
+
+@router.get("/api/v1/adfilter/admin/miss-samples", summary="漏判样本明细（管理端，v1.18.0）")
+def adfilter_admin_miss_samples(
+    days: int = Query(7, ge=1, le=365),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """按 host 聚合漏判举报 + 指纹覆盖判定（§3.3），不返回 url 原文。"""
+    return {"code": SUCCESS_CODE, **adfilter_fp.miss_samples(days, limit)}
+
+
+@router.get("/api/v1/adfilter/admin/audit", summary="操作审计（管理端，v1.18.0）")
+def adfilter_admin_audit_log(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    action: str = Query("", description="按动作筛，逗号分隔多个：review,delete,manual..."),
+):
+    """运营操作审计列表（§3.5）：谁在何时做了什么。"""
+    return {"code": SUCCESS_CODE, **audit.list_audit(limit, offset, action)}
+
+
+@router.get("/api/v1/adfilter/admin/events", summary="系统事件流（管理端，v1.18.0）")
+def adfilter_admin_events(
+    limit: int = Query(50, ge=1, le=200),
+    kind: str = Query("", description="事件类型：promoted/demoted/auto_disabled，空=全部"),
+):
+    """系统事件流（§4.3）：自动晋升/降级/停用等，与人工操作审计共用一张表。"""
+    return {"code": SUCCESS_CODE, **audit.events(limit, kind)}
 
 
 def _tag_stats_brief() -> dict:

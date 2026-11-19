@@ -292,6 +292,10 @@ ADFILTER_FP_MISS_DISABLE = max(1, int(os.environ.get("ADFILTER_FP_MISS_DISABLE",
 ADFILTER_FP_MAX_DOWNLOAD = max(0, min(256, int(os.environ.get("ADFILTER_FP_MAX_DOWNLOAD", "128"))))
 # 后台自动重算间隔（分钟）。0 = 关闭自动重算，只能面板手动点。
 ADFILTER_FP_REBUILD_INTERVAL_MIN = max(0, int(os.environ.get("ADFILTER_FP_REBUILD_INTERVAL_MIN", "360")))
+# v1.18.0 明细保留策略（§3.4）：0 = 关闭清理（默认，先观察体量）。
+# adfilter_segments 默认建议 90 天，adfilter_reports 默认建议 180 天。
+ADFILTER_SEGMENT_RETENTION_DAYS = max(0, int(os.environ.get("ADFILTER_SEGMENT_RETENTION_DAYS", "0")))
+ADFILTER_REPORT_RETENTION_DAYS = max(0, int(os.environ.get("ADFILTER_REPORT_RETENTION_DAYS", "0")))
 
 # ---------------------------------------------------------------------------
 # 标签精确检索（v1.14.0 / B-01）

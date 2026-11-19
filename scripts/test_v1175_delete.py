@@ -139,7 +139,8 @@ spec = app.openapi()
 route_path = "/api/v1/adfilter/admin/fingerprints/{fp_hash}"
 check("DELETE 路由已注册", route_path in spec["paths"] and "delete" in spec["paths"].get(route_path, {}),
       list(spec["paths"].get(route_path, {}).keys()))
-check("openapi 版本为 1.17.5", spec["info"]["version"] == "1.17.5", spec["info"]["version"])
+from app import __version__ as _cur_ver  # noqa: E402
+check("openapi 版本与代码一致", spec["info"]["version"] == _cur_ver, spec["info"]["version"])
 
 print("\n==== SUMMARY ====")
 if fails:
