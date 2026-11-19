@@ -2674,7 +2674,7 @@ async function fpLoad() {
   }
 }
 
-$("#fpReload").onclick = () => fpLoad();
+$("#btnFpReload").onclick = () => fpLoad();
 $("#fpStatusFilter").onchange = () => fpLoad();
 $("#fpHostFilter").addEventListener("keydown", (ev) => { if (ev.key === "Enter") fpLoad(); });
 
