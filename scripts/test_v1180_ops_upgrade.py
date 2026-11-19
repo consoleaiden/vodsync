@@ -242,7 +242,8 @@ new_routes = {
 for path, method in new_routes.items():
     check(f"路由 {method.upper()} {path.rsplit('/',1)[-1]}",
           path in spec["paths"] and method in spec["paths"][path])
-check("版本=1.18.0", spec["info"]["version"] == "1.18.0", spec["info"]["version"])
+from app import __version__ as _ver  # noqa: E402 —— 后续补丁版本不应让本套件失败
+check(f"版本={_ver}", spec["info"]["version"] == _ver, spec["info"]["version"])
 
 print("\n==== SUMMARY ====")
 if fails:

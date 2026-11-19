@@ -2700,20 +2700,30 @@ $("#adHistory").addEventListener("click", async (ev) => {
 
 // ---------------- 广告指纹库（v1.17.0 / Phase 2） ----------------
 // 只读聚合 + 审核启停 + 发布下发。不做播放数据面，过滤仍在客户端。
-function fpStatusBadge(s, locked, downloadable, blockReason) {
-  let badge;
+function fpStatusBadge(s, locked, downloadable, blockReason, shortfall) {
+  // v1.18.1：title 必须写进 <span> 内部，不能拼在 badge 字符串后面——
+  // 否则 innerHTML 会把 title="..." 当普通文本渲染到单元格里（截图里那串「未下发原因」）。
+  let cls, label, tip = "";
   if (s === "confirmed") {
-    badge = downloadable
-      ? '<span class="badge ok">下发中</span>'
-      : '<span class="badge warn" title="状态是确认，但因误杀阈值未下发">确认·未下发</span>';
+    cls = downloadable ? "ok" : "warn";
+    label = downloadable ? "下发中" : "确认·未下发";
+    if (!downloadable) {
+      tip = blockReason === "miss_threshold" ? "误杀达阈值，未下发"
+          : blockReason === "capped" ? "超出下发上限，未下发"
+          : "状态未确认，未下发";
+    }
   } else if (s === "disabled") {
-    badge = '<span class="badge warn">已停用</span>';
+    cls = "warn";
+    label = "已停用";
+    tip = blockReason === "miss_threshold" ? "误杀达阈值，自动停用" : "人工停用，不下发";
   } else {
-    badge = '<span class="badge mute">样本不足</span>';
+    cls = "mute";
+    label = "样本不足";
+    // candidate 的笼统「未确认」没有价值：直接告诉运营卡在哪一项门槛。
+    tip = shortfall ? `未达标：${shortfall}` : "样本不足，未下发";
   }
   const lock = locked ? ' <span title="人工锁定：重算不会覆盖此状态">🔒</span>' : '';
-  const why = blockReason ? ` title="未下发原因：${{miss_threshold:'误杀达阈值',not_confirmed:'未确认',capped:'超出下发上限'}[blockReason] || blockReason}"` : '';
-  return badge + lock + (why || '');
+  return `<span class="badge ${cls}"${tip ? ` title="${esc(tip)}"` : ""}>${label}</span>${lock}`;
 }
 
 function renderFpList(data) {
@@ -2725,6 +2735,15 @@ function renderFpList(data) {
     return;
   }
   const blocked = r => r.blocked_by || {};
+  // v1.18.1：candidate 的「未确认」换成可执行的门槛差额（截图里 8 条卡地址数的指纹）。
+  const shortfallOf = (r) => {
+    const bb = blocked(r);
+    const parts = [];
+    if (bb.users) parts.push(`用户 ${fmtNum(r.distinct_users)}/${fmtNum(window._fpMinUsers || 1)}`);
+    if (bb.urls) parts.push(`地址 ${fmtNum(r.distinct_urls)}/${fmtNum(window._fpMinUrls || 3)}`);
+    if (bb.hits) parts.push(`命中 ${fmtNum(r.hit_count)}/${fmtNum(window._fpMinHits || 10)}`);
+    return parts.join("、");
+  };
   box.innerHTML = `<table>
     <thead><tr><th style="width:110px">指纹</th><th>站点 host</th><th class="num">时长桶</th>
       <th class="num">大小桶</th><th class="num">置信度</th><th class="num">命中段</th>
@@ -2736,6 +2755,12 @@ function renderFpList(data) {
       const stuck = r.status === "candidate"
         ? [bb.users && "用户", bb.urls && "地址", bb.hits && "命中"].filter(Boolean).join("/")
         : "";
+      const shortfall = shortfallOf(r);
+      const why = !r.downloadable
+        ? (shortfall ? `未达标：${shortfall}`
+          : r.block_reason === "miss_threshold" ? "误杀达阈值"
+          : r.block_reason === "capped" ? "超出下发上限" : "状态未确认")
+        : "已随规则包下发";
       const confirmLabel = (Number(r.miss_count || 0) >= (window._fpMissDisable || 5))
         ? "确认并重置误杀" : "确认";
       return `<tr>
@@ -2748,9 +2773,9 @@ function renderFpList(data) {
         <td class="num">${fmtNum(r.distinct_urls)}</td>
         <td class="num">${fmtNum(r.miss_count)}</td>
         <td class="num" title="最后命中：${esc(r.last_hit_at || "无")}">${fmtNum(r.run_hits)}</td>
-        <td>${r.downloadable ? '<span class="badge ok">是</span>' : '<span class="badge mute">否</span>'}</td>
+        <td title="${esc(why)}">${r.downloadable ? '<span class="badge ok">是</span>' : '<span class="badge mute">否</span>'}</td>
         <td>${r.source === "manual" ? '<span class="badge" title="人工录入">人工</span>' :'<span class="muted">自动</span>'}</td>
-        <td>${fpStatusBadge(r.status, r.locked, r.downloadable, r.block_reason)}</td>
+        <td>${fpStatusBadge(r.status, r.locked, r.downloadable, r.block_reason, shortfall)}</td>
         <td style="white-space:nowrap">
           <button class="sm" data-fp-act="confirmed" data-hash="${esc(r.fp_hash)}" title="人工确认并下发${r.miss_count >= (window._fpMissDisable||5) ? '（将重置误杀计数）' : ''}">${confirmLabel}</button>
           <button class="sm warn" data-fp-act="disabled" data-hash="${esc(r.fp_hash)}" title="止血：停用且不再下发">停用</button>
@@ -2769,6 +2794,9 @@ async function fpLoad() {
     const ov = await api("/api/v1/adfilter/admin/fingerprints/overview");
     const c = ov.config || {};
     window._fpMissDisable = c.miss_disable || 5;
+    window._fpMinUsers = c.min_users || 1;
+    window._fpMinUrls = c.min_urls || 3;
+    window._fpMinHits = c.min_hits || 10;
     $("#fpThresholds").textContent = `用户 ≥ ${fmtNum(c.min_users)} / 地址 ≥ ${fmtNum(c.min_urls)} / 命中 ≥ ${fmtNum(c.min_hits)}，误杀 ≥ ${fmtNum(c.miss_disable)} 停用`;
     const bb = ov.blocked_by || {};
     $("#fpStats").textContent = `共 ${fmtNum(ov.total)} 条`
@@ -2802,6 +2830,61 @@ async function fpLoad() {
   }
 }
 
+// v1.18.1：审计详情是结构化 JSON，但运营面板要给人看的短句，
+// 不直接把 JSON.stringify 的结果铺在表格里（截图里那三行原始 JSON）。
+const FP_AUDIT_LABELS = {
+  fp_hash: "指纹", host: "站点", pattern: "模式", status: "状态", from: "原状态",
+  note: "备注", lock: "锁定", created: "新建", target: "对象",
+  deleted_fingerprints: "删聚合", deleted_segments: "删明细",
+  scanned: "扫描", confirmed: "确认", demoted: "降级",
+  disabled: "停用", disabled_kept: "停用保留", locked_kept: "锁定保留",
+  kept: "保留", updated: "更新", not_found: "未找到", duration_ms: "耗时",
+  version: "版本", channel: "渠道", count: "条数", reason: "原因",
+};
+function fmtAuditDetail(detail) {
+  if (!detail || typeof detail !== "object" || Array.isArray(detail)) return esc(detail ?? "-");
+  const parts = [];
+  for (const [k, raw] of Object.entries(detail)) {
+    if (raw === null || raw === undefined || raw === "") continue;
+    let v = raw;
+    if (k === "fp_hash" || k === "target") {
+      v = String(v).slice(0, 10) + "…";
+    } else if (typeof v === "boolean") {
+      v = v ? "是" : "否";
+    } else if (Array.isArray(v)) {
+      v = `${v.length} 项`;
+    } else if (typeof v === "object") {
+      v = Object.entries(v).map(([kk, vv]) => `${kk}=${vv}`).join(",");
+    } else if (typeof v === "string") {
+      const s = v.trim();
+      if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
+        try {
+          const o = JSON.parse(s);
+          if (o && typeof o === "object") {
+            v = Object.entries(o).map(([kk, vv]) => `${kk}=${vv}`).join(",");
+          }
+        } catch (_) { /* 不是 JSON 就按原文截断 */ }
+      }
+    }
+    v = String(v);
+    if (v.length > 44) v = v.slice(0, 44) + "…";
+    if (k.endsWith("_ms")) v += "ms";
+    parts.push(`${FP_AUDIT_LABELS[k] || k}=${v}`);
+    if (parts.length >= 8) break;
+  }
+  return esc(parts.join(" · ") || "-");
+}
+function fmtAuditActor(a) {
+  const n = Number(a);
+  if (!Number.isFinite(n)) return esc(a || "-");
+  if (n === 0) return "主 Token";
+  if (n === -1) return "API_KEY";
+  if (n === -2) return "管理面板";
+  if (n === -3) return "未知凭据";
+  if (n === -4) return "匿名/未鉴权";
+  return `Token #${n}`;
+}
+
 async function fpLoadAudit(force) {
   const box = $("#fpAuditList");
   if (!box || (box.dataset.loaded === "1" && !force)) return;
@@ -2812,8 +2895,8 @@ async function fpLoadAudit(force) {
     box.innerHTML = `<table><thead><tr><th>时间</th><th>动作</th><th>对象</th><th>操作者</th><th>详情</th></tr></thead><tbody>`
       + rows.map(r => `<tr><td class="muted">${esc(r.at || "-")}</td><td><code>${esc(r.action)}</code></td>`
         + `<td title="${esc(r.target)}"><code>${esc((r.target || "").slice(0, 14))}</code></td>`
-        + `<td>${esc(r.actor || "-")}</td>`
-        + `<td class="muted" style="font-size:11px">${esc(JSON.stringify(r.detail || {}).slice(0, 90))}</td></tr>`).join("")
+        + `<td>${fmtAuditActor(r.actor)}</td>`
+        + `<td class="muted" style="font-size:11px" title="${esc(JSON.stringify(r.detail || {}).slice(0, 600))}">${fmtAuditDetail(r.detail)}</td></tr>`).join("")
       + `</tbody></table>`;
     box.dataset.loaded = "1";
   } catch (e) { box.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
