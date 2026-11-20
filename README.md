@@ -677,7 +677,7 @@ vodsync/
 <details>
 <summary><b>v1.19.0</b> — 运营管理升级「未实现/半实现项」全部补齐</summary>
 
-##### v1.19.0
+### v1.19.0
 **运营管理升级「未实现/半实现项」全部补齐**（对照 `ADFILTER_ADMIN_OPS_UPGRADE` 需求文档逐条核查后补齐；规则包/客户端协议结构不变）：
 
 - **§4.3 事件流闭环**：`rebuild` 逐条写 `promoted/demoted`、`feedback` 写 `auto_disabled/feedback_still_ads`、
@@ -709,7 +709,7 @@ vodsync/
 <details>
 <summary><b>v1.18.1</b> — 运营面板展示修复</summary>
 
-##### v1.18.1
+### v1.18.1
 **运营面板展示修复**（v1.18.0 上线后截图验收发现的两处展示问题，纯前端，后端接口/数据模型不变）：
 
 - **指纹状态列不再把 `title="…"` 当文本显示**：`fpStatusBadge()` 原先拼在 `<span class="badge">…</span>`
@@ -728,7 +728,7 @@ vodsync/
 <details>
 <summary><b>v1.18.0</b> — 广告过滤运营管理升级</summary>
 
-##### v1.18.0
+### v1.18.0
 **广告过滤运营管理升级**（据前端分析需求文档，P0/P1/P2 后端项；规则包与客户端协议不变、客户端零改动）：
 
 **P0 — 打通运营闭环**
@@ -765,7 +765,7 @@ vodsync/
 <details>
 <summary><b>v1.17.5</b> — 广告指纹库支持物理删除</summary>
 
-##### v1.17.5
+### v1.17.5
 **广告指纹库支持物理删除**：
 
 - 指纹库操作列新增「删除」按钮（红色，带不可恢复二次确认），可彻底清除测试残留 / 误上报的指纹。
@@ -783,7 +783,7 @@ vodsync/
 <details>
 <summary><b>v1.17.4</b> — 管理面板页脚：镜像版本 + 项目地址</summary>
 
-##### v1.17.4
+### v1.17.4
 **管理面板页脚：镜像版本 + 项目地址**：
 
 - 面板底部新增页脚，左侧显示**当前镜像版本**（`vX.Y.Z`），右侧是 **GitHub 项目地址**链接
@@ -799,7 +799,7 @@ vodsync/
 <details>
 <summary><b>v1.17.3</b> — 广告指纹库用户数门槛放宽（适配单用户场景）</summary>
 
-##### v1.17.3
+### v1.17.3
 **广告指纹库用户数门槛放宽（适配单用户场景）**：
 
 - **门槛调整**：`ADFILTER_FP_MIN_USERS` 默认值 `3 → 1`。用户实际只有 1 个 `user_id`，
@@ -819,7 +819,7 @@ vodsync/
 <details>
 <summary><b>v1.17.2</b> — 管理面板整体失效修复</summary>
 
-##### v1.17.2
+### v1.17.2
 **管理面板整体失效修复**（据线上反馈：能登录、面板能显示，但功能块展开不了、数据不加载）：
 
 - **根因**：v1.17.0 新增指纹库时，面板顶层 JS 把「刷新」按钮写成 `$("#fpReload")`，
@@ -838,7 +838,7 @@ vodsync/
 <details>
 <summary><b>v1.17.1</b> — 指纹库阻断性修复 + 上报响应补全</summary>
 
-##### v1.17.1
+### v1.17.1
 **指纹库阻断性修复 + 上报响应补全**（前端已升级，据线上联调反馈修复）：
 
 - **修复指纹永不匹配的阻断性 bug**：`adfilter_fp.rebuild()` 此前写 `pattern_json` 时只有
@@ -858,7 +858,7 @@ vodsync/
 <details>
 <summary><b>v1.17.0</b> — 广告指纹库（Phase 2）</summary>
 
-##### v1.17.0
+### v1.17.0
 **广告指纹库（Phase 2）**：把「哪些片段是广告」从客户端本地启发式升级为跨用户共享知识，服务端完成全链路落地。
 
 - **数据模型**：新增 `adfilter_segments`（逐段特征明细，去重键 `(user,url_hash,at,seg_index)`）
@@ -882,7 +882,7 @@ vodsync/
 <details>
 <summary><b>v1.16.7</b> — 中转代理配置从 docker 环境变量搬到管理面板</summary>
 
-##### v1.16.7
+### v1.16.7
 **中转代理配置从 docker 环境变量搬到管理面板**：改代理地址 / 并发 / 记忆时长不再需要重启容器。
 
 - 新增 `app/proxyconf.py`：代理配置的单一读写入口，持久化在 `settings` 表（key `panel_proxy_config`）
@@ -903,7 +903,7 @@ vodsync/
 <details>
 <summary><b>v1.16.6</b> — 标签索引「已写行」口径修正</summary>
 
-##### v1.16.6
+### v1.16.6
 **标签索引「已写行」口径修正**（线上实测面板加总 581,614 vs 真实 `COUNT(video_tags)` 1,726,394，方案 A）：
 
 - **新增功能**：`GET /api/v1/tag/status` 新增 `refresh` 查询参数（强刷跳过缓存）；面板「倒排行数」列替换原「已写行」列，新增「↻ 实时行数」按钮与快照年龄提示。
@@ -916,7 +916,7 @@ vodsync/
 <details>
 <summary><b>v1.16.5</b> — 计划任务管理面板 + 源站 slug 安全收敛 + 标签索引显示源站名</summary>
 
-##### v1.16.5
+### v1.16.5
 **计划任务管理面板 + 源站 slug 安全收敛 + 标签索引显示源站名**：
 
 - **新增功能**：`app/scheduler.py` 新增 `list_jobs/pause_job/resume_job/trigger_job/reschedule_job` 与中文任务名，配 `GET|POST /api/v1/admin/scheduler` 系列接口；面板新增「计划任务」区块（状态/暂停/恢复/立即执行/改周期）。
@@ -929,7 +929,7 @@ vodsync/
 <details>
 <summary><b>v1.16.4</b> — 管理面板性能与批量管理</summary>
 
-##### v1.16.4
+### v1.16.4
 **管理面板性能与批量管理**（实测归因：逐站 `COUNT(*)` 扫 12GB 大表是主因，占 96%+，网络仅 1~2%）：
 
 - **新增功能**：`app/panel.py`（纯管理面）以 `settings` 表 key `panel_blocked_sources` 存屏蔽名单，并提供 `cached(key, ttl, producer, refresh)` 进程内快照 + per-key 锁合并并发；新接口 `GET /api/v1/admin/overview`（合并 stats/pause/sources/logs + blocks，失败自动降级回 4 个老接口）、`GET|POST /api/v1/admin/source-blocks`、`POST /api/v1/star-terms/batch`；`GET /api/v1/star-terms` 增加 `page/page_size(50~500)/q/ids_only`。
@@ -942,7 +942,7 @@ vodsync/
 <details>
 <summary><b>v1.16.3</b> — 去广告阈值登记与用户举报样本隔离</summary>
 
-##### v1.16.3
+### v1.16.3
 **去广告阈值登记与用户举报样本隔离**（v1.5.169 客户端算法升级配套）：
 
 - **新增功能**：`app/adfilter.py` 的 `_THRESHOLDS` 登记 `safety_floor_high_confidence`(0.4~1.0) 与 `duplicate_max_ratio`(0.3~0.9)，区间对齐客户端 `AdFilterRules.java` 的 clamp；`stats()` 新增 `miss_reports`（总数）与 `miss_hosts`（host + reports + last_at，按举报数降序，最多 limit 条）。
@@ -955,7 +955,7 @@ vodsync/
 <details>
 <summary><b>v1.16.2</b> — 标题命中明星词库回填 `vod_tag`</summary>
 
-##### v1.16.2
+### v1.16.2
 **标题命中明星词库回填 `vod_tag`**（修复乐播反例「香草少女」118 行无标签）：
 
 - **新增功能**：同步写时按标题单正则扫描全词库命中并合并进 `vod_tag`（性能与词库大小解耦）；`star_map` 倒排映射支撑同明星作品查询走索引毫秒返回；新表 `star_rebuild_state` 记录按站回填水位；`POST /api/v1/maintenance/star-tags?slug=` 触发单站后台重建。
@@ -968,7 +968,7 @@ vodsync/
 <details>
 <summary><b>v1.16.1</b> — 去广告按站点分布统计与误杀主动发现</summary>
 
-##### v1.16.1
+### v1.16.1
 **去广告按站点分布统计与误杀主动发现**：
 
 - **新增功能**：`adfilter_reports` 新增 `host` 冗余列（写时从 url 归一解析，读侧一句 `GROUP BY host`，PG/SQLite 通用）；`GET /api/v1/adfilter/admin/stats` 新增 `hosts`（逐条删除占比均值/最大、平均删除段数、去重地址数）、`thresholds`（阈值随响应回显）与 `suspicious` 标记；面板可一键生成 `mode:"off"` 止血建议。
@@ -981,7 +981,7 @@ vodsync/
 <details>
 <summary><b>v1.16.0</b> — 智能去广告控制面</summary>
 
-##### v1.16.0
+### v1.16.0
 **智能去广告控制面**（需求源自客户端 Phase 1 端上过滤，后端只做控制面，**不代理任何播放流量、零带宽**）：
 
 - **新增功能**：`GET /api/v1/adfilter/rules` 下发规则包（阈值 / 高置信 URL 模式 / 站点级例外，不发版即可调参、可一键回滚）；`POST /api/v1/adfilter/report` 收命中明细（幂等去重 + 限流 + 逐条校验）；新表 `adfilter_rule_packs` / `adfilter_reports`；面板「去广告规则包」区块（编辑 JSON / 发布 / 回滚 / 看上报量）；`capabilities` 增 `adfilter` 能力位。
@@ -994,7 +994,7 @@ vodsync/
 <details>
 <summary><b>v1.15.1</b> — 面板批量标记 18+ 与轮询不打断操作</summary>
 
-##### v1.15.1
+### v1.15.1
 **面板批量标记 18+ 与轮询不打断操作**：
 
 - **新增功能**：`POST /api/v1/sources/adult?enabled=&slugs=all|a,b` 批量端点（一次 UPDATE，语义同单站：只动 `is_adult` + 清分类缓存）；面板工具栏「标记所选 18+ / 取消所选 18+」，标记方向二次确认。
@@ -1007,7 +1007,7 @@ vodsync/
 <details>
 <summary><b>v1.15.0</b> — 源站 18+ 标记与未成年模式</summary>
 
-##### v1.15.0
+### v1.15.0
 **源站 18+ 标记与未成年模式**：
 
 - **新增功能**：`sources.is_adult INTEGER DEFAULT 0`（存量站默认「否」，`_migrate()` 自动补列，`refresh_sources()`/`update_custom_source()` 都不写这列）；源站清单下发 `is_adult`；请求级无状态开关 `X-Minor-Mode: 1`（头优先）或 `?minor_mode=1`；部署级 `MINOR_MODE_FORCE=true` 强制管控；`GET /api/v1/minor-mode` 诊断端点；`capabilities` 增 `minor_mode`。
@@ -1018,9 +1018,9 @@ vodsync/
 </details>
 
 <details>
-<summary><b>v1.14.1</b> — 根因</summary>
+<summary><b>v1.14.1</b> — 标签回填进度超过 100% 修复</summary>
 
-##### v1.14.1
+### v1.14.1
 修复标签回填进度显示超过 100% 的 bug（面板截图报了 147.1%、172.6%）。
 
 - **根因**：`progress = cursor / total`，但 `cursor` 是上游 `vod_id` 水位、`total` 是行数 ——
@@ -1046,9 +1046,9 @@ vodsync/
 </details>
 
 <details>
-<summary><b>v1.14.0</b> — 不改任何既有字段名</summary>
+<summary><b>v1.14.0</b> — 能力清单、统一错误码与 Token 分档</summary>
 
-##### v1.14.0
+### v1.14.0
 后端契约升级（对接 `BACKEND_UPGRADE_REQUIREMENTS_2026-11-09.md` 的 B-01 ~ B-11）：
 加能力、收错误码，**不改任何既有字段名**。详见 `docs/UPGRADE_2026-11-09_v1.14.0.md`。
 
@@ -1090,7 +1090,7 @@ vodsync/
 <details>
 <summary><b>v1.13.0</b> — 明星词库搬到主面板</summary>
 
-##### v1.13.0
+### v1.13.0
 面板布局调整：明星词库独立成区块 + 内容区自适应全屏。
 
 - **明星词库搬到主面板**（原先藏在「⚙ 设置」弹层最底下）：独立区块，含词条列表
@@ -1112,9 +1112,9 @@ vodsync/
 </details>
 
 <details>
-<summary><b>v1.12.2</b> — 根因</summary>
+<summary><b>v1.12.2</b> — 数据表浏览查询无数据修复</summary>
 
-##### v1.12.2
+### v1.12.2
 修复数据表浏览「查询没有数据」（v1.12.0 引入）：表头空白、每行每格都显示 `-`。
 
 - **根因**：`/rows` 返回的 `columns` 是**列名字符串数组**，面板却按 `{name,type,pk}` 对象用
@@ -1129,9 +1129,9 @@ vodsync/
 </details>
 
 <details>
-<summary><b>v1.12.1</b> — 源站名称</summary>
+<summary><b>v1.12.1</b> — 数据表下拉显示源站名称</summary>
 
-##### v1.12.1
+### v1.12.1
 数据表浏览的下拉改显示**源站名称**：原来是 `vod_s361c088099`，面板上根本看不出是哪个站。
 
 - 清单接口每项新增 `label`：`vod_*` 取 `sources.name`（如「新极品资源站」）；
@@ -1146,9 +1146,9 @@ vodsync/
 </details>
 
 <details>
-<summary><b>v1.12.0</b> — 面板新区块</summary>
+<summary><b>v1.12.0</b> — 新增只读数据表浏览</summary>
 
-##### v1.12.0
+### v1.12.0
 管理面板「数据表浏览」：只读查看数据库内容，排障时不用再登 psql。
 
 - **面板新区块**：下拉切换数据表（内置 5 张系统表 + 全部 `vod_{slug}`）；
@@ -1172,7 +1172,7 @@ vodsync/
 <details>
 <summary><b>v1.11.0</b> — 入库保留线路来源</summary>
 
-##### v1.11.0
+### v1.11.0
 播放线路识别 / 过滤 / 排序（需求源自线上：非凡资源站 100% 记录的线路 1 是 H5 分享页，
 客户端自动选源必然播放失败）。
 
@@ -1199,9 +1199,9 @@ vodsync/
 </details>
 
 <details>
-<summary><b>v1.10.1</b> — `_detail_item` 新增 5 个字段</summary>
+<summary><b>v1.10.1</b> — 详情透出演职员与标签字段</summary>
 
-##### v1.10.1
+### v1.10.1
 详情接口透出演职员与明星标签：NAS 模式下「演员/标签」不再无数据。
 
 - **`_detail_item` 新增 5 个字段**（纯新增，旧客户端无影响）：`vod_actor`、`vod_director`、
@@ -1224,9 +1224,9 @@ vodsync/
 </details>
 
 <details>
-<summary><b>v1.10.0</b> — 接口只加字段、不改结构</summary>
+<summary><b>v1.10.0</b> — 推荐算法 v2 与性能修正</summary>
 
-##### v1.10.0
+### v1.10.0
 按 `docs/REVIEW_2026-11-07.md` 第 8 节把 W1~W4 四个批次一次落地：4 个数据级 Bug、
 6 项算法修正、13 项性能优化、7 项次要 Bug。**接口只加字段、不改结构**，
 完整对接说明见 [`docs/UPGRADE_2026-11-07_v1.10.x.md`](docs/UPGRADE_2026-11-07_v1.10.x.md)。
@@ -1268,7 +1268,7 @@ vodsync/
 <details>
 <summary><b>v1.9.3</b> — CI 改为「每构建必带版本号」</summary>
 
-##### v1.9.3
+### v1.9.3
 镜像版本化 + 版本探针：每次构建都打版本号 tag，回滚有据可依。
 
 - **CI 改为「每构建必带版本号」**：`app/__init__.py` 的 `__version__` 是唯一来源，
@@ -1293,7 +1293,7 @@ vodsync/
 <details>
 <summary><b>v1.9.2</b> — 新接口 `GET /api/v1/star/works`</summary>
 
-##### v1.9.2
+### v1.9.2
 明星作品接口补强：新增「按明星查作品」、`star/related` 增加 Tab 角标数据、
 词库支持别名、未入词库高频词统计。
 
@@ -1329,7 +1329,7 @@ vodsync/
 <details>
 <summary><b>v1.9.1</b> — Tag 回填（词库 → vod_tag）</summary>
 
-##### v1.9.1
+### v1.9.1
 明星作品推荐：明星 Tag 回填 + 同明星视频查询 API。基于 v1.9.0 的明星词库，
 把词库价值落到数据层（`vod_tag`）和查询层（`star_map` 倒排映射）。
 
@@ -1370,9 +1370,9 @@ vodsync/
 </details>
 
 <details>
-<summary><b>v1.9.0</b> — 关键背景</summary>
+<summary><b>v1.9.0</b> — 相关推荐预计算与明星词库</summary>
 
-##### v1.9.0
+### v1.9.0
 相关推荐（服务端预计算）+ 存量字段补齐 + 明星词库。客户端详情页新增「相关推荐」栏，
 接口直读预计算表（P95 < 50ms，实测 0.3ms），任何详情页的推荐栏都不为空。
 
@@ -1436,9 +1436,9 @@ vodsync/
 </details>
 
 <details>
-<summary><b>v1.8.1</b> — M1 页级重试</summary>
+<summary><b>v1.8.1</b> — 源站健康度退避与页级重试</summary>
 
-##### v1.8.1
+### v1.8.1
 源站健康度退避：源站持续限流/宕机时不再「每 6 小时从第 1 页捶到最后一页」。
 
 背景：某 9.3 万条的源站出现单轮 2,678 个索引页失败的日志。旧逻辑水位线冻结是对的
@@ -1468,9 +1468,9 @@ vodsync/
 </details>
 
 <details>
-<summary><b>v1.8.0</b> — 数据模型</summary>
+<summary><b>v1.8.0</b> — 自定义源站登记</summary>
 
-##### v1.8.0
+### v1.8.0
 自定义源站：latest.json 之外的接口可以在面板直接登记。
 
 - **数据模型**：`sources` 表新增 `origin`（`latest` / `custom`），`_migrate()` 自动为老库补列。
@@ -1504,7 +1504,7 @@ vodsync/
 <details>
 <summary><b>v1.7.0</b> — 生产统一 PostgreSQL</summary>
 
-##### v1.7.0
+### v1.7.0
 Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一 PostgreSQL**。
 
 - **多源列表查询**（`app/multiquery.py`，新）：不带 `source` 查全部源站时，旧实现把 52 张表
@@ -1535,7 +1535,7 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 <details>
 <summary><b>v1.6.1</b> — 删除 `token_hint`</summary>
 
-##### v1.6.1
+### v1.6.1
 收紧 `/api/v1/auth/state` 的信息暴露面（该接口在免鉴权白名单里，登录页需要它）：
 
 - **删除 `token_hint`**：原来会回 `vs_HYgS…u51c` 这种前 7 位 + 后 4 位片段。Token 是唯一凭据，
@@ -1552,9 +1552,9 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 </details>
 
 <details>
-<summary><b>v1.6.0</b> — P0-1 全量同步丢页</summary>
+<summary><b>v1.6.0</b> — 三处静默丢数据修复与断电恢复</summary>
 
-##### v1.6.0
+### v1.6.0
 修复三个「静默丢数据」的同步缺陷（复盘报告 `docs/REVIEW_2026-11-03.md`），围绕断电/重启恢复补齐冗余：
 
 - **P0-1 全量同步丢页**：批内单页失败时旧代码用 `max(成功页)` 存断点 → 跳过失败页且清断点标记完成。
@@ -1575,9 +1575,9 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 </details>
 
 <details>
-<summary><b>v1.5.2</b> — 30</summary>
+<summary><b>v1.5.2</b> — 分页默认值 20→30</summary>
 
-##### v1.5.2
+### v1.5.2
 - 分页：`API_PAGE_SIZE_DEFAULT` 默认由 20 调到 **30**（三列宫格 10 行 × 3 列，每页正好整行）
 - 修复：`/api/v1/search` 的 `page_size` 之前写死 `20 / 100`，不跟随配置；现在与列表接口一致读 `API_PAGE_SIZE_DEFAULT` / `API_PAGE_SIZE_MAX`
 - 新增 `scripts/test_v151_paging.py`（14 项：默认值、显式值、最后一页不足整页、越界 422、search 与 MacCMS 兼容接口一致性）
@@ -1587,9 +1587,9 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 </details>
 
 <details>
-<summary><b>v1.5.1</b> — `docs/APP_TOKEN_UPGRADE.md`</summary>
+<summary><b>v1.5.1</b> — /source 鉴权修复与 Token 施工单</summary>
 
-##### v1.5.1
+### v1.5.1
 - 修复：`/source`（源站清单 JSON）不带 `/api/` 前缀，此前只带 Token 的客户端会被拦成
   `401 请先登录管理面板`，现在与其它接口一致认 Token
 - 新增 **`docs/APP_TOKEN_UPGRADE.md`** —— 交给 AI 给 App 加 Token 的施工单（含各平台拦截器代码、401 处理策略、自测清单）
@@ -1601,7 +1601,7 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 <details>
 <summary><b>v1.5.0</b> — 访问控制</summary>
 
-##### v1.5.0
+### v1.5.0
 - 新增**访问控制**：面板密码登录 + API Token，防止接口被公网滥用
   - `settings` 表（key/value，启动自动建）：`auth_enabled` / `admin_password_hash` / `api_token` / `session_secret`
   - 面板登录：默认密码 `666666`，PBKDF2-SHA256（20 万轮 + 随机盐），HttpOnly 签名会话 cookie（默认 7 天）
@@ -1620,7 +1620,7 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 <details>
 <summary><b>v1.4.2</b> — 切库不需要重新同步</summary>
 
-##### v1.4.2
+### v1.4.2
 - 新增 `scripts/migrate_sqlite_to_pg.py`：SQLite → PostgreSQL 数据迁移，**切库不需要重新同步**
   - 迁移 `sources` / `sync_logs` / 全部 `vod_*` 表，保留 `watermark`（增量水位线）与 `last_page`（全量断点），迁完直接续增量
   - 幂等（重复执行按主键跳过）、每批一个事务（中断可续跑）、PG 下自动对齐 SERIAL 序列
@@ -1634,7 +1634,7 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 <details>
 <summary><b>v1.4.1</b> — 并发同步过多导致数据库连接池耗尽，整个服务「假死」</summary>
 
-##### v1.4.1
+### v1.4.1
 - 修复：**并发同步过多导致数据库连接池耗尽，整个服务「假死」**（NAS 上表现为容器不健康 / 面板全 500）
   - 根因链：面板连点十几个「全量」→ 每个请求各起一个线程、无任何上限 → SQLite 只允许一个写者，十几个写线程互相等写锁 → 等锁期间线程仍占着连接池连接（默认 5+10）→ 池满后连 `/healthz` 都 30s 超时 → Docker 判容器不健康
   - **全局并发闸门**：`sync_source` 内加信号量，无论谁触发（面板 / 定时 / 续跑 / 批量），同时真正在跑的源站不超过 `SOURCE_SYNC_CONCURRENCY`（默认 2），其余排队且**不占数据库连接**；`/stats.sync_load`、`/sources[].queued` 可看排队情况，面板显示「排队中」
@@ -1653,7 +1653,7 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 <details>
 <summary><b>v1.4.0</b> — 中转代理降级通道</summary>
 
-##### v1.4.0
+### v1.4.0
 - 新增**中转代理降级通道**：源站直连不可达/被风控时，自动按顺序切到 API 中转代理拉取数据
   - 请求格式 `{proxy}?url=<urlencode(目标地址)>`，默认内置 `https://pz.v88.qzz.io/`、`https://mconfig.viptv.work/`，可用 `PROXY_URLS` 覆盖
   - 路由策略：直连优先 → 失败自动切代理；连接失败/超时/403/429/451 立即切换（不做无意义重试），5xx 与 JSON 解析失败在当前路由重试后再切换
@@ -1671,7 +1671,7 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 <details>
 <summary><b>v1.3.0</b> — 按源站的自动同步开关</summary>
 
-##### v1.3.0
+### v1.3.0
 - 新增**按源站的自动同步开关**（全局定时调度保留不变：每 6 小时全站增量、每 12 小时刷新源站列表）：
   - `sources` 表新增 `auto_sync` 列（默认 1=参与），启动自动迁移旧库，状态持久化重启不丢
   - 关闭后该源站**不参与**定时增量任务与全站同步（`sync-all` / 定时 / 增量续跑），手动单站同步不受影响
@@ -1685,7 +1685,7 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 <details>
 <summary><b>v1.2.3</b> — 发布 GitHub 与双架构 CI 镜像</summary>
 
-##### v1.2.3
+### v1.2.3
 - 项目已发布到 GitHub：https://github.com/consoleaiden/vodsync
 - GitHub Actions 首次构建成功（amd64 + arm64 双架构），镜像公开可拉取：`ghcr.io/consoleaiden/vodsync:latest`、`ghcr.io/consoleaiden/vodsync:1.2.2`
 - `docker-compose.yml` 与群晖部署文档的镜像地址已替换为实际发布地址
@@ -1695,7 +1695,7 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 <details>
 <summary><b>v1.2.2</b> — 未同步的源站</summary>
 
-##### v1.2.2
+### v1.2.2
 - 修复：源站列表的「暂停」按钮在**未同步的源站**上也显示（误把"有断点未跑完"当成"正在跑"）
 - 新增运行时状态 `syncer._running`：`sync_source` 进入即登记、结束即注销，`/api/v1/sources` 与详情返回 `running` / `running_mode` / `running_seconds`
 - 面板交互改为按运行态渲染：**只有 `running=true` 才显示「暂停」**；已暂停显示「继续」；空闲站不显示这两个按钮
@@ -1709,7 +1709,7 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 <details>
 <summary><b>v1.2.1</b> — 单源站级暂停/继续</summary>
 
-##### v1.2.1
+### v1.2.1
 - 新增**单源站级暂停/继续**：源站列表每行增加「暂停 / 继续」按钮，暂停中的站显示橙色「本站暂停」徽标
 - 新增 API `POST /api/v1/sources/{slug}/pause` 与 `POST /api/v1/sources/{slug}/resume`；`/api/v1/sources`、`/api/v1/sources/{slug}` 返回 `paused` / `paused_at`
 - 判定顺序：全局/分层暂停 → 单源站暂停，任一命中即停；单源站暂停不影响其他源站，`sync-all` 与定时任务自动跳过被暂停的站
@@ -1721,7 +1721,7 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 <details>
 <summary><b>v1.2.0</b> — 同步暂停/继续</summary>
 
-##### v1.2.0
+### v1.2.0
 - 新增**同步暂停/继续**，三层级独立控制：全局（全量+增量+定时任务一起停）、仅全量、仅增量
 - 暂停语义为**检查点式优雅停止**：当前抓取批次完成后保存断点再停，不丢数据；继续时自动从断点续传（增量则水位线不动、重跑增量）
 - 暂停状态持久化到 `data/pause_state.json`，服务重启后仍生效；启动时自动恢复
@@ -1733,9 +1733,9 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 </details>
 
 <details>
-<summary><b>v1.1.3</b> — docs/CLIENT_API.md</summary>
+<summary><b>v1.1.3</b> — 客户端对接：分类清单与 CORS</summary>
 
-##### v1.1.3
+### v1.1.3
 - 面向客户端 App 对接的整理：
   - 新增 `GET /api/v1/categories`：分类清单（type_id/type_name/count，支持多源合并），分类浏览入口
   - `/api/v1/videos` 新增 `type_id` 参数（可与 `ac=detail`、`wd` 组合）
@@ -1747,7 +1747,7 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 <details>
 <summary><b>v1.1.2</b> — 批量详情与 ac=detail 列表带播放地址</summary>
 
-##### v1.1.2
+### v1.1.2
 - `/api/v1/videos` 增强：新增 `ids=1,2,3`（批量取详情，按请求顺序返回，含播放地址）与 `ac=detail`（列表带播放地址）
 - 查询参数归一化：兼容 `&?ac=detail` 这类多打问号的写法（原会被静默忽略）
 - 详情字段统一：列表/详情/兼容接口共用 `_detail_item()`，补齐 `vod_play_from`
@@ -1758,7 +1758,7 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 <details>
 <summary><b>v1.1.1</b> — 新增 /source 资源站 API 清单</summary>
 
-##### v1.1.1
+### v1.1.1
 - 新增 `GET /source`：资源站 API 清单（上游 `api` 地址 + 本地 `local_api`/`local_list_api` + 已入库条数），支持 `?status=ok|down`、`?only_ready=true` 过滤
 - 管理面板新增「资源站 API」按钮，一键查看清单
 - 断点保存时同步更新 `last_sync_at`，面板与 `/source` 的"最后同步时间"不再为空
@@ -1768,7 +1768,7 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 <details>
 <summary><b>v1.1.0</b> — Web 管理面板</summary>
 
-##### v1.1.0
+### v1.1.0
 - 新增 **Web 管理面板**（`/`）：概览统计、全量同步进度条、单站/全站手动触发、条数校准、源站日志、跨源搜索
 - 新增 **聚合搜索接口** `GET /api/v1/search`：线程池并行查询各源站表 + 内存归并分页，单源失败隔离，LIKE 通配符转义
 - 新增 `GET /api/v1/stats`（面板概览）、`POST /api/v1/maintenance/recount`（条数校准）
@@ -1781,7 +1781,7 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 <details>
 <summary><b>v1.0.0</b> — 首个版本：源站发现、断点续传、增量同步、双接口风格</summary>
 
-##### v1.0.0
+### v1.0.0
 - 首个版本：源站发现、全量断点续传、增量水位线同步、每源站一表、REST + MacCMS 兼容 API、CI 多架构镜像、群晖部署文档
 
 </details>
