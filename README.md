@@ -57,7 +57,22 @@
   行为与 v1.15.1 完全一致。详见 [CLIENT_API 1.6](docs/CLIENT_API.md) 与
   [API_SPEC 4.28](docs/API_SPEC_FOR_AI.md)
 
-> 文档入口：[`docs/README.md`](docs/README.md)（按用途索引全部文档）
+## 核心功能模块
+
+按职责划分为 8 组。每组列出**入口文件**、**解决什么问题**、**首次引入版本**与**当前状态**，便于按功能定位代码与变更记录。
+
+| 模块组 | 入口文件 | 职责 | 引入版本 / 状态 |
+|---|---|---|---|
+| ① 源站发现与同步 | `maccms.py` / `syncer.py` / `scheduler.py` | 拉取 latest.json 自动发现源站、全量断点续传、增量水位线、重启恢复、健康度退避、定时调度 | v1.0.0 起，v1.6.0 恢复、v1.8.1 退避、v1.16.5 计划任务面板 |
+| ② 存储与迁移 | `database.py` / `models.py` / `housekeeping.py` | PostgreSQL 引擎、动态 `vod_{slug}` 分表、自动迁移补列、日志清理与 WAL 回收、明细数据保留 | v1.0.0 起，v1.7.0 固定 PG、v1.18.0 保留策略 |
+| ③ 多源查询与播放 | `multiquery.py` / `playline.py` / `routes/api.py` | 每源站 top-K + 进程内归并、跨源聚合搜索、播放线路识别/过滤/排序、批量详情 | v1.7.0 起，v1.11.0 线路过滤 |
+| ④ 鉴权与权限 | `auth.py` / `apiresp.py` / `caps.py` / `minor_mode.py` | 面板密码/会话、API Token（read/admin 两档）、统一错误码、能力清单、18+ 未成年模式 | v1.5.0 起，v1.14.0 分档、v1.15.0 未成年模式 |
+| ⑤ 推荐与标签 | `related.py` / `star_tags.py` / `tags.py` | 相关推荐预计算、明星词库与倒排映射、`?tag=` 精确检索、按明星查作品 | v1.9.0 起，v1.10.0 算法 v2、v1.16.2/v1.16.6 回填与口径修正 |
+| ⑥ 管理与运维面板 | `web/index.html` / `panel.py` / `tablebrowse.py` | 单文件 Web 面板：同步/源站/数据表浏览/词库/计划任务/代理/去广告运营，折叠懒加载与合并轮询 | v1.1.0 起，v1.16.4/v1.16.5 性能优化、v1.18.x 运营升级 |
+| ⑦ 智能去广告 | `adfilter.py` / `adfilter_fp.py` / `audit.py` | 规则包控制面（下发/回滚/校验）、结构指纹库、上报统计、运营审计与事件流 | v1.16.0 起，v1.17.0 指纹库、v1.18.0~v1.19.0 运营管理 |
+| ⑧ 终端适配 | `tvbox.py` | 输出 TVBox 兼容配置（sites/lives/spider），Token 透传与跨域响应 | v1.20.0，只读新增 |
+
+> 各模块的字段级契约见 [`docs/API_SPEC_FOR_AI.md`](docs/API_SPEC_FOR_AI.md)；文档入口见 [`docs/README.md`](docs/README.md)。
 
 ## 技术选型说明
 
@@ -547,19 +562,33 @@ curl -s http://127.0.0.1:8181/healthz
 ```
 vodsync/
 ├── app/
-│   ├── main.py          # 应用入口（启动初始化 + 调度器 + 鉴权中间件）
+│   ├── main.py          # 应用入口（启动初始化 + 调度器 + 鉴权中间件 + CORS）
 │   ├── config.py        # 全部配置项（环境变量）
-│   ├── database.py      # 引擎与连接池（生产 PG；SQLite 仅测试）
-│   ├── models.py        # sources / sync_logs / settings / 动态 vod_{slug} 表
+│   ├── database.py      # 引擎与连接池（生产 PG；SQLite 仅测试）+ 自动迁移补列
+│   ├── models.py        # sources / sync_logs / settings / 去广告 / 审计 / 动态 vod_{slug} 表
 │   ├── maccms.py        # 苹果 CMS 接口客户端（重试/限速/代理降级）
 │   ├── syncer.py        # 同步引擎（全量断点续传 + 增量水位线 + 重启恢复）
 │   ├── multiquery.py    # 多源列表查询（每表 top-K + 进程内归并）
-│   ├── housekeeping.py  # 数据维护（sync_logs 清理 / WAL checkpoint）
-│   ├── auth.py          # 访问控制（面板密码 / 会话 / API Token）
+│   ├── playline.py      # 播放线路识别 / 过滤 / 排序（v1.11.0）
+│   ├── proxyconf.py     # 中转代理配置单一读写入口（v1.16.7）
+│   ├── housekeeping.py  # 数据维护（sync_logs 清理 / WAL / 明细保留策略）
+│   ├── auth.py          # 访问控制（面板密码 / 会话 / API Token 分档）
+│   ├── apiresp.py       # 统一错误码（40001/40101/40301/40401）
+│   ├── caps.py          # 能力清单（capabilities）
+│   ├── minor_mode.py    # 18+ 源站标记与未成年模式屏蔽（v1.15.0）
 │   ├── pause.py         # 暂停状态持久化（原子写）
-│   ├── scheduler.py     # APScheduler 定时任务
-│   ├── utils.py         # 播放地址解析 / 分页参数
-│   ├── routes/api.py    # 全部 API 路由（含 /search 聚合搜索、/stats 统计）
+│   ├── panel.py         # 面板只读快照缓存 + 屏蔽名单（v1.16.4）
+│   ├── tablebrowse.py   # 数据表浏览白名单与查询
+│   ├── related.py       # 相关推荐预计算与查询（v1.9.0）
+│   ├── star_tags.py     # 明星词库与 star_map 倒排映射（v1.9.1/v1.16.2）
+│   ├── tags.py          # 标签倒排索引与 ?tag= 精确检索（v1.14.0）
+│   ├── adfilter.py      # 去广告规则包控制面（下发/回滚/校验，v1.16.0）
+│   ├── adfilter_fp.py   # 广告结构指纹库（聚类/审核/反馈/运营，v1.17.0）
+│   ├── audit.py         # 运营审计与事件流（v1.18.0/v1.19.0）
+│   ├── tvbox.py         # TVBox 兼容配置输出（v1.20.0）
+│   ├── scheduler.py     # APScheduler 定时任务与管理接口
+│   ├── utils.py         # 播放地址解析 / 分页参数 / slug 校验
+│   ├── routes/api.py    # 全部 API 路由（含 /search、/stats、管理端）
 │   └── web/             # 管理面板 index.html + 登录页 login.html（单文件内联，无需构建）
 ├── .github/workflows/docker-image.yml   # CI：多架构镜像构建推送
 ├── Dockerfile / docker-compose.yml      # compose 内含必备的 postgres 服务
@@ -586,28 +615,69 @@ vodsync/
 ## 变更记录
 
 > 按版本号**从新到旧**排列，最新版本在最前。历史版本只做归档记录，细节以对应版本的代码与文档为准。
+>
+> **条目结构约定**：v1.15.0 起的版本统一按四段组织——**新增功能**（本次能用什么）、
+> **变更说明**（内部怎么改的）、**影响范围**（谁会受影响、客户端是否需要改动）、
+> **注意事项**（兼容性、迁移动作、运维约束）。更早版本保留当时的原始记录，不改写法。
+> 类型标记：`新增`＝引入新能力、`优化`＝改进既有实现、`修复`＝纠正缺陷、`兼容`＝协议/数据结构变化需关注。
+>
+> **折叠约定**：仅**最新版本**默认展开；历史版本收进可折叠区块，点击标题行（`▸`）展开任意版本。
+> 需要按版本定位时，先用下方「版本演进速览」表找到目标版本，再展开对应区块。
+
+### 版本演进速览
+
+按时间正序（旧→新）一眼看清每个版本的主题与类型。**详细内容见下方逐版记录**。
+
+| 版本 | 主题 | 类型 | 兼容性 / 客户端影响 |
+|---|---|---|---|
+| v1.0.0 | 源站发现、断点续传、增量同步、双接口风格、CI 与群晖部署文档 | 新增 | 首个版本 |
+| v1.1.0~v1.1.3 | Web 管理面板、`/source` 清单、批量详情、App 对接整理 | 新增 | 纯新增接口 |
+| v1.2.0~v1.2.3 | 同步暂停/继续（三层级）、单站暂停、发布 GitHub | 新增 / 修复 | 纯新增 |
+| v1.3.0 | 按源站自动同步开关 | 新增 | 默认开，行为不变 |
+| v1.4.0~v1.4.2 | 中转代理降级、连接池耗尽修复、SQLite→PG 迁移脚本 | 新增 / 修复 | 修「假死」，切库免重同步 |
+| v1.5.0~v1.5.2 | 访问控制（密码 + Token）、`/source` 鉴权修复、分页默认 20→30 | 新增 / 修复 / **兼容** | **分页默认值变化** |
+| v1.6.0~v1.6.1 | 三处静默丢数据修复、断电恢复、`auth/state` 信息收紧 | 修复 | 恢复逻辑增强 |
+| v1.7.0 | 多源查询重写、数据维护、源站身份修复、**固定 PostgreSQL** | 优化 / **兼容** | **不再支持 SQLite 生产** |
+| v1.8.0~v1.8.1 | 自定义源站、健康度退避 | 新增 / 优化 | 存量源不受影响 |
+| v1.9.0~v1.9.3 | 相关推荐预计算、明星词库/作品、镜像版本化与探针 | 新增 / 优化 | 能力递增 |
+| v1.10.0~v1.10.1 | 推荐算法 v2、详情透出演职员/标签 | 优化 / 新增 | 纳秒级字段透出，无破坏 |
+| v1.11.0 | 播放线路识别/过滤/排序 | 新增 / **兼容** | **`vod_play_list` 线路变化**，`?play_raw=1` 排障 |
+| v1.12.0~v1.12.2 | 数据表浏览（只读）、显示源站名、查询空数据修复 | 新增 / 修复 | 纯管理面 |
+| v1.13.0 | 面板布局调整（明星词库独立区块、全屏自适应） | 优化 | 纯前端 |
+| v1.14.0~v1.14.1 | 能力清单、统一错误码、Token read/admin 分档、`?tag=` 精确检索、进度>100% 修复 | 新增 / **兼容** / 修复 | **错误码改为非 2xx + code**；能力门控 |
+| v1.15.0~v1.15.1 | 18+ 标记与未成年模式、面板批量标记 | 新增 | 不传开关行为完全不变 |
+| v1.16.0~v1.16.3 | 去广告控制面、按站点统计、标题词库回填、阈值登记与举报隔离 | 新增 / 优化 / 修复 | 能力门控，App 零改动 |
+| v1.16.4~v1.16.7 | 面板性能与批量管理、计划任务/slug 收敛、倒排行数口径、代理配置面板化 | 优化 / 修复 / 新增 | 屏蔽不改客户端可见集合 |
+| v1.17.0~v1.17.5 | 广告指纹库 Phase 2、桶字段阻断修复、面板失效修复、门槛 3→1、页脚、物理删除 | 新增 / 修复 / **兼容** | **门槛默认值变化**；上报新增可选字段 |
+| v1.18.0~v1.18.1 | 运营管理升级（locked/复位/人工补录/审计/异步重算/批量）、面板展示修复 | 新增 / 优化 / 修复 | 规则包与客户端协议不变 |
+| v1.19.0 | 运营管理未实现项补齐（事件流/reason/批量删除/diff/漏判样本等） | 新增 / 优化 | reason 需前端协同；兼容开关默认开 |
+| v1.20.0 | TVBox 兼容配置接口 | 新增 | 纯只读新增，CORS + Token 透传 |
 
 ### v1.20.0
 **TVBox 兼容配置接口**（`app/tvbox.py` 新模块；纯只读新增，不影响既有 API）：
 
-- `GET /api/v1/tvbox/config` 与别名 `GET /tvbox.json`：把源站清单转成 TVBox 兼容
+- **新增功能**：`GET /api/v1/tvbox/config` 与别名 `GET /tvbox.json`：把源站清单转成 TVBox 兼容
   JSON —— 每个可用源站一个 `type=1`（苹果 CMS JSON）站点，`api` 指向本服务
-  `/api/v1/{slug}` MacCMS 兼容接口（分类/分页/搜索/详情直接可用）
-- 站点准入：`enabled=1` 且 `status=ok` 且入库视频数 ≥ `TVBOX_MIN_VIDEOS`（默认 1）；
-  未成年模式（`X-Minor-Mode: 1`）下 18+ 源站照常剔除；`?slugs=a,b` 可输出子集
-- 鉴权部署：配置 URL 带 `?token=<Token>` 即可（Token 支持 query 参数）；生成的
-  `sites[].api` 自动内嵌同一枚 Token，TVBox 内拉取分类/详情/搜索免配置；
-  `AUTH_ENABLED=false` 的开放部署不带任何凭据
-- `api` 前缀自动推导：`TVBOX_BASE_URL` 环境变量 > `X-Forwarded-Proto/Host` 反代头
-  > 请求 host；反代场景建议显式配置
-- 可选字段：`TVBOX_SPIDER`（嗅探 jar）、`TVBOX_WALLPAPER`（壁纸）、
-  `TVBOX_LIVE_URL`（TXT 直播源，下发 `lives`）、`TVBOX_QUICK_SEARCH`（默认开，
-  `?quick_search=0` 可按请求临时关闭）
-- 跨域：全局 CORS 中间件覆盖（`Access-Control-Allow-Origin: *`，可用
-  `CORS_ORIGINS` 环境变量收紧），浏览器网页调试可直接取配置
-- TVBox 使用：配置地址填 `http://<host>:<port>/api/v1/tvbox/config?token=<Token>`
+  `/api/v1/{slug}` MacCMS 兼容接口（分类/分页/搜索/详情直接可用）；可选下发
+  `lives` / `spider` / `wallpaper`。`?slugs=a,b` 可输出子集，`?quick_search=0` 关快速搜索。
+- **变更说明**：站点 api 前缀自动推导（`TVBOX_BASE_URL` > `X-Forwarded-Proto/Host` 反代头
+  > 请求 host）；`app/auth.py` 把 `/tvbox.json` 加入 `API_PATHS`（非 `/api/` 前缀但需按 Token 鉴权）；
+  路由注册在 `/api/v1/{slug}` 通配之前，避免路径被吞。
+- **影响范围**：纯只读新增，既有 API 与数据模型零改动；站点准入 `enabled=1` 且 `status=ok`
+  且入库数 ≥ `TVBOX_MIN_VIDEOS`（默认 1），未成年模式（`X-Minor-Mode: 1`）下 18+ 源站照常剔除。
+  **App 客户端零改动**，本功能面向 TVBox 新终端。
+- **注意事项**：TVBox 无法带 Authorization 头，配置 URL 填 `http://<host>:<port>/api/v1/tvbox/config?token=<Token>`，
+  生成的 `sites[].api` 自动内嵌同一枚 Token（请求自带优先，否则回退存量单 Token），
+  `AUTH_ENABLED=false` 的开放部署不带凭据；**站点 api 地址随取配置的请求 host 自动生成**，
+  反代场景须转发 `X-Forwarded-*` 或显式设 `TVBOX_BASE_URL`。可选环境变量：
+  `TVBOX_SPIDER` / `TVBOX_WALLPAPER` / `TVBOX_LIVE_URL` / `TVBOX_QUICK_SEARCH`。
+  跨域由全局 CORS 中间件覆盖（`Access-Control-Allow-Origin: *`，`CORS_ORIGINS` 可收紧）。
+  测试 `scripts/test_v1200_tvbox.py`（39 项）。
 
-### v1.19.0
+<details>
+<summary><b>v1.19.0</b> — 运营管理升级「未实现/半实现项」全部补齐</summary>
+
+##### v1.19.0
 **运营管理升级「未实现/半实现项」全部补齐**（对照 `ADFILTER_ADMIN_OPS_UPGRADE` 需求文档逐条核查后补齐；规则包/客户端协议结构不变）：
 
 - **§4.3 事件流闭环**：`rebuild` 逐条写 `promoted/demoted`、`feedback` 写 `auto_disabled/feedback_still_ads`、
@@ -634,7 +704,12 @@ vodsync/
   按当前桶宽重算 fp_hash 并重建聚合；发布侧桶宽漂移仍拒绝（面板不提供按钮，符合文档要求）。
 - 测试：新增 `test_v1190_completion.py`（后端全项 + 前端 DOM 完整性守护，全部通过）。
 
-### v1.18.1
+</details>
+
+<details>
+<summary><b>v1.18.1</b> — 运营面板展示修复</summary>
+
+##### v1.18.1
 **运营面板展示修复**（v1.18.0 上线后截图验收发现的两处展示问题，纯前端，后端接口/数据模型不变）：
 
 - **指纹状态列不再把 `title="…"` 当文本显示**：`fpStatusBadge()` 原先拼在 `<span class="badge">…</span>`
@@ -648,7 +723,12 @@ vodsync/
   操作者数字身份映射为「主 Token / 管理面板 / API_KEY / Token #N」等可读名称。
 - 测试：新增 `test_v1181_panel_display.py`（静态检查 + Node 模拟执行渲染函数，22 项全过）。
 
-### v1.18.0
+</details>
+
+<details>
+<summary><b>v1.18.0</b> — 广告过滤运营管理升级</summary>
+
+##### v1.18.0
 **广告过滤运营管理升级**（据前端分析需求文档，P0/P1/P2 后端项；规则包与客户端协议不变、客户端零改动）：
 
 **P0 — 打通运营闭环**
@@ -680,7 +760,12 @@ vodsync/
 数据模型：加列全部走 `database._migrate()` 存量兼容（SQLite/PG 双支持），老库升级自动补列补索引。
 测试：新增 `test_v1180_ops_upgrade.py`（全验收点），**12 套回归全绿** + compileall，openapi 81 paths。
 
-### v1.17.5
+</details>
+
+<details>
+<summary><b>v1.17.5</b> — 广告指纹库支持物理删除</summary>
+
+##### v1.17.5
 **广告指纹库支持物理删除**：
 
 - 指纹库操作列新增「删除」按钮（红色，带不可恢复二次确认），可彻底清除测试残留 / 误上报的指纹。
@@ -693,7 +778,12 @@ vodsync/
 - 测试：新增 `test_v1175_delete.py`（21 项），重点验证两表同删、`rebuild()` 后不复活、
   不误删其它指纹、downloadable 同步移除、异常路径与路由注册。11 套回归全绿 + compileall。
 
-### v1.17.4
+</details>
+
+<details>
+<summary><b>v1.17.4</b> — 管理面板页脚：镜像版本 + 项目地址</summary>
+
+##### v1.17.4
 **管理面板页脚：镜像版本 + 项目地址**：
 
 - 面板底部新增页脚，左侧显示**当前镜像版本**（`vX.Y.Z`），右侧是 **GitHub 项目地址**链接
@@ -704,7 +794,12 @@ vodsync/
 - 测试：新增 `test_v1174_footer.py`（16 项），含模拟 DOM 真实执行版本函数，覆盖正常渲染 /
   fetch 抛错 / 非 200 三场景；10 套回归全绿。
 
-### v1.17.3
+</details>
+
+<details>
+<summary><b>v1.17.3</b> — 广告指纹库用户数门槛放宽（适配单用户场景）</summary>
+
+##### v1.17.3
 **广告指纹库用户数门槛放宽（适配单用户场景）**：
 
 - **门槛调整**：`ADFILTER_FP_MIN_USERS` 默认值 `3 → 1`。用户实际只有 1 个 `user_id`，
@@ -719,7 +814,12 @@ vodsync/
 - **运维动作**：升级后存量 `candidate` 指纹需重跑一次重算（面板「↻ 重算聚合」或等定时任务）
   才会按新门槛重新晋升；线上升级时已执行
 
-### v1.17.2
+</details>
+
+<details>
+<summary><b>v1.17.2</b> — 管理面板整体失效修复</summary>
+
+##### v1.17.2
 **管理面板整体失效修复**（据线上反馈：能登录、面板能显示，但功能块展开不了、数据不加载）：
 
 - **根因**：v1.17.0 新增指纹库时，面板顶层 JS 把「刷新」按钮写成 `$("#fpReload")`，
@@ -733,7 +833,12 @@ vodsync/
 - 注：`test_v1164_panel.py` 早有同类 H2 断言，但 CI workflow 只做 docker build/push、
   从不跑测试，故 v1.17.1 未拦截。本次照旧本地全量回归（8 套全绿）+ compileall 通过
 
-### v1.17.1
+</details>
+
+<details>
+<summary><b>v1.17.1</b> — 指纹库阻断性修复 + 上报响应补全</summary>
+
+##### v1.17.1
 **指纹库阻断性修复 + 上报响应补全**（前端已升级，据线上联调反馈修复）：
 
 - **修复指纹永不匹配的阻断性 bug**：`adfilter_fp.rebuild()` 此前写 `pattern_json` 时只有
@@ -748,7 +853,12 @@ vodsync/
   把存量指纹的桶字段补齐后重新发布规则包才生效
 - 测试：`test_v1170_fingerprint.py` 新增桶字段下发/存量修复断言（现 60 项全过），全量回归绿
 
-### v1.17.0
+</details>
+
+<details>
+<summary><b>v1.17.0</b> — 广告指纹库（Phase 2）</summary>
+
+##### v1.17.0
 **广告指纹库（Phase 2）**：把「哪些片段是广告」从客户端本地启发式升级为跨用户共享知识，服务端完成全链路落地。
 
 - **数据模型**：新增 `adfilter_segments`（逐段特征明细，去重键 `(user,url_hash,at,seg_index)`）
@@ -767,7 +877,12 @@ vodsync/
 - 测试：`scripts/test_v1170_fingerprint.py`（42 项全过：落库/幂等/聚类/置信度/状态机/下发/反馈/兼容），
   既有 5 套回归测试全绿
 
-### v1.16.7
+</details>
+
+<details>
+<summary><b>v1.16.7</b> — 中转代理配置从 docker 环境变量搬到管理面板</summary>
+
+##### v1.16.7
 **中转代理配置从 docker 环境变量搬到管理面板**：改代理地址 / 并发 / 记忆时长不再需要重启容器。
 
 - 新增 `app/proxyconf.py`：代理配置的单一读写入口，持久化在 `settings` 表（key `panel_proxy_config`）
@@ -783,7 +898,129 @@ vodsync/
   （面板从未保存过时用），面板「恢复默认」即回到该值。老部署升级后行为不变，直到有人在面板里改
 - 测试：`scripts/test_v1167_proxy_panel.py`（27 项：env 回退、持久化、非法输入收敛、reset、信号量重建、关闭代理后路由只剩直连）
 
-### v1.14.1
+</details>
+
+<details>
+<summary><b>v1.16.6</b> — 标签索引「已写行」口径修正</summary>
+
+##### v1.16.6
+**标签索引「已写行」口径修正**（线上实测面板加总 581,614 vs 真实 `COUNT(video_tags)` 1,726,394，方案 A）：
+
+- **新增功能**：`GET /api/v1/tag/status` 新增 `refresh` 查询参数（强刷跳过缓存）；面板「倒排行数」列替换原「已写行」列，新增「↻ 实时行数」按钮与快照年龄提示。
+- **变更说明**：`app/tags.py` 新增 `_row_counts()`（一次 `GROUP BY source` 走 `(source, vod_id, tag_norm)` 主键 index-only scan，同时给出总数与逐站行数）与 `row_counts()`（`panel.cached("tag.rows", 120)` 进程内快照）；`status()` 逐站新增 `rows`（实时真值）与顶层 `cache_age_s`，`indexed` 保留但**仅作回填进度参考**，不再代表真实倒排行数。
+- **影响范围**：仅改管理面板展示口径与只读接口返回字段，**不改动任何数据**；后端 `tags.index_rows()` 的写库行为不变。
+- **注意事项**：原 `indexed` 只有「重建索引」会写，明星 Tag 夜间重建直接写 `video_tags` 不回写它——这是口径偏差的根因，排障时应以 `rows` 为准；`panel.cached` 的 age 用 `int()` 取整，同秒二次调用得到 `age=0` 属正常。测试 `scripts/test_v1166_tag_rows.py`；已部署（`/healthz`=1.16.6）。
+
+</details>
+
+<details>
+<summary><b>v1.16.5</b> — 计划任务管理面板 + 源站 slug 安全收敛 + 标签索引显示源站名</summary>
+
+##### v1.16.5
+**计划任务管理面板 + 源站 slug 安全收敛 + 标签索引显示源站名**：
+
+- **新增功能**：`app/scheduler.py` 新增 `list_jobs/pause_job/resume_job/trigger_job/reschedule_job` 与中文任务名，配 `GET|POST /api/v1/admin/scheduler` 系列接口；面板新增「计划任务」区块（状态/暂停/恢复/立即执行/改周期）。
+- **变更说明**：`app/syncer.py` 新增 `_clean_slug_chars`/`_sanitize_slug`，登记自定义源站时强制收敛 slug 为安全标识（杜绝 URL 形状 slug 破坏路径型 API），占用仍返回 409；新增启动自检 `migrate_unsafe_slugs()`，幂等迁移 sources + 6 张引用表 + `vod_{slug}` 表名。`app/tags.py` 的 `status()` 各站条目 join `sources` 补 `name`，面板标签索引列表改显示源站名（slug 降为次级）。
+- **影响范围**：非法 slug 的存量部署**启动时会自动改名**（涉及表名与外键引用），属本次唯一有数据动作的一项；其余为纯面板与只读接口增强。
+- **注意事项**：APScheduler 3.11.3 无 `trigger_job`（4.x 才有 API），实现改为后台线程执行 `job.func`；源站编辑页此前因 slug 含 URL 字符 404 的问题随 slug 收敛自动修复。测试 `test_v1165_migrate.py` / `test_v1165_scheduler.py`。
+
+</details>
+
+<details>
+<summary><b>v1.16.4</b> — 管理面板性能与批量管理</summary>
+
+##### v1.16.4
+**管理面板性能与批量管理**（实测归因：逐站 `COUNT(*)` 扫 12GB 大表是主因，占 96%+，网络仅 1~2%）：
+
+- **新增功能**：`app/panel.py`（纯管理面）以 `settings` 表 key `panel_blocked_sources` 存屏蔽名单，并提供 `cached(key, ttl, producer, refresh)` 进程内快照 + per-key 锁合并并发；新接口 `GET /api/v1/admin/overview`（合并 stats/pause/sources/logs + blocks，失败自动降级回 4 个老接口）、`GET|POST /api/v1/admin/source-blocks`、`POST /api/v1/star-terms/batch`；`GET /api/v1/star-terms` 增加 `page/page_size(50~500)/q/ids_only`。
+- **变更说明**：缓存 TTL —— admin/tables 60s、star/tags/status 与 related/status 120s，均支持 `refresh=1`；前端词库改服务端分页、本页全选 + 跨页全选/反选（`ids_only=1`）、批量删除/启用/停用；源站行加「屏蔽」按钮与「显示已屏蔽」；5 秒轮询改打合并接口，源站表差量渲染短路。
+- **影响范围**：面板与只读/管理接口；**不改客户端可见源站集合**——屏蔽复用既有 `set_source_paused()`，不改 `enabled/auto_sync/is_adult`。
+- **注意事项**：取消屏蔽只清「因屏蔽而暂停」的位，**不触发自动同步**；测试 `scripts/test_v1164_panel.py`（96 项），本次未单独发版，随 v1.16.5 一并上线。
+
+</details>
+
+<details>
+<summary><b>v1.16.3</b> — 去广告阈值登记与用户举报样本隔离</summary>
+
+##### v1.16.3
+**去广告阈值登记与用户举报样本隔离**（v1.5.169 客户端算法升级配套）：
+
+- **新增功能**：`app/adfilter.py` 的 `_THRESHOLDS` 登记 `safety_floor_high_confidence`(0.4~1.0) 与 `duplicate_max_ratio`(0.3~0.9)，区间对齐客户端 `AdFilterRules.java` 的 clamp；`stats()` 新增 `miss_reports`（总数）与 `miss_hosts`（host + reports + last_at，按举报数降序，最多 limit 条）。
+- **变更说明**：hosts 聚合条件加 `removed_runs > 0`，排除 `0/0/0` 的用户手动举报样本（这类必然来自举报），避免稀释 `avg_removed_ratio`/`avg_removed_runs` 的过激判定；面板阈值提示/placeholder 与 `renderAdHosts` hint 同步展示漏判举报。
+- **影响范围**：**无数据库变更、无新增端点**（仍 58 paths / 65 methods），`default_rules()` 保持 3 项（新字段缺省＝客户端内置默认）；App 客户端零改动；全局 stats 字段一字未改。
+- **注意事项**：为隐私从严，`miss_hosts` **只给 host + 计数 + 时间，不给 url 原文**；本次只让面板可填新阈值，**未在线上发布带新阈值的规则包**（会改变全量客户端行为，属运营动作）。测试 `scripts/test_v1163_adfilter.py`（39 项，量化反例：5 条有效样本 + 20 条举报，修复前 avg 被稀释到 0.06/1.2 不判疑似，修复后保持 0.30/6.0）。
+
+</details>
+
+<details>
+<summary><b>v1.16.2</b> — 标题命中明星词库回填 `vod_tag`</summary>
+
+##### v1.16.2
+**标题命中明星词库回填 `vod_tag`**（修复乐播反例「香草少女」118 行无标签）：
+
+- **新增功能**：同步写时按标题单正则扫描全词库命中并合并进 `vod_tag`（性能与词库大小解耦）；`star_map` 倒排映射支撑同明星作品查询走索引毫秒返回；新表 `star_rebuild_state` 记录按站回填水位；`POST /api/v1/maintenance/star-tags?slug=` 触发单站后台重建。
+- **变更说明**：回写采用**合并式**——保留源站原生标签段，只替换「本服务上次写进去的推断段」（`STAR_TAG_MERGE_TAG` 默认 true），避免误删；新增 ASCII 短词过滤（`STAR_TAG_MIN_ASCII_LEN` 默认 3，过滤 er/ss/jk 噪声）。
+- **影响范围**：前端 App 零改动；openapi 两份快照、`app/__init__.py`、`docker-compose.yml` 注释的版本号需同步（两份 openapi 必须同时改，否则既有测试的一致性断言失败）。
+- **注意事项**：**单站重建耗时约 55 分钟且无断点续跑，重启会杀掉线程从头再扫**——发版前必须确认无进行中的全量重建。上线时对乐播 `s35192781f1` 执行回填：扫描 337,986 行 / 回填 95,817 行 / 映射 113,418 条，`vod_tag` 非空 383→96,117，「香草少女」118 行全部命中；回填前已备份全库 `pg_dump`（2.3G）与标签快照（11M）。测试 `scripts/test_v1162_title_tags.py`；方案见 [`docs/TITLE_TAG_BACKFILL_PLAN.md`](docs/TITLE_TAG_BACKFILL_PLAN.md)。
+
+</details>
+
+<details>
+<summary><b>v1.16.1</b> — 去广告按站点分布统计与误杀主动发现</summary>
+
+##### v1.16.1
+**去广告按站点分布统计与误杀主动发现**：
+
+- **新增功能**：`adfilter_reports` 新增 `host` 冗余列（写时从 url 归一解析，读侧一句 `GROUP BY host`，PG/SQLite 通用）；`GET /api/v1/adfilter/admin/stats` 新增 `hosts`（逐条删除占比均值/最大、平均删除段数、去重地址数）、`thresholds`（阈值随响应回显）与 `suspicious` 标记；面板可一键生成 `mode:"off"` 止血建议。
+- **变更说明**：自动迁移 `ALTER TABLE ... ADD COLUMN host`，`ensure_seed()` 启动分批回填（每轮 5000 行，`host=''`=待回填、`host='-'`=解析不出，回填放在「已有规则包就 return」**之前**）；逐条 ratio 用 `CAST(removed_ms AS FLOAT)/total_ms` 避免 BIGINT 整数除法得 0；新增 `min_reports=5` 护栏（一条脏上报就能把 ratio 冲 0.9）。判定严格 `>` 阈值，等于不标。
+- **影响范围**：stats 原有 7 个字段一字未改，`limit`/`min_reports` 缺省 0 = 服务端默认；**App 客户端零改动**——新字段只在需 admin Token 的 `admin/stats`，App 不调用；`host` 由服务端解析，客户端不要新增上报字段（未知字段会被忽略）。
+- **注意事项**：**绝不自动发布 `mode:"off"`**——阈值是启发式，误判会让该站对全量客户端停止过滤；面板按钮只把 `site_overrides` 追加到编辑框，仍需人工点发布。后续小修（仍为 1.16.1，仅日志文案：回填已达上限才提示「下次启动继续」）提交 `deecfd0` 为该版正式 tag。测试 `scripts/test_v1161_host_stats.py`（58 项）。
+
+</details>
+
+<details>
+<summary><b>v1.16.0</b> — 智能去广告控制面</summary>
+
+##### v1.16.0
+**智能去广告控制面**（需求源自客户端 Phase 1 端上过滤，后端只做控制面，**不代理任何播放流量、零带宽**）：
+
+- **新增功能**：`GET /api/v1/adfilter/rules` 下发规则包（阈值 / 高置信 URL 模式 / 站点级例外，不发版即可调参、可一键回滚）；`POST /api/v1/adfilter/report` 收命中明细（幂等去重 + 限流 + 逐条校验）；新表 `adfilter_rule_packs` / `adfilter_reports`；面板「去广告规则包」区块（编辑 JSON / 发布 / 回滚 / 看上报量）；`capabilities` 增 `adfilter` 能力位。
+- **变更说明**：规则包按 `(channel, version)` 唯一（stable/beta 各自发号），历史行永不修改，回滚＝新增一行（版本号单调）；上报去重键 `(user_id, url_hash, at)` 用 sha256（url 允许 2048 字符，直接进 PG btree 会超 2704 字节单条上限）；`user_id` 单租户下用凭据身份近似（0=存量 Token，>0=api_tokens.id，-1=API_KEY，-2=面板会话，-4=未鉴权）；越界规则服务端硬拒（客户端对越界包整体丢弃回退内置）；时长与 `at` 用 BIGINT（epoch 秒 2038 溢出）。
+- **影响范围**：能力门控——**仅当 `capabilities` 含 `adfilter` 时客户端才调用**，老客户端零请求、行为与 v1.15.1 完全一致；`/adfilter/rules` 从不 5xx（读不到包降级为内置默认 + version 0），控制面故障不影响播放；上报接口放行 read Token（`auth._READ_SCOPE_WRITES`），否则打开 `TOKEN_SCOPE_ENFORCE` 后 App 上报全 403。
+- **注意事项**：响应不带 `code` 包装（按契约）、带 `Cache-Control: no-store`；上线后已在真实 PG 实测「发布 beta v1→v2、回滚得 v3」验证 `_insert_next` 的 `INSERT..SELECT..RETURNING` 分支。测试 `scripts/test_v1160_adfilter.py`（76 项）。详见 [`CLIENT_API.md` 1.6](docs/CLIENT_API.md) 与 [`API_SPEC_FOR_AI.md` 4.28](docs/API_SPEC_FOR_AI.md)。
+
+</details>
+
+<details>
+<summary><b>v1.15.1</b> — 面板批量标记 18+ 与轮询不打断操作</summary>
+
+##### v1.15.1
+**面板批量标记 18+ 与轮询不打断操作**：
+
+- **新增功能**：`POST /api/v1/sources/adult?enabled=&slugs=all|a,b` 批量端点（一次 UPDATE，语义同单站：只动 `is_adult` + 清分类缓存）；面板工具栏「标记所选 18+ / 取消所选 18+」，标记方向二次确认。
+- **变更说明**：`loadSources(force=false)` 在焦点位于表格内 `select/input/textarea` 时跳过该轮重渲染（5 秒轮询的 `innerHTML` 重建会收起下拉、冲掉刚选的值）；显式操作一律 `loadSources(true)` 强制刷新。
+- **影响范围**：仅面板与源站标记接口；`sources` 下不存在 `POST /{slug}` 单段路由，故 `/sources/adult` 不会被通配吃掉；App 客户端零改动。
+- **注意事项**：批量端点任一 slug 不存在则**整批 404 拒绝**，不做部分成功；缺 `enabled` 参数实际返回 **400**（main.py 全局把 `RequestValidationError` 改成 400/40001+field，不是 422），相关文档 4 处口径已同步改正。当时线上 57 站中 56 站被用户手动标为 18+（本人确认，非 bug），未成年模式下仅 1 站可见——已提示整站屏蔽的粒度风险，未擅自改动。
+
+</details>
+
+<details>
+<summary><b>v1.15.0</b> — 源站 18+ 标记与未成年模式</summary>
+
+##### v1.15.0
+**源站 18+ 标记与未成年模式**：
+
+- **新增功能**：`sources.is_adult INTEGER DEFAULT 0`（存量站默认「否」，`_migrate()` 自动补列，`refresh_sources()`/`update_custom_source()` 都不写这列）；源站清单下发 `is_adult`；请求级无状态开关 `X-Minor-Mode: 1`（头优先）或 `?minor_mode=1`；部署级 `MINOR_MODE_FORCE=true` 强制管控；`GET /api/v1/minor-mode` 诊断端点；`capabilities` 增 `minor_mode`。
+- **变更说明**：开启时服务端统一屏蔽 18+ 站的展示入口及列表/详情/搜索/推荐/MacCMS 全部内容；单站入口用 `guard()` → **404 而非 403**（避免泄露源站存在），多源列表用 `filter_slugs()`/`source_clause()`，可见站为空返回 200 + 空列表；`categories` 的 300s 缓存 key 必须带 `active(request)`、保存标记后清缓存（否则有 5 分钟一致性窗口）。
+- **影响范围**：**不传开关时行为与 v1.14.1 完全一致，现有 API 调用无需改动**；屏蔽只改读路径可见集合、绝不删数据，关闭后立即恢复，无需重建/重同步；FORCE 时面板源站清单也会隐藏 18+ 行（改标记端点本身永不拦截）。
+- **注意事项**：反代必须显式转发 `X-Minor-Mode` 头（丢头会导致屏蔽静默失效，接口仍 200，最易被忽略）；新端点须注册在 `/api/v1/{slug}` 通配路由**之前**，否则 `/api/v1/minor-mode` 会被当 slug 吃掉。测试 `scripts/test_v1150_minor_mode.py`（72 项）。详见 [`CLIENT_API.md` 1.5](docs/CLIENT_API.md) 与 [`API_SPEC_FOR_AI.md` 4.27](docs/API_SPEC_FOR_AI.md)。
+
+</details>
+
+<details>
+<summary><b>v1.14.1</b> — 根因</summary>
+
+##### v1.14.1
 修复标签回填进度显示超过 100% 的 bug（面板截图报了 147.1%、172.6%）。
 
 - **根因**：`progress = cursor / total`，但 `cursor` 是上游 `vod_id` 水位、`total` 是行数 ——
@@ -806,7 +1043,12 @@ vodsync/
   稀疏 ID 端到端、续跑补算、迁移补列、面板渲染）；`test_v1130_panel_layout.py` 增至 97 项
   （新增折叠区块 G 组断言）
 
-### v1.14.0
+</details>
+
+<details>
+<summary><b>v1.14.0</b> — 不改任何既有字段名</summary>
+
+##### v1.14.0
 后端契约升级（对接 `BACKEND_UPGRADE_REQUIREMENTS_2026-11-09.md` 的 B-01 ~ B-11）：
 加能力、收错误码，**不改任何既有字段名**。详见 `docs/UPGRADE_2026-11-09_v1.14.0.md`。
 
@@ -843,7 +1085,12 @@ vodsync/
 - 测试：`scripts/test_v1140_contract.py` 123 项（能力清单 / 错误码 / 分页 / 标签检索 /
   索引维护 / Token 权限 / 详情契约 / 回归）；全量 21 套回归全绿
 
-### v1.13.0
+</details>
+
+<details>
+<summary><b>v1.13.0</b> — 明星词库搬到主面板</summary>
+
+##### v1.13.0
 面板布局调整：明星词库独立成区块 + 内容区自适应全屏。
 
 - **明星词库搬到主面板**（原先藏在「⚙ 设置」弹层最底下）：独立区块，含词条列表
@@ -862,7 +1109,12 @@ vodsync/
   JS 接线、无重复 id、真实渲染词条列表 / 空态 / 错误态，以及面板与接口总表的能力覆盖对照 +
   覆盖统计/覆盖率/高频词三张表的渲染断言）
 
-### v1.12.2
+</details>
+
+<details>
+<summary><b>v1.12.2</b> — 根因</summary>
+
+##### v1.12.2
 修复数据表浏览「查询没有数据」（v1.12.0 引入）：表头空白、每行每格都显示 `-`。
 
 - **根因**：`/rows` 返回的 `columns` 是**列名字符串数组**，面板却按 `{name,type,pk}` 对象用
@@ -874,7 +1126,12 @@ vodsync/
   这类 bug 接口级测试照不到，必须跑渲染
 - 接口、数据库、配置均无变化
 
-### v1.12.1
+</details>
+
+<details>
+<summary><b>v1.12.1</b> — 源站名称</summary>
+
+##### v1.12.1
 数据表浏览的下拉改显示**源站名称**：原来是 `vod_s361c088099`，面板上根本看不出是哪个站。
 
 - 清单接口每项新增 `label`：`vod_*` 取 `sources.name`（如「新极品资源站」）；
@@ -886,7 +1143,12 @@ vodsync/
 - 无新增环境变量、无数据库变更、无接口破坏
 - 测试：`scripts/test_v1121_tablelabel.py`（30 项：label 取值 / 孤儿表 / 同名源站 / 排序 / 契约 / 回归）
 
-### v1.12.0
+</details>
+
+<details>
+<summary><b>v1.12.0</b> — 面板新区块</summary>
+
+##### v1.12.0
 管理面板「数据表浏览」：只读查看数据库内容，排障时不用再登 psql。
 
 - **面板新区块**：下拉切换数据表（内置 5 张系统表 + 全部 `vod_{slug}`）；
@@ -905,7 +1167,12 @@ vodsync/
 **升级步骤（v1.11.0 → v1.12.0）**：`docker compose pull vodsync && docker compose up -d`。
 `/healthz` 应返回 `"version":"1.12.0"`。
 
-### v1.11.0
+</details>
+
+<details>
+<summary><b>v1.11.0</b> — 入库保留线路来源</summary>
+
+##### v1.11.0
 播放线路识别 / 过滤 / 排序（需求源自线上：非凡资源站 100% 记录的线路 1 是 H5 分享页，
 客户端自动选源必然播放失败）。
 
@@ -929,7 +1196,12 @@ vodsync/
 **升级步骤（v1.10.x → v1.11.0）**：`docker compose pull vodsync && docker compose up -d`。
 补列在启动时自动完成，无需手工 SQL、无需重新同步；`/healthz` 应返回 `"version":"1.11.0"`。
 
-### v1.10.1
+</details>
+
+<details>
+<summary><b>v1.10.1</b> — `_detail_item` 新增 5 个字段</summary>
+
+##### v1.10.1
 详情接口透出演职员与明星标签：NAS 模式下「演员/标签」不再无数据。
 
 - **`_detail_item` 新增 5 个字段**（纯新增，旧客户端无影响）：`vod_actor`、`vod_director`、
@@ -949,7 +1221,12 @@ vodsync/
 无数据库变更、无新增配置项、不触发重算。升级后 `curl http://<IP>:8181/healthz` 应看到
 `"version":"1.10.1"`。
 
-### v1.10.0
+</details>
+
+<details>
+<summary><b>v1.10.0</b> — 接口只加字段、不改结构</summary>
+
+##### v1.10.0
 按 `docs/REVIEW_2026-11-07.md` 第 8 节把 W1~W4 四个批次一次落地：4 个数据级 Bug、
 6 项算法修正、13 项性能优化、7 项次要 Bug。**接口只加字段、不改结构**，
 完整对接说明见 [`docs/UPGRADE_2026-11-07_v1.10.x.md`](docs/UPGRADE_2026-11-07_v1.10.x.md)。
@@ -986,7 +1263,12 @@ vodsync/
 52 站预计数小时）。期间 `/api/v1/related` 走实时兜底（`fallback=true`，仍非空），功能不降级。
 `pg_trgm` 扩展若建不出来只会记 warning，搜索退化为顺序扫描。回滚见「镜像版本与回滚」。
 
-### v1.9.3
+</details>
+
+<details>
+<summary><b>v1.9.3</b> — CI 改为「每构建必带版本号」</summary>
+
+##### v1.9.3
 镜像版本化 + 版本探针：每次构建都打版本号 tag，回滚有据可依。
 
 - **CI 改为「每构建必带版本号」**：`app/__init__.py` 的 `__version__` 是唯一来源，
@@ -1006,7 +1288,12 @@ vodsync/
 无数据库变更、无新增配置项。升级后 `curl http://<IP>:8181/healthz` 应看到
 `"version":"1.9.3"`；从这版起每次构建都有不可变 tag，回滚按上文「镜像版本与回滚」操作。
 
-### v1.9.2
+</details>
+
+<details>
+<summary><b>v1.9.2</b> — 新接口 `GET /api/v1/star/works`</summary>
+
+##### v1.9.2
 明星作品接口补强：新增「按明星查作品」、`star/related` 增加 Tab 角标数据、
 词库支持别名、未入词库高频词统计。
 
@@ -1037,7 +1324,12 @@ vodsync/
 「重算推荐」即可把历史别名命中并入主名。新配置见 `.env.example`「明星 Tag」段
 （`STAR_WORKS_LIMIT_*` / `STAR_UNTRACKED_*`），均有默认值。
 
-### v1.9.1
+</details>
+
+<details>
+<summary><b>v1.9.1</b> — Tag 回填（词库 → vod_tag）</summary>
+
+##### v1.9.1
 明星作品推荐：明星 Tag 回填 + 同明星视频查询 API。基于 v1.9.0 的明星词库，
 把词库价值落到数据层（`vod_tag`）和查询层（`star_map` 倒排映射）。
 
@@ -1075,7 +1367,12 @@ vodsync/
 `POST /api/v1/maintenance/star-tags?slug=all` 立即执行）；新增配置见 `.env.example`
 的「明星 Tag 回填」段，全部有默认值。
 
-### v1.9.0
+</details>
+
+<details>
+<summary><b>v1.9.0</b> — 关键背景</summary>
+
+##### v1.9.0
 相关推荐（服务端预计算）+ 存量字段补齐 + 明星词库。客户端详情页新增「相关推荐」栏，
 接口直读预计算表（P95 < 50ms，实测 0.3ms），任何详情页的推荐栏都不为空。
 
@@ -1136,7 +1433,12 @@ vodsync/
 
 **新增配置**：见 `.env.example` 的「相关推荐（v1.9.0）」与「存量字段回填」两段，全部有默认值，不配也能正常跑。
 
-### v1.8.1
+</details>
+
+<details>
+<summary><b>v1.8.1</b> — M1 页级重试</summary>
+
+##### v1.8.1
 源站健康度退避：源站持续限流/宕机时不再「每 6 小时从第 1 页捶到最后一页」。
 
 背景：某 9.3 万条的源站出现单轮 2,678 个索引页失败的日志。旧逻辑水位线冻结是对的
@@ -1163,7 +1465,12 @@ vodsync/
   streak 进退、sync_all 跳过与到期恢复、错误聚合、水位线冻结回归），全仓 303 项通过
 - 版本号 1.8.0 → 1.8.1
 
-### v1.8.0
+</details>
+
+<details>
+<summary><b>v1.8.0</b> — 数据模型</summary>
+
+##### v1.8.0
 自定义源站：latest.json 之外的接口可以在面板直接登记。
 
 - **数据模型**：`sources` 表新增 `origin`（`latest` / `custom`），`_migrate()` 自动为老库补列。
@@ -1192,7 +1499,12 @@ vodsync/
   同 slug 重建，以及一段真实 HTTP 的端到端链路），全仓 267 项通过
 - 版本号 1.7.0 → 1.8.0
 
-### v1.7.0
+</details>
+
+<details>
+<summary><b>v1.7.0</b> — 生产统一 PostgreSQL</summary>
+
+##### v1.7.0
 Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一 PostgreSQL**。
 
 - **多源列表查询**（`app/multiquery.py`，新）：不带 `source` 查全部源站时，旧实现把 52 张表
@@ -1218,7 +1530,12 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
   LIKE 转义、缓存命中、深页回退、日志三级清理、slug 碰撞），全仓 201 项通过
 - 版本号 1.6.1 → 1.7.0
 
-### v1.6.1
+</details>
+
+<details>
+<summary><b>v1.6.1</b> — 删除 `token_hint`</summary>
+
+##### v1.6.1
 收紧 `/api/v1/auth/state` 的信息暴露面（该接口在免鉴权白名单里，登录页需要它）：
 
 - **删除 `token_hint`**：原来会回 `vs_HYgS…u51c` 这种前 7 位 + 后 4 位片段。Token 是唯一凭据，
@@ -1232,7 +1549,12 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 - 测试：`scripts/test_v150_auth.py` 增加 10 项断言（未登录字段白名单、响应体不含 Token 前后缀、缓存头）
 - 版本号 1.6.0 → 1.6.1
 
-### v1.6.0
+</details>
+
+<details>
+<summary><b>v1.6.0</b> — P0-1 全量同步丢页</summary>
+
+##### v1.6.0
 修复三个「静默丢数据」的同步缺陷（复盘报告 `docs/REVIEW_2026-11-03.md`），围绕断电/重启恢复补齐冗余：
 
 - **P0-1 全量同步丢页**：批内单页失败时旧代码用 `max(成功页)` 存断点 → 跳过失败页且清断点标记完成。
@@ -1250,21 +1572,36 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 - 测试：新增 `scripts/test_v160_recovery.py`（42 项，含三个缺陷的复现转回归 + 自动续跑），全仓 207 项通过
 - 版本号 1.5.2 → 1.6.0
 
-### v1.5.2
+</details>
+
+<details>
+<summary><b>v1.5.2</b> — 30</summary>
+
+##### v1.5.2
 - 分页：`API_PAGE_SIZE_DEFAULT` 默认由 20 调到 **30**（三列宫格 10 行 × 3 列，每页正好整行）
 - 修复：`/api/v1/search` 的 `page_size` 之前写死 `20 / 100`，不跟随配置；现在与列表接口一致读 `API_PAGE_SIZE_DEFAULT` / `API_PAGE_SIZE_MAX`
 - 新增 `scripts/test_v151_paging.py`（14 项：默认值、显式值、最后一页不足整页、越界 422、search 与 MacCMS 兼容接口一致性）
 - 文档：`docs/APP_TOKEN_UPGRADE.md` 新增「9. 分页约定：三列宫格每页 30 条」（含取数策略与三个常见坑）
 - 版本号 1.5.1 → 1.5.2
 
-### v1.5.1
+</details>
+
+<details>
+<summary><b>v1.5.1</b> — `docs/APP_TOKEN_UPGRADE.md`</summary>
+
+##### v1.5.1
 - 修复：`/source`（源站清单 JSON）不带 `/api/` 前缀，此前只带 Token 的客户端会被拦成
   `401 请先登录管理面板`，现在与其它接口一致认 Token
 - 新增 **`docs/APP_TOKEN_UPGRADE.md`** —— 交给 AI 给 App 加 Token 的施工单（含各平台拦截器代码、401 处理策略、自测清单）
 - 测试：鉴权用例补 4 项（`/source` 认 Token、双空格 Bearer、无空格 Bearer 拒绝），共 44 项
 - 版本号 1.5.0 → 1.5.1
 
-### v1.5.0
+</details>
+
+<details>
+<summary><b>v1.5.0</b> — 访问控制</summary>
+
+##### v1.5.0
 - 新增**访问控制**：面板密码登录 + API Token，防止接口被公网滥用
   - `settings` 表（key/value，启动自动建）：`auth_enabled` / `admin_password_hash` / `api_token` / `session_secret`
   - 面板登录：默认密码 `666666`，PBKDF2-SHA256（20 万轮 + 随机盐），HttpOnly 签名会话 cookie（默认 7 天）
@@ -1278,7 +1615,12 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 - 测试：`scripts/test_v150_auth.py`（40 项：默认密码、三种 Token 带法、登录跳转、锁定、改密失效、开关换 Token、开放重定向防护）
 - 版本号 1.4.2 → 1.5.0
 
-### v1.4.2
+</details>
+
+<details>
+<summary><b>v1.4.2</b> — 切库不需要重新同步</summary>
+
+##### v1.4.2
 - 新增 `scripts/migrate_sqlite_to_pg.py`：SQLite → PostgreSQL 数据迁移，**切库不需要重新同步**
   - 迁移 `sources` / `sync_logs` / 全部 `vod_*` 表，保留 `watermark`（增量水位线）与 `last_page`（全量断点），迁完直接续增量
   - 幂等（重复执行按主键跳过）、每批一个事务（中断可续跑）、PG 下自动对齐 SERIAL 序列
@@ -1287,7 +1629,12 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 - 镜像内包含迁移脚本，可直接 `docker run --entrypoint python .../migrate_sqlite_to_pg.py`
 - 测试：`scripts/test_migration.py`（42 项：跨批翻页、字段保真、幂等、替换、过滤、dry-run、错误提示）
 
-### v1.4.1
+</details>
+
+<details>
+<summary><b>v1.4.1</b> — 并发同步过多导致数据库连接池耗尽，整个服务「假死」</summary>
+
+##### v1.4.1
 - 修复：**并发同步过多导致数据库连接池耗尽，整个服务「假死」**（NAS 上表现为容器不健康 / 面板全 500）
   - 根因链：面板连点十几个「全量」→ 每个请求各起一个线程、无任何上限 → SQLite 只允许一个写者，十几个写线程互相等写锁 → 等锁期间线程仍占着连接池连接（默认 5+10）→ 池满后连 `/healthz` 都 30s 超时 → Docker 判容器不健康
   - **全局并发闸门**：`sync_source` 内加信号量，无论谁触发（面板 / 定时 / 续跑 / 批量），同时真正在跑的源站不超过 `SOURCE_SYNC_CONCURRENCY`（默认 2），其余排队且**不占数据库连接**；`/stats.sync_load`、`/sources[].queued` 可看排队情况，面板显示「排队中」
@@ -1301,7 +1648,12 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
   - 聚合搜索并行度收敛为 `SEARCH_CONCURRENCY`（默认 4，原来固定 8，每线程各占一个连接）
 - 测试：新增 `scripts/test_v141_pool.py`（17 项：池参数、无泄漏、并发闸门峰值、防重入、并发写、池满时 healthz、断点保存）与 `scripts/loadtest_concurrency.py`（端到端：12 源站同时全量，实测峰值并发 2、探活 0 失败、连接池归零、720 条数据全部入库）
 
-### v1.4.0
+</details>
+
+<details>
+<summary><b>v1.4.0</b> — 中转代理降级通道</summary>
+
+##### v1.4.0
 - 新增**中转代理降级通道**：源站直连不可达/被风控时，自动按顺序切到 API 中转代理拉取数据
   - 请求格式 `{proxy}?url=<urlencode(目标地址)>`，默认内置 `https://pz.v88.qzz.io/`、`https://mconfig.viptv.work/`，可用 `PROXY_URLS` 覆盖
   - 路由策略：直连优先 → 失败自动切代理；连接失败/超时/403/429/451 立即切换（不做无意义重试），5xx 与 JSON 解析失败在当前路由重试后再切换
@@ -1314,7 +1666,12 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
   - `/api/v1/sources`、`/api/v1/sources/{slug}` 新增 `synced` 字段；面板对未同步站显示 `0%` +「从未同步 · 可点「增量」开始」
 - 测试：新增 `scripts/test_v140_proxy_progress.py`（19 项：URL 编码、直连不可达/403 自动切代理、记忆与 TTL、代理关闭即报错、进度口径）；`scripts/test_panel_render.js` 增加"未同步不得显示已完成"断言
 
-### v1.3.0
+</details>
+
+<details>
+<summary><b>v1.3.0</b> — 按源站的自动同步开关</summary>
+
+##### v1.3.0
 - 新增**按源站的自动同步开关**（全局定时调度保留不变：每 6 小时全站增量、每 12 小时刷新源站列表）：
   - `sources` 表新增 `auto_sync` 列（默认 1=参与），启动自动迁移旧库，状态持久化重启不丢
   - 关闭后该源站**不参与**定时增量任务与全站同步（`sync-all` / 定时 / 增量续跑），手动单站同步不受影响
@@ -1323,12 +1680,22 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
   - 面板源站列表：每行「自动」开关 + 复选框多选（全选框跨刷新保留）+ 「全部开启 / 全部暂停 / 开启所选 / 暂停所选自动同步」批量按钮
   - 测试 `scripts/test_v130_autosync.py`（13 项：默认值/单站/批量/sync_all 过滤/续跑过滤/路由注册）
 
-### v1.2.3
+</details>
+
+<details>
+<summary><b>v1.2.3</b> — 发布 GitHub 与双架构 CI 镜像</summary>
+
+##### v1.2.3
 - 项目已发布到 GitHub：https://github.com/consoleaiden/vodsync
 - GitHub Actions 首次构建成功（amd64 + arm64 双架构），镜像公开可拉取：`ghcr.io/consoleaiden/vodsync:latest`、`ghcr.io/consoleaiden/vodsync:1.2.2`
 - `docker-compose.yml` 与群晖部署文档的镜像地址已替换为实际发布地址
 
-### v1.2.2
+</details>
+
+<details>
+<summary><b>v1.2.2</b> — 未同步的源站</summary>
+
+##### v1.2.2
 - 修复：源站列表的「暂停」按钮在**未同步的源站**上也显示（误把"有断点未跑完"当成"正在跑"）
 - 新增运行时状态 `syncer._running`：`sync_source` 进入即登记、结束即注销，`/api/v1/sources` 与详情返回 `running` / `running_mode` / `running_seconds`
 - 面板交互改为按运行态渲染：**只有 `running=true` 才显示「暂停」**；已暂停显示「继续」；空闲站不显示这两个按钮
@@ -1337,14 +1704,24 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 - 单源站暂停接口返回 `was_running`，并区分提示"将在当前批次结束后停止"与"当前未在同步，暂停标记已记录"
 - 新增 `scripts/test_panel_render.js`：Node 里用 DOM 桩执行面板真实 JS，逐行断言「暂停」按钮只出现在运行中的行
 
-### v1.2.1
+</details>
+
+<details>
+<summary><b>v1.2.1</b> — 单源站级暂停/继续</summary>
+
+##### v1.2.1
 - 新增**单源站级暂停/继续**：源站列表每行增加「暂停 / 继续」按钮，暂停中的站显示橙色「本站暂停」徽标
 - 新增 API `POST /api/v1/sources/{slug}/pause` 与 `POST /api/v1/sources/{slug}/resume`；`/api/v1/sources`、`/api/v1/sources/{slug}` 返回 `paused` / `paused_at`
 - 判定顺序：全局/分层暂停 → 单源站暂停，任一命中即停；单源站暂停不影响其他源站，`sync-all` 与定时任务自动跳过被暂停的站
 - `sources` 表新增 `paused` / `paused_at` 列，启动自动迁移旧库
 - 测试 `scripts/test_v12_pause.py` 扩至 23 项（含单源站暂停隔离、运行中单源站暂停断点保存、全局暂停下的阻断提示）
 
-### v1.2.0
+</details>
+
+<details>
+<summary><b>v1.2.0</b> — 同步暂停/继续</summary>
+
+##### v1.2.0
 - 新增**同步暂停/继续**，三层级独立控制：全局（全量+增量+定时任务一起停）、仅全量、仅增量
 - 暂停语义为**检查点式优雅停止**：当前抓取批次完成后保存断点再停，不丢数据；继续时自动从断点续传（增量则水位线不动、重跑增量）
 - 暂停状态持久化到 `data/pause_state.json`，服务重启后仍生效；启动时自动恢复
@@ -1353,25 +1730,45 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 - 定时调度在暂停期间自动跳过对应任务（恢复后下一周期自动执行）
 - 新增测试 `scripts/test_v12_pause.py`（15 项，含真实网络中途暂停→断点 8 页→继续→16 页的端到端验证）
 
-### v1.1.3
+</details>
+
+<details>
+<summary><b>v1.1.3</b> — docs/CLIENT_API.md</summary>
+
+##### v1.1.3
 - 面向客户端 App 对接的整理：
   - 新增 `GET /api/v1/categories`：分类清单（type_id/type_name/count，支持多源合并），分类浏览入口
   - `/api/v1/videos` 新增 `type_id` 参数（可与 `ac=detail`、`wd` 组合）
   - 新增 CORS 支持（H5/Web App 可跨域直调，`CORS_ORIGINS` 环境变量可限制来源）
   - 新增 **docs/CLIENT_API.md**：面向 AI 客户端开发的完整 API 文档（约定/鉴权/全部接口/响应示例/App 实现流程/常见坑）
 
-### v1.1.2
+</details>
+
+<details>
+<summary><b>v1.1.2</b> — 批量详情与 ac=detail 列表带播放地址</summary>
+
+##### v1.1.2
 - `/api/v1/videos` 增强：新增 `ids=1,2,3`（批量取详情，按请求顺序返回，含播放地址）与 `ac=detail`（列表带播放地址）
 - 查询参数归一化：兼容 `&?ac=detail` 这类多打问号的写法（原会被静默忽略）
 - 详情字段统一：列表/详情/兼容接口共用 `_detail_item()`，补齐 `vod_play_from`
 - `ids` 查不到时返回 404 并提示如何搜索确认 `vod_id`（原来只返回空列表）
 
-### v1.1.1
+</details>
+
+<details>
+<summary><b>v1.1.1</b> — 新增 /source 资源站 API 清单</summary>
+
+##### v1.1.1
 - 新增 `GET /source`：资源站 API 清单（上游 `api` 地址 + 本地 `local_api`/`local_list_api` + 已入库条数），支持 `?status=ok|down`、`?only_ready=true` 过滤
 - 管理面板新增「资源站 API」按钮，一键查看清单
 - 断点保存时同步更新 `last_sync_at`，面板与 `/source` 的"最后同步时间"不再为空
 
-### v1.1.0
+</details>
+
+<details>
+<summary><b>v1.1.0</b> — Web 管理面板</summary>
+
+##### v1.1.0
 - 新增 **Web 管理面板**（`/`）：概览统计、全量同步进度条、单站/全站手动触发、条数校准、源站日志、跨源搜索
 - 新增 **聚合搜索接口** `GET /api/v1/search`：线程池并行查询各源站表 + 内存归并分页，单源失败隔离，LIKE 通配符转义
 - 新增 `GET /api/v1/stats`（面板概览）、`POST /api/v1/maintenance/recount`（条数校准）
@@ -1379,5 +1776,13 @@ Wave 2：多源查询重写 + 数据维护 + 源站身份修复 + **生产统一
 - 修复：全量同步中断时 `total_videos` 长期为 0（现在每次断点保存同时刷新条数；启动时也会校准）
 - 版本号 1.0.0 → 1.1.0
 
-### v1.0.0
+</details>
+
+<details>
+<summary><b>v1.0.0</b> — 首个版本：源站发现、断点续传、增量同步、双接口风格</summary>
+
+##### v1.0.0
 - 首个版本：源站发现、全量断点续传、增量水位线同步、每源站一表、REST + MacCMS 兼容 API、CI 多架构镜像、群晖部署文档
+
+</details>
+
