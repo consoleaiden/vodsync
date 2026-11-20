@@ -3,7 +3,7 @@
   "info": {
     "title": "VodSync 影视数据同步服务",
     "description": "遍历 ziyuanzhan latest.json 源站列表，定时增量同步苹果 CMS(MacCMS) 影视数据到本地数据库，并对外提供统一的视频列表/详情 API（source 参数区分源站）。",
-    "version": "1.19.0"
+    "version": "1.20.0"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -474,6 +474,84 @@
                 "schema": {
                   "$ref": "#/components/schemas/HTTPValidationError"
                 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tvbox/config": {
+      "get": {
+        "summary": "TVBox 兼容配置（v1.20.0）",
+        "description": "TVBox 兼容配置 JSON：把本服务的源站清单转成 `sites`（type=1 苹果 CMS\nJSON 站点，api 指向 `/api/v1/{slug}` MacCMS 兼容接口），可选下发\n`lives` / `spider` / `wallpaper`（TVBOX_* 环境变量配置）。\n\n使用：TVBox 配置地址填 `http://<host>:<port>/api/v1/tvbox/config?token=<Token>`；\n开启鉴权时生成的 sites[].api 会自动携带同一枚 Token，TVBox 内免配置。\n未成年模式下 18+ 源站照常剔除；响应带 CORS 头（全局中间件），网页端\n调试也能直接取。",
+        "operationId": "tvbox_config_api_v1_tvbox_config_get",
+        "parameters": [
+          {
+            "name": "slugs",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "只输出指定源站，逗号分隔；空=全部可用源站",
+              "default": "",
+              "title": "Slugs"
+            },
+            "description": "只输出指定源站，逗号分隔；空=全部可用源站"
+          },
+          {
+            "name": "quick_search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 1,
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "1/0 强制开/关 quickSearch；缺省跟随 TVBOX_QUICK_SEARCH",
+              "title": "Quick Search"
+            },
+            "description": "1/0 强制开/关 quickSearch；缺省跟随 TVBOX_QUICK_SEARCH"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tvbox.json": {
+      "get": {
+        "summary": "TVBox 配置别名（v1.20.0）",
+        "description": "同 /api/v1/tvbox/config，路径更短便于手动填写；鉴权口径一致。",
+        "operationId": "tvbox_config_alias_tvbox_json_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
               }
             }
           }

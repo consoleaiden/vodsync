@@ -619,3 +619,26 @@ STAR_TAG_REBUILD_SLEEP_MS = int(os.environ.get("STAR_TAG_REBUILD_SLEEP_MS", "20"
 # 纯 ASCII 词的最短长度：词库里 er/ss/jk/fc2 这类 2 字母词会污染标签，
 # 中文词仍按 2 字起（related.reload_star_terms 的既有规则）。0 = 不额外过滤。
 STAR_TAG_MIN_ASCII_LEN = int(os.environ.get("STAR_TAG_MIN_ASCII_LEN", "3"))
+
+# ---------------------------------------------------------------------------
+# v1.20.0 TVBox 配置接口（GET /api/v1/tvbox/config、GET /tvbox.json）
+#
+# 把本服务的源站清单转成 TVBox 兼容配置（sites/lives/spider/wallpaper）。
+# TVBox 是纯客户端，不会带 Authorization 头，所以鉴权部署下约定：
+#   - 配置 URL 直接带 ?token=xxx（Token 支持 query 参数，auth.extract_token）；
+#   - 生成的 sites[].api 会自动带上同一枚 Token，TVBox 拉分类/详情/搜索不用再配。
+# ---------------------------------------------------------------------------
+# 站点 api 前缀。留空 = 从请求自动推导（X-Forwarded-Proto/Host > 请求 host），
+# 反代场景建议显式指定为对外可达地址。
+TVBOX_BASE_URL = os.environ.get("TVBOX_BASE_URL", "").rstrip("/")
+# TVBox 网络嗅探/解析 jar 地址，没有就下发空串（TVBox 用内置默认行为）。
+TVBOX_SPIDER = os.environ.get("TVBOX_SPIDER", "")
+# 壁纸地址（TVBox 首页背景），留空不下发。
+TVBOX_WALLPAPER = os.environ.get("TVBOX_WALLPAPER", "")
+# 直播源地址（TXT 格式），留空则 lives 下发空数组。
+TVBOX_LIVE_URL = os.environ.get("TVBOX_LIVE_URL", "")
+# 只输出已入库视频数 ≥ 该值的源站，避免 TVBox 里出现一堆空站。
+TVBOX_MIN_VIDEOS = int(os.environ.get("TVBOX_MIN_VIDEOS", "1"))
+# 快速搜索（quickSearch）默认开：TVBox 首页搜索会并行打所有站，源站多时
+# 可设为 0 关掉（TVBox 配置 URL ?quick_search=0 也可以临时关）。
+TVBOX_QUICK_SEARCH = os.environ.get("TVBOX_QUICK_SEARCH", "1") == "1"

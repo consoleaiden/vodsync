@@ -858,6 +858,43 @@ def source_catalog(
 # 这两个端点注册在 `/api/v1/{slug}`（MacCMS 兼容通配路由）之前 —— 否则
 # `GET /api/v1/minor-mode` 会被当成 slug="minor-mode" 吃进采集接口返回 404。
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# TVBox 配置接口（v1.20.0）
+#
+# 同样必须注册在 `/api/v1/{slug}` 通配路由之前：否则 tvbox 会被当成 slug
+# 吃进 MacCMS 兼容接口，返回「源站不存在」。别名 /tvbox.json 不在 /api/
+# 前缀下，走 auth.API_PATHS 白名单按 Token 鉴权。
+# ---------------------------------------------------------------------------
+@router.get("/api/v1/tvbox/config", summary="TVBox 兼容配置（v1.20.0）")
+def tvbox_config(
+    request: Request,
+    slugs: str = Query("", description="只输出指定源站，逗号分隔；空=全部可用源站"),
+    quick_search: Optional[int] = Query(None, ge=0, le=1,
+                                        description="1/0 强制开/关 quickSearch；缺省跟随 TVBOX_QUICK_SEARCH"),
+):
+    """
+    TVBox 兼容配置 JSON：把本服务的源站清单转成 `sites`（type=1 苹果 CMS
+    JSON 站点，api 指向 `/api/v1/{slug}` MacCMS 兼容接口），可选下发
+    `lives` / `spider` / `wallpaper`（TVBOX_* 环境变量配置）。
+
+    使用：TVBox 配置地址填 `http://<host>:<port>/api/v1/tvbox/config?token=<Token>`；
+    开启鉴权时生成的 sites[].api 会自动携带同一枚 Token，TVBox 内免配置。
+    未成年模式下 18+ 源站照常剔除；响应带 CORS 头（全局中间件），网页端
+    调试也能直接取。
+    """
+    from .. import tvbox
+    return tvbox.build_config(
+        request,
+        slugs=slugs or None,
+        quick_search=(None if quick_search is None else bool(quick_search)),
+    )
+
+
+@router.get("/tvbox.json", include_in_schema=True, summary="TVBox 配置别名（v1.20.0）")
+def tvbox_config_alias(request: Request):
+    """同 /api/v1/tvbox/config，路径更短便于手动填写；鉴权口径一致。"""
+    from .. import tvbox
+    return tvbox.build_config(request)
 @router.get("/api/v1/minor-mode", summary="未成年模式状态（能力诊断用）")
 def minor_mode_status(request: Request):
     """

@@ -536,7 +536,9 @@ PUBLIC_PATHS = {
 # 返回 JSON 的接口路径。中间件对它们走「Token 或会话」判定。
 # 注意 `/source`（源站清单）不在 /api/ 前缀下，但同样是对外 API ——
 # 漏掉它会让只带 Token 的客户端收到 401「请先登录管理面板」。
-API_PATHS = ("/source",)
+# `/tvbox.json`（v1.20.0）：TVBox 配置别名，TVBox 只能带 ?token=，
+# 同样必须进这份清单。
+API_PATHS = ("/source", "/tvbox.json")
 
 
 def is_public(path: str) -> bool:

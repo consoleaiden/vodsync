@@ -587,6 +587,26 @@ vodsync/
 
 > 按版本号**从新到旧**排列，最新版本在最前。历史版本只做归档记录，细节以对应版本的代码与文档为准。
 
+### v1.20.0
+**TVBox 兼容配置接口**（`app/tvbox.py` 新模块；纯只读新增，不影响既有 API）：
+
+- `GET /api/v1/tvbox/config` 与别名 `GET /tvbox.json`：把源站清单转成 TVBox 兼容
+  JSON —— 每个可用源站一个 `type=1`（苹果 CMS JSON）站点，`api` 指向本服务
+  `/api/v1/{slug}` MacCMS 兼容接口（分类/分页/搜索/详情直接可用）
+- 站点准入：`enabled=1` 且 `status=ok` 且入库视频数 ≥ `TVBOX_MIN_VIDEOS`（默认 1）；
+  未成年模式（`X-Minor-Mode: 1`）下 18+ 源站照常剔除；`?slugs=a,b` 可输出子集
+- 鉴权部署：配置 URL 带 `?token=<Token>` 即可（Token 支持 query 参数）；生成的
+  `sites[].api` 自动内嵌同一枚 Token，TVBox 内拉取分类/详情/搜索免配置；
+  `AUTH_ENABLED=false` 的开放部署不带任何凭据
+- `api` 前缀自动推导：`TVBOX_BASE_URL` 环境变量 > `X-Forwarded-Proto/Host` 反代头
+  > 请求 host；反代场景建议显式配置
+- 可选字段：`TVBOX_SPIDER`（嗅探 jar）、`TVBOX_WALLPAPER`（壁纸）、
+  `TVBOX_LIVE_URL`（TXT 直播源，下发 `lives`）、`TVBOX_QUICK_SEARCH`（默认开，
+  `?quick_search=0` 可按请求临时关闭）
+- 跨域：全局 CORS 中间件覆盖（`Access-Control-Allow-Origin: *`，可用
+  `CORS_ORIGINS` 环境变量收紧），浏览器网页调试可直接取配置
+- TVBox 使用：配置地址填 `http://<host>:<port>/api/v1/tvbox/config?token=<Token>`
+
 ### v1.19.0
 **运营管理升级「未实现/半实现项」全部补齐**（对照 `ADFILTER_ADMIN_OPS_UPGRADE` 需求文档逐条核查后补齐；规则包/客户端协议结构不变）：
 
