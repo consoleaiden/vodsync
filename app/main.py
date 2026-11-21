@@ -38,6 +38,16 @@ app = FastAPI(
 
 app.include_router(router)
 
+# [selenetv] 增量：挂载 SeleneTV 专用 API（Helios 风格）。
+# 由 SELENETV_API_ENABLED 控制，默认开启；设为 false 即整包不挂载，现有功能完全不受影响。
+if os.environ.get("SELENETV_API_ENABLED", "true").strip().lower() == "true":
+    try:
+        from .selenetv import mount as _mount_selenetv
+
+        _mount_selenetv(app)
+    except Exception:
+        logging.getLogger("vodsync.main").exception("SeleneTV API 挂载失败（不影响 vodsync 主服务）")
+
 
 # ---------------------------------------------------------------------------
 # 访问控制闸门（v1.5.0）
@@ -56,6 +66,16 @@ async def _auth_guard(request: Request, call_next):
     from . import auth
 
     path = request.url.path
+    # [selenetv] 增量：SeleneTV 专用 API 走自己的 Helios 风格鉴权（Cookie auth），
+    # 不经过 vodsync 的 Token 闸门。这里只对精确注册的 10 条路径放行，其它 /api/**
+    # 一律保持原有行为不变。整包删除 app/selenetv 后此分支自动失效。
+    try:
+        from .selenetv import is_selenetv_path
+        if is_selenetv_path(path):
+            return await call_next(request)
+    except ImportError:
+        pass
+
     if request.method == "OPTIONS" or not auth.is_enabled() or auth.is_public(path):
         return await call_next(request)
 
@@ -236,6 +256,16 @@ def on_startup():
     # 注意：不要在这里打印 config.DATABASE_URL —— 它带着 PG 密码。
     # init_db() 内部用 render_as_string(hide_password=True) 打了脱敏版本。
     database.init_db()
+
+    # [selenetv] 增量：幂等创建 4 张 SeleneTV 专用表（只增不改，checkfirst）。
+    # 失败只记日志，绝不影响 vodsync 现有启动流程。
+    if os.environ.get("SELENETV_API_ENABLED", "true").strip().lower() == "true":
+        try:
+            from .selenetv.migrate import ensure_tables
+
+            ensure_tables(verbose=True)
+        except Exception:
+            log.exception("SeleneTV 专用表初始化失败（不影响 vodsync 现有功能）")
 
     from . import auth
 

@@ -22,3 +22,6 @@ data/
 .DS_Store
 Thumbs.db
 data-test
+
+# SeleneTV 验证用临时 venv（非生产依赖）
+.venv_selene/
