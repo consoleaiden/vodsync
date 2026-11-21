@@ -50,6 +50,9 @@ PROTECTED_PATHS = {
     "/api/search/suggestions", "/api/detail", "/api/favorites",
     "/api/searchhistory", "/api/playrecords", "/api/live/sources",
     "/api/adfilter/rules",  # [广告过滤] 规则包拉取（Helios Cookie 鉴权）
+    # [18+ Tab] 源站/分类/视频（Helios Cookie 鉴权 + allow_adult 守卫）
+    "/api/adult/permission", "/api/adult/sources",
+    "/api/adult/categories", "/api/adult/videos",
 }
 PUBLIC_PATHS = {"/api/login"}
 
@@ -564,3 +567,108 @@ def selenetv_adfilter_rules(
         # 服务端版本更低（回滚过）：不给 rules，客户端继续用本地较新的包
         return {"changed": False, "version": state["version"]}
     return {"changed": True, "version": state["version"], "rules": state["rules"]}
+
+
+# ---------------------------------------------------------------------------
+# ⑬ [18+ Tab] GET /api/adult/permission —— 当前登录用户是否有 18+ 访问权限
+#
+# 客户端在登录后/返回首页时轮询此端点决定「18+」tab 的显隐：
+#   - 未登录/登录失效 → _guard 401 → 客户端隐藏 tab
+#   - 登录但无权限   → {"allowed": false} → 客户端隐藏 tab
+#   - 登录且有权限   → {"allowed": true}
+# ---------------------------------------------------------------------------
+@selenetv_router.get("/api/adult/permission")
+def selenetv_adult_permission(request: Request):
+    err = _guard(request)
+    if err:
+        return err
+    # no-store：权限随时可能被面板改动，且客户端要求「失效即隐藏」
+    return _json({"allowed": bool(_allow_adult(request))},
+                 headers={"Cache-Control": "no-store"})
+
+
+def _adult_guard(request: Request) -> Response | None:
+    """18+ Tab 公共守卫前半段：鉴权 + allow_adult 权限。"""
+    err = _guard(request)
+    if err:
+        return err
+    if not _allow_adult(request):
+        return security.text_error(403, "Adult content access denied")
+    return None
+
+
+def _adult_source_or_error(request: Request, slug: str):
+    """18+ Tab 需要定位源站的端点的公共守卫：鉴权 + 权限 + 源站有效性。
+
+    返回 (source_row, None) 或 (None, error_response)。
+    无 18+ 权限返回 403（tab 本身就不会展示给无权用户，403 足够明确）。
+    """
+    err = _adult_guard(request)
+    if err:
+        return None, err
+    if not slug:
+        return None, security.text_error(400, "缺少必要参数")
+    src = repo.get_source(slug)
+    if not src:
+        return None, security.text_error(400, "无效的API来源")
+    return src, None
+
+
+# ---------------------------------------------------------------------------
+# ⑭ [18+ Tab] GET /api/adult/sources —— 18+ 源站列表 [{"key","name","detail"}]
+# 形状与 /api/search/resources 对齐，客户端可复用同一套展示逻辑。
+# ---------------------------------------------------------------------------
+@selenetv_router.get("/api/adult/sources")
+def selenetv_adult_sources(request: Request):
+    err = _adult_guard(request)
+    if err:
+        return err
+    sites = [
+        {"key": s["slug"], "api": s["api_url"] or "", "name": s["name"] or "",
+         "detail": s["homepage"] or ""}
+        for s in repo.list_adult_sources(enabled_only=True)
+    ]
+    return _json(sites, headers={"Cache-Control": "no-store"})
+
+
+# ---------------------------------------------------------------------------
+# ⑮ [18+ Tab] GET /api/adult/categories?source=slug —— 单源分类列表
+# ---------------------------------------------------------------------------
+@selenetv_router.get("/api/adult/categories")
+def selenetv_adult_categories(request: Request):
+    source = (request.query_params.get("source") or "").strip()
+    _, err = _adult_source_or_error(request, source)
+    if err:
+        return err
+    cats = repo.list_categories(source)
+    return _json(cats, headers={"Cache-Control": "no-store"})
+
+
+# ---------------------------------------------------------------------------
+# ⑯ [18+ Tab] GET /api/adult/videos?source=slug&type_id=&page=&size=
+# 单源分类视频分页列表：{"list":[{vod_id,name,pic,remarks,vod_year,type_name,
+# type_id}],"total","page","size"}
+# ---------------------------------------------------------------------------
+@selenetv_router.get("/api/adult/videos")
+def selenetv_adult_videos(request: Request):
+    source = (request.query_params.get("source") or "").strip()
+    _, err = _adult_source_or_error(request, source)
+    if err:
+        return err
+    try:
+        page = int(request.query_params.get("page") or 1)
+    except ValueError:
+        page = 1
+    try:
+        size = int(request.query_params.get("size") or 25)
+    except ValueError:
+        size = 25
+    type_raw = (request.query_params.get("type_id") or "").strip()
+    type_id: int | None = None
+    if type_raw:
+        try:
+            type_id = int(type_raw)
+        except ValueError:
+            return security.text_error(400, "无效的分类ID")
+    data = repo.list_videos(source, type_id=type_id, page=page, size=size)
+    return _json(data, headers={"Cache-Control": "no-store"})

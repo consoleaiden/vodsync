@@ -101,6 +101,96 @@ def search_in_source(
         return [dict(r) for r in conn.execute(stmt).mappings().all()]
 
 
+def list_adult_sources(enabled_only: bool = True) -> List[Dict[str, Any]]:
+    """
+    [18+ Tab] 返回标记为 18+ 的源站列表（sources.is_adult = 1）。
+    调用方（router）负责 Helios Cookie 鉴权 + allow_adult 守卫，这里只按标记过滤。
+    """
+    stmt = select(
+        sources_table.c.slug,
+        sources_table.c.name,
+        sources_table.c.api_url,
+        sources_table.c.homepage,
+        sources_table.c.total_videos,
+        sources_table.c.is_adult,
+    ).where(func.coalesce(sources_table.c.is_adult, 0) == 1)
+    if enabled_only:
+        stmt = stmt.where(sources_table.c.enabled == 1)
+    stmt = stmt.order_by(sources_table.c.name)
+    with database.engine.connect() as conn:
+        return [dict(r) for r in conn.execute(stmt).mappings().all()]
+
+
+def list_categories(slug: str) -> List[Dict[str, Any]]:
+    """
+    [18+ Tab] 单源分类列表：SELECT DISTINCT type_id, type_name，按 type_id 升序。
+    表不存在返回空列表（与 search_in_source 的容错一致）。
+    """
+    slug = validate_slug(slug)
+    table = build_vod_table(slug)
+    if table.name not in existing_vod_tables():
+        return []
+    with database.engine.connect() as conn:
+        rows = conn.execute(
+            select(
+                func.max(table.c.type_id).label("type_id"),
+                table.c.type_name,
+            )
+            .where(table.c.type_name != "")
+            .group_by(table.c.type_name)
+            .order_by(func.max(table.c.type_id))
+            .limit(200)
+        ).mappings().all()
+    return [
+        {"type_id": int(r["type_id"] or 0), "type_name": str(r["type_name"] or "")}
+        for r in rows
+    ]
+
+
+def list_videos(
+    slug: str,
+    type_id: Optional[int] = None,
+    page: int = 1,
+    size: int = 25,
+) -> Dict[str, Any]:
+    """
+    [18+ Tab] 单源分类视频分页列表（按 vod_time 倒序，与搜索排序一致）。
+
+    返回 {"list": [瘦行...], "total": 总数, "page": page, "size": size}。
+    瘦行不含 content/play_url 大字段——网格只需要封面/标题/年份/备注，
+    播放信息走既有 /api/detail 端点按需获取。
+    """
+    slug = validate_slug(slug)
+    table = build_vod_table(slug)
+    if table.name not in existing_vod_tables():
+        return {"list": [], "total": 0, "page": page, "size": size}
+
+    page = max(1, int(page))
+    size = min(max(1, int(size)), 100)
+    offset = (page - 1) * size
+
+    cols = [
+        table.c.vod_id, table.c.type_id, table.c.type_name, table.c.name,
+        table.c.pic, table.c.remarks, table.c.vod_year,
+    ]
+    base_where = []
+    if type_id is not None:
+        base_where.append(table.c.type_id == int(type_id))
+
+    count_stmt = select(func.count()).select_from(table).where(*base_where)
+    list_stmt = (
+        select(*cols)
+        .where(*base_where)
+        .order_by(table.c.vod_time.desc(), table.c.vod_id.desc())
+        .offset(offset)
+        .limit(size)
+    )
+    with database.engine.connect() as conn:
+        total = int(conn.execute(count_stmt).scalar() or 0)
+        rows = [dict(r) for r in conn.execute(list_stmt).mappings().all()]
+    return {"list": rows, "total": total, "page": page, "size": size}
+
+
 def get_detail(slug: str, vod_id: str) -> Optional[Dict[str, Any]]:
     """精确取一条详情整行。"""
     slug = validate_slug(slug)
