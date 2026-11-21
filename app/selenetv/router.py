@@ -132,18 +132,26 @@ async def search(request: Request):
         return _json({"results": []}, headers=_CACHE_HEADERS)
 
     srcs = repo.list_sources(enabled_only=True)
-    all_results = []
-    for src in srcs:
-        try:
-            rows = repo.search_in_source(src["slug"], q, limit=100)
-        except Exception as exc:  # noqa: BLE001 - 单源失败吞掉（Helios 行为）
-            log.warning("selenetv search[%s] failed: %s", src["slug"], exc)
-            continue
+    if not srcs:
+        return _json({"results": []}, headers=_CACHE_HEADERS)
+
+    # 与 vodsync 原生聚合搜索一致：一次取全 vod_ 表集合 + 线程池并发，
+    # 避免串行遍历 64 源站导致 710 万行规模下整体超时（P0 性能修复）。
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from .. import config as _config
+
+    known = repo.existing_vod_tables()
+
+    def _one(src):
+        rows = repo.search_in_source(src["slug"], q, limit=100, known_tables=known)
+        out = []
         for row in rows:
-            episodes, titles = extract_episodes(row.get("play_url") or "", row.get("content") or "")
+            episodes, titles = extract_episodes(
+                row.get("play_url") or "", row.get("content") or ""
+            )
             if not episodes:                       # Helios 过滤无 m3u8 的结果
                 continue
-            all_results.append(search_result(
+            out.append(search_result(
                 vod_id=row.get("vod_id"),
                 name=row.get("name") or "",
                 pic=row.get("pic") or "",
@@ -155,6 +163,18 @@ async def search(request: Request):
                 content=row.get("content"),
                 type_name=row.get("type_name"),
             ))
+        return out
+
+    all_results = []
+    workers = max(1, min(getattr(_config, "SEARCH_CONCURRENCY", 4), len(srcs)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_one, src): src for src in srcs}
+        for fut in as_completed(futures):
+            src = futures[fut]
+            try:
+                all_results.extend(fut.result())
+            except Exception as exc:  # noqa: BLE001 - 单源失败吞掉（Helios 行为）
+                log.warning("selenetv search[%s] failed: %s", src["slug"], exc)
     return _json({"results": all_results}, headers=_CACHE_HEADERS)
 
 
@@ -179,35 +199,48 @@ async def search_ws(request: Request):
         return security.text_error(500, "No API sites configured")
 
     def event_stream():
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from .. import config as _config
+
         yield serializers.sse_frame(serializers.sse_start(q, len(srcs)))
         total_results = 0
         completed = 0
-        for src in srcs:
-            try:
-                rows = repo.search_in_source(src["slug"], q, limit=100)
-                results = []
-                for row in rows:
-                    episodes, titles = extract_episodes(
-                        row.get("play_url") or "", row.get("content") or ""
+        known = repo.existing_vod_tables()
+
+        def _one(src):
+            rows = repo.search_in_source(src["slug"], q, limit=100, known_tables=known)
+            results = []
+            for row in rows:
+                episodes, titles = extract_episodes(
+                    row.get("play_url") or "", row.get("content") or ""
+                )
+                if not episodes:
+                    continue
+                results.append(search_result(
+                    vod_id=row.get("vod_id"), name=row.get("name") or "",
+                    pic=row.get("pic") or "", episodes=episodes,
+                    episodes_titles=titles, source=src["slug"],
+                    source_name=src["name"] or "", year=row.get("vod_year") or "",
+                    content=row.get("content"), type_name=row.get("type_name"),
+                ))
+            return results
+
+        workers = max(1, min(getattr(_config, "SEARCH_CONCURRENCY", 4), len(srcs)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_one, src): src for src in srcs}
+            for fut in as_completed(futures):
+                src = futures[fut]
+                try:
+                    results = fut.result()
+                    yield serializers.sse_frame(
+                        serializers.sse_source_result(src["slug"], src["name"] or "", results)
                     )
-                    if not episodes:
-                        continue
-                    results.append(search_result(
-                        vod_id=row.get("vod_id"), name=row.get("name") or "",
-                        pic=row.get("pic") or "", episodes=episodes,
-                        episodes_titles=titles, source=src["slug"],
-                        source_name=src["name"] or "", year=row.get("vod_year") or "",
-                        content=row.get("content"), type_name=row.get("type_name"),
-                    ))
-                yield serializers.sse_frame(
-                    serializers.sse_source_result(src["slug"], src["name"] or "", results)
-                )
-                total_results += len(results)
+                    total_results += len(results)
+                except Exception as exc:  # noqa: BLE001
+                    yield serializers.sse_frame(
+                        serializers.sse_source_error(src["slug"], src["name"] or "", str(exc))
+                    )
                 completed += 1
-            except Exception as exc:  # noqa: BLE001
-                yield serializers.sse_frame(
-                    serializers.sse_source_error(src["slug"], src["name"] or "", str(exc))
-                )
         yield serializers.sse_frame(serializers.sse_complete(total_results, completed))
 
     return StreamingResponse(

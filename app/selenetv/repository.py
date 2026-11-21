@@ -60,12 +60,17 @@ def existing_vod_tables() -> set:
 # 搜索 / 详情（只读 vod_{slug}）
 # ---------------------------------------------------------------------------
 def search_in_source(
-    slug: str, keyword: str, limit: int = 100, type_name: Optional[str] = None
+    slug: str, keyword: str, limit: int = 100, type_name: Optional[str] = None,
+    known_tables: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
-    """单源 pg_trgm LIKE 检索；返回瘦行 dict（含 play_url/content 供 episodes 提取）。"""
+    """单源 pg_trgm LIKE 检索；返回瘦行 dict（含 play_url/content 供 episodes 提取）。
+
+    known_tables: 调用方可一次取全 vod_ 表集合传入，避免并发时每源重复查 pg_tables
+                  （与 vodsync 原生聚合搜索的 list_tables 一次取全策略一致）。
+    """
     slug = validate_slug(slug)
     table = build_vod_table(slug)
-    if table.name not in existing_vod_tables():
+    if table.name not in (known_tables if known_tables is not None else existing_vod_tables()):
         return []
     pattern = "%" + keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
     cols = [
