@@ -49,6 +49,7 @@ PROTECTED_PATHS = {
     "/api/search", "/api/search/ws", "/api/search/resources",
     "/api/search/suggestions", "/api/detail", "/api/favorites",
     "/api/searchhistory", "/api/playrecords", "/api/live/sources",
+    "/api/adfilter/rules",  # [广告过滤] 规则包拉取（Helios Cookie 鉴权）
 }
 PUBLIC_PATHS = {"/api/login"}
 
@@ -524,3 +525,42 @@ async def live_playlist(request: Request, key: str):
         media_type="application/vnd.apple.mpegurl; charset=utf-8",
         headers=headers,
     )
+
+# ---------------------------------------------------------------------------
+# ⑫ [广告过滤] GET /api/adfilter/rules —— 规则包拉取（Helios Cookie 鉴权，只读）
+#
+# 契约与 /api/v1/adfilter/rules 完全一致（四态：changed/version/rules），
+# 差别只在鉴权：SeleneTV 客户端没有 vodsync 的 API Token（late-show-app 走
+# Bearer Token，SeleneTV 登录体系是 Helios Cookie），故在本模块下提供同形
+# 端点，走 SeleneTV 自己的鉴权。只读、无副作用，复用 app/adfilter 现有逻辑。
+# ---------------------------------------------------------------------------
+@selenetv_router.get("/api/adfilter/rules")
+def selenetv_adfilter_rules(
+    request: Request,
+    response: Response,
+    version: int = 0,
+    channel: str | None = None,
+):
+    err = _guard(request)
+    if err:
+        return err
+    from .. import adfilter as _adfilter
+    from .. import config as _config
+
+    # 规则随时可能被面板改，别让中间层缓存住（客户端自己有 30min TTL）
+    response.headers["Cache-Control"] = "no-store"
+    if not _config.ADFILTER_ENABLED:
+        return JSONResponse(status_code=404, content={"error": "adfilter disabled"})
+    if version < 0:
+        version = 0
+    state = _adfilter.current(_adfilter.normalize_channel(channel))
+    try:
+        v = int(version)
+    except (TypeError, ValueError):
+        v = 0
+    if v == state["version"]:
+        return {"changed": False, "version": state["version"]}
+    if v > state["version"]:
+        # 服务端版本更低（回滚过）：不给 rules，客户端继续用本地较新的包
+        return {"changed": False, "version": state["version"]}
+    return {"changed": True, "version": state["version"], "rules": state["rules"]}

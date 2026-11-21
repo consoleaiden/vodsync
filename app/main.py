@@ -281,7 +281,9 @@ def on_startup():
                 except Exception:
                     log.exception("[直播源] 启动首拉失败（不影响 vodsync 现有功能）")
 
-            import threading
+            # 注意：不能在这里局部 import threading —— 会把 threading 变成 on_startup
+            # 的局部名，SELENETV_LIVE_SYNC_ENABLED=false 跳过本分支时，下方
+            # threading.Thread(_bootstrap) 会 UnboundLocalError 启动崩溃。顶部已全局导入。
             threading.Thread(target=_first_live_sync, daemon=True, name="selenetv-live-first-sync").start()
 
     from . import auth
