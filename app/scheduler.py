@@ -185,6 +185,23 @@ def _job_star_tags_nightly():
         log.exception("[明星Tag] 每晚重建失败")
 
 
+def _job_selenetv_live_sync():
+    """[selenetv] 每日拉取 vbskycn/iptv 直播源（失败只记日志，不影响其他任务）。"""
+    import os
+
+    if os.environ.get("SELENETV_API_ENABLED", "true").strip().lower() != "true":
+        return
+    if os.environ.get("SELENETV_LIVE_SYNC_ENABLED", "true").strip().lower() != "true":
+        return
+    try:
+        from .selenetv.live_sync import sync_once
+
+        result = sync_once()
+        log.info("[直播源] 每日同步结果: %s", result)
+    except Exception:
+        log.exception("[直播源] 每日同步任务失败（不影响其他任务）")
+
+
 def start_scheduler():
     global _scheduler
     if _scheduler is not None:
@@ -254,6 +271,26 @@ def start_scheduler():
             max_instances=1,
             coalesce=True,
         )
+    # [selenetv] 每日拉取 iptv 直播源（默认 04:30 Asia/Shanghai，可配置）。
+    import os
+
+    if (
+        os.environ.get("SELENETV_API_ENABLED", "true").strip().lower() == "true"
+        and os.environ.get("SELENETV_LIVE_SYNC_ENABLED", "true").strip().lower() == "true"
+    ):
+        try:
+            _sync_hour = max(0, min(23, int(os.environ.get("SELENETV_LIVE_SYNC_HOUR", "4"))))
+            _sync_minute = max(0, min(59, int(os.environ.get("SELENETV_LIVE_SYNC_MINUTE", "30"))))
+            _scheduler.add_job(
+                _job_selenetv_live_sync,
+                CronTrigger(hour=_sync_hour, minute=_sync_minute, timezone="Asia/Shanghai"),
+                id="selenetv_live_sync",
+                max_instances=1,
+                coalesce=True,
+            )
+            log.info("[直播源] 每日拉取任务已注册: %02d:%02d Asia/Shanghai", _sync_hour, _sync_minute)
+        except Exception:
+            log.exception("[直播源] 注册每日拉取任务失败（不影响其他任务）")
     _scheduler.start()
     log.info(
         "调度器已启动: 源站刷新每 %d 分钟, 增量同步每 %d 分钟%s%s",

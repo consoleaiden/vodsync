@@ -64,7 +64,13 @@ def is_selenetv_path(path: str) -> bool:
 
     if os.environ.get("SELENETV_API_ENABLED", "true").strip().lower() != "true":
         return False
-    return path in PROTECTED_PATHS or path in PUBLIC_PATHS
+    if path in PROTECTED_PATHS or path in PUBLIC_PATHS:
+        return True
+    # [直播源融合] /live/playlist/{key} 是 app 裸 GET 拉取 m3u 的公开端点：
+    # 绕过 vodsync 会话闸门（router 内不做鉴权，内容仅为公开 IPTV 列表）。
+    if path.startswith("/live/playlist/"):
+        return True
+    return False
 
 
 def _json(data: Any, status: int = 200, headers: Dict[str, str] = None) -> Response:
@@ -433,19 +439,77 @@ async def play_records(request: Request):
 # ---------------------------------------------------------------------------
 # ⑩ GET /api/live/sources —— {"success":true,"data":[...]}
 # ---------------------------------------------------------------------------
+def _live_base_url(request: Request) -> str:
+    """本地 M3U 端点的对外基址：配置优先，其次按请求 Host 推导（自适应 IP/域名/端口）。"""
+    import os
+
+    configured = os.environ.get("SELENETV_LIVE_BASE_URL", "").strip().rstrip("/")
+    if configured:
+        return configured
+    # 反代场景优先取 X-Forwarded-Proto/Host，否则用请求自身的 scheme/netloc。
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip()
+    host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc))
+    host = host.split(",")[0].strip()
+    return f"{scheme}://{host}"
+
+
+def _local_playlist_marker() -> str:
+    """仓储里 url 用此前缀表示"由本地端点分发"，router 据此动态生成绝对 url。"""
+    return "local:"
+
+
 @selenetv_router.api_route("/api/live/sources", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def live_sources(request: Request):
     err = _method_guard(request, {"GET"}) or _guard(request)
     if err:
         return err
+    base = _live_base_url(request)
+    marker = _local_playlist_marker()
     rows = repo.live_sources_all()
     data = []
     for r in rows:
+        raw_url = r["url"] or ""
+        if raw_url.startswith(marker) or raw_url == "":
+            # iptv4 等本地托管源：url 指向 /live/playlist/{key}（免鉴权，app 裸 GET）。
+            # 注意：老的空 url 记录也统一指向本地端点；若确有外部源请填完整 http(s) url。
+            url = f"{base}/live/playlist/{r['key']}"
+        else:
+            url = raw_url
         item = {
-            "key": r["key"], "name": r["name"] or "", "url": r["url"] or "",
+            "key": r["key"], "name": r["name"] or "", "url": url,
             "epg": r["epg"] or "", "from": "config", "disabled": bool(r["disabled"]),
         }
         if r.get("ua"):                            # ua,omitempty
             item["ua"] = r["ua"]
         data.append(item)
     return _json({"success": True, "data": data})
+
+
+# ---------------------------------------------------------------------------
+# ⑪ [直播源融合] GET /live/playlist/{key} —— 免鉴权分发 m3u 原文
+# 非 /api/ 路径：app 用 HttpURLConnection 裸 GET（不带 Cookie）拉播放列表，
+# 故必须公开；内容仅为公开 IPTV 播放列表，不含任何敏感信息。
+# ---------------------------------------------------------------------------
+@selenetv_router.api_route(
+    "/live/playlist/{key}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]
+)
+async def live_playlist(request: Request, key: str):
+    err = _method_guard(request, {"GET", "HEAD"})
+    if err:
+        return err
+    row = repo.live_playlist_get(key)
+    if not row or not row.get("content"):
+        return security.text_error(404, "live playlist not found")
+    content = row["content"]
+    headers = {
+        "Cache-Control": "public, max-age=300",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if row.get("fetched_at"):
+        headers["ETag"] = f'"{key}-{row["fetched_at"]}"'
+    return Response(
+        content=content,
+        status_code=200,
+        media_type="application/vnd.apple.mpegurl; charset=utf-8",
+        headers=headers,
+    )

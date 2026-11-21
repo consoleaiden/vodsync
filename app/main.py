@@ -257,7 +257,7 @@ def on_startup():
     # init_db() 内部用 render_as_string(hide_password=True) 打了脱敏版本。
     database.init_db()
 
-    # [selenetv] 增量：幂等创建 4 张 SeleneTV 专用表（只增不改，checkfirst）。
+    # [selenetv] 增量：幂等创建 5 张 SeleneTV 专用表（只增不改，checkfirst）。
     # 失败只记日志，绝不影响 vodsync 现有启动流程。
     if os.environ.get("SELENETV_API_ENABLED", "true").strip().lower() == "true":
         try:
@@ -266,6 +266,23 @@ def on_startup():
             ensure_tables(verbose=True)
         except Exception:
             log.exception("SeleneTV 专用表初始化失败（不影响 vodsync 现有功能）")
+
+        # [selenetv][直播源融合] 缓存为空时延迟后台首拉一次，让新部署立即可用。
+        # 用线程延后 3s，避免阻塞启动；失败只记日志。
+        if os.environ.get("SELENETV_LIVE_SYNC_ENABLED", "true").strip().lower() == "true":
+            def _first_live_sync():
+                import time as _t
+                try:
+                    from .selenetv import repository as _repo
+                    _t.sleep(3)
+                    if not _repo.live_playlist_get("iptv4"):
+                        from .selenetv.live_sync import sync_once
+                        log.info("[直播源] 启动首拉结果: %s", sync_once())
+                except Exception:
+                    log.exception("[直播源] 启动首拉失败（不影响 vodsync 现有功能）")
+
+            import threading
+            threading.Thread(target=_first_live_sync, daemon=True, name="selenetv-live-first-sync").start()
 
     from . import auth
 

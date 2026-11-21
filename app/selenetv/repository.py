@@ -123,7 +123,9 @@ def suggestions(slug: str, keyword: str, limit: int = 10) -> List[str]:
 # ---------------------------------------------------------------------------
 # 收藏 / 播放记录 / 搜索历史 / 直播源（读写 4 张专用表）
 # ---------------------------------------------------------------------------
-from .schema import favorites, live_sources, play_records, search_history  # noqa: E402
+from .schema import (  # noqa: E402
+    favorites, live_sources, play_records, search_history, live_playlist,
+)
 
 
 def _key_parts(key: str) -> Tuple[str, str]:
@@ -269,3 +271,51 @@ def live_sources_all() -> List[Dict[str, Any]]:
             select(live_sources).order_by(live_sources.c.sort_order)
         ).mappings().all()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# [直播源融合] iptv m3u 拉取缓存读写
+# ---------------------------------------------------------------------------
+def live_playlist_get(key: str) -> Optional[Dict[str, Any]]:
+    with database.engine.connect() as conn:
+        row = conn.execute(
+            select(live_playlist).where(live_playlist.c.key == key)
+        ).mappings().first()
+    return dict(row) if row else None
+
+
+def live_playlist_upsert(
+    key: str, name: str, url: str, content: str, channel_count: int, fetched_at: int
+) -> None:
+    """幂等写入 m3u 缓存（ON CONFLICT DO UPDATE）。失败抛异常由调用方捕获。"""
+    values = dict(
+        key=key, name=name, url=url, content=content,
+        channel_count=int(channel_count), fetched_at=int(fetched_at),
+    )
+    stmt = database.dialect_insert(live_playlist).values(**values)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["key"],
+        set_={k: stmt.excluded[k] for k in values if k != "key"},
+    )
+    with database.write_txn() as conn:
+        conn.execute(stmt)
+
+
+def live_source_ensure(
+    key: str, name: str, url: str, epg: str, ua: str, sort_order: int = 100
+) -> None:
+    """确保 /api/live/sources 里有这条订阅记录（存在则不覆盖人工修改）。"""
+    existing = None
+    with database.engine.connect() as conn:
+        existing = conn.execute(
+            select(live_sources).where(live_sources.c.key == key)
+        ).mappings().first()
+    if existing:
+        return
+    values = dict(
+        key=key, name=name, url=url, epg=epg, ua=ua, disabled=0, sort_order=sort_order,
+    )
+    stmt = database.dialect_insert(live_sources).values(**values)
+    stmt = stmt.on_conflict_do_nothing(index_elements=["key"])
+    with database.write_txn() as conn:
+        conn.execute(stmt)

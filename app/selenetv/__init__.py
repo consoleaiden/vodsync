@@ -2,9 +2,9 @@
 SeleneTV 专用 API 包（Helios 风格，独立、只增不改）。
 
 对 vodsync 现有功能的保证：
-  - 现有文件只改 main.py 两处：include_router + startup 里调 ensure_tables()；
+  - 现有文件只改 main.py（挂载/鉴权放行/建表+直播首拉）、scheduler.py（每日拉取 job）；
   - 不修改任何现有表、字段、handler、鉴权逻辑；
-  - 13 个 API（含 3 个多方法）全部在本包内实现，可整包删除即完全回退。
+  - 全部 API（含直播源融合的 /live/playlist/{key}）在本包内实现，可整包删除即完全回退。
 
 对外入口：
   from .selenetv import selenetv_router, mount  # mount(app) 一步挂载

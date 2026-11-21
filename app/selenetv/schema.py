@@ -16,6 +16,7 @@ SeleneTV 专用 API —— 独立数据表定义。
   - play_records: 上述 + index_number, play_time, total_time
   - search_history: 单行 id=1，record = JSON 数组字符串
   - live_sources: key, name, url, epg, ua, disabled
+  - live_playlist: key, name, url, content, channel_count, fetched_at（iptv 拉取缓存，只增）
 """
 from sqlalchemy import (
     BigInteger,
@@ -100,5 +101,22 @@ live_sources = Table(
     Column("sort_order", Integer, nullable=False, default=0, server_default="0"),
 )
 
+# ---------------------------------------------------------------------------
+# [直播源融合] iptv 拉取缓存表：存 vbskycn/iptv 的 m3u 原文，供本地端点分发。
+# 只增表：不改动上面任何既有表/字段。
+# ---------------------------------------------------------------------------
+live_playlist = Table(
+    "selenetv_live_playlist",
+    selenetv_meta,
+    Column("key", String(64), primary_key=True, comment="直播源标识，种子 iptv4"),
+    Column("name", String(128), nullable=False, default="", server_default=""),
+    Column("url", String(1024), nullable=False, default="", server_default="", comment="上游原始地址(溯源)"),
+    Column("content", Text, nullable=False, default="", server_default="", comment="M3U 原文"),
+    Column("channel_count", Integer, nullable=False, default=0, server_default="0", comment="频道数(#EXTINF)"),
+    Column("fetched_at", BigInteger, nullable=False, default=0, server_default="0", comment="成功拉取Unix毫秒"),
+)
+
 # 对外暴露的表名清单（供自检/文档用）
-TABLE_NAMES = tuple(t.name for t in (favorites, play_records, search_history, live_sources))
+TABLE_NAMES = tuple(
+    t.name for t in (favorites, play_records, search_history, live_sources, live_playlist)
+)
