@@ -459,6 +459,27 @@
     </div>
   </section>
 
+  <!-- SeleneTV 用户管理：增删改查 + 每用户 18+ 源访问权限（只增功能，不改现有） -->
+  <section class="panel" id="seleneUsersPanel">
+    <div class="head">
+      <h2>SeleneTV 用户管理</h2>
+      <span class="hint">管理 SeleneTV 客户端登录账号；18+ 权限开关控制该用户能否访问标记为 18+ 的源站资源（服务端强制过滤）</span>
+      <span style="flex:1"></span>
+      <button class="sm primary" id="seleneUserAdd" title="新增一个 SeleneTV 用户">+ 新增用户</button>
+      <button class="sm" id="seleneUsersReload" title="重新读取用户列表">↻ 刷新</button>
+      <button class="sm" id="seleneUsersToggle" title="折叠 / 展开本区块">展开 ▾</button>
+    </div>
+    <div id="seleneUsersWrap" style="display:none">
+      <div class="body pad">
+        <div class="muted" style="font-size:12px;line-height:1.75">
+          未在此表登记的用户名仍可用管理面板密码登录（兼容存量账号，拥有全部权限）。在此建同名账号即切换为按用户密码与权限管控。
+          关闭 18+ 权限后，该用户的搜索结果、资源列表与详情接口会在服务端剔除全部 18+ 源站，客户端无法绕过。
+        </div>
+      </div>
+      <div class="body" id="seleneUsersBody"><div class="empty">展开时加载用户列表…</div></div>
+    </div>
+  </section>
+
   <!-- 中转代理（v1.16.7）：原 docker-compose 环境变量搬进面板，保存即生效 -->
   <section class="panel" id="proxyPanel">
     <div class="head">
@@ -3361,6 +3382,165 @@ $("#fpList").addEventListener("click", async (ev) => {
   } finally { btn.disabled = false; }
 });
 
+// ---------------- SeleneTV 用户管理（只增，不改既有逻辑） ----------------
+const SELENE_USERS_API = "/api/v1/admin/selenetv/users";
+
+function fmtMs(ms) {
+  if (!ms) return "-";
+  try { return new Date(Number(ms)).toLocaleString("zh-CN", { hour12: false }); }
+  catch (e) { return String(ms); }
+}
+
+async function seleneUsersLoad() {
+  const box = $("#seleneUsersBody");
+  if (!box) return;
+  try {
+    const d = await api(SELENE_USERS_API);
+    const list = Array.isArray(d.list) ? d.list : [];
+    if (!list.length) {
+      box.innerHTML = '<div class="empty">暂无用户。存量账号仍可用面板密码登录；点「新增用户」开始按用户管控。</div>';
+      return;
+    }
+    const rows = list.map(u => {
+      const adultOn = !!u.allow_adult;
+      const enOn = u.enabled !== false;
+      return `<tr data-id='${u.id}'>
+        <td class="name">${esc(u.username)}</td>
+        <td><span class="badge ${u.role === 'owner' ? 'run' : 'mute'}">${esc(u.role || 'user')}</span></td>
+        <td>
+          <label class="switch" title="开启后该用户可访问标记为 18+ 的源站资源">
+            <input type="checkbox" class="su-adult" data-id='${u.id}' ${adultOn ? 'checked' : ''}>
+            ${adultOn ? '允许' : '禁止'}
+          </label>
+        </td>
+        <td>
+          <label class="switch" title="停用后该用户无法登录">
+            <input type="checkbox" class="su-enabled" data-id='${u.id}' ${enOn ? 'checked' : ''}>
+            ${enOn ? '启用' : '停用'}
+          </label>
+        </td>
+        <td class="muted" style="font-size:12px">${fmtMs(u.created_at)}</td>
+        <td>
+          <button class="sm" data-act="edit" data-id='${u.id}' data-name="${esc(u.username)}"
+                  data-role="${esc(u.role || 'user')}" title="改密码 / 角色">编辑</button>
+          <button class="sm warn" data-act="del" data-id='${u.id}' data-name="${esc(u.username)}"
+                  title="删除该用户">删除</button>
+        </td>
+      </tr>`;
+    }).join("");
+    box.innerHTML = `<table><thead><tr>
+      <th>用户名</th><th>角色</th><th>18+ 权限</th><th>状态</th><th>创建时间</th><th>操作</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+  } catch (e) {
+    box.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+// 18+ 开关 / 启用开关：即时保存
+$("#seleneUsersBody").addEventListener("change", async (ev) => {
+  const t = ev.target;
+  if (!t.matches(".su-adult, .su-enabled")) return;
+  const id = Number(t.dataset.id);
+  const field = t.classList.contains("su-adult") ? "allow_adult" : "enabled";
+  const val = !!t.checked;
+  t.disabled = true;
+  try {
+    await api(`${SELENE_USERS_API}/${id}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [field]: val }),
+    });
+    toast(`已保存：${field === 'allow_adult' ? '18+权限' : '状态'} = ${val ? '开' : '关'}`);
+    await seleneUsersLoad();
+  } catch (e) {
+    toast("保存失败：" + e.message, true);
+    await seleneUsersLoad();
+  }
+});
+
+// 编辑 / 删除
+$("#seleneUsersBody").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-act]");
+  if (!btn) return;
+  const id = Number(btn.dataset.id);
+  const name = btn.dataset.name;
+  if (btn.dataset.act === "del") {
+    if (!confirm(`确定删除用户「${name}」？此操作不可撤销。`)) return;
+    try {
+      await api(`${SELENE_USERS_API}/${id}`, { method: "DELETE" });
+      toast(`已删除用户 ${name}`);
+      await seleneUsersLoad();
+    } catch (e) { toast("删除失败：" + e.message, true); }
+    return;
+  }
+  if (btn.dataset.act === "edit") {
+    const role = btn.dataset.role;
+    const newPwd = prompt(`为用户「${name}」设置新密码（留空则不改密码）：`, "");
+    if (newPwd === null) return;
+    const newRole = prompt(`角色（owner / user，留空保持 ${role}）：`, "");
+    if (newRole === null) return;
+    const body = {};
+    if (newPwd.trim()) body.password = newPwd.trim();
+    if (newRole.trim()) body.role = newRole.trim().toLowerCase();
+    if (!Object.keys(body).length) { toast("没有需要修改的内容"); return; }
+    try {
+      await api(`${SELENE_USERS_API}/${id}`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      toast(`已更新用户 ${name}`);
+      await seleneUsersLoad();
+    } catch (e) { toast("更新失败：" + e.message, true); }
+  }
+});
+
+// 新增用户（复用现有 modal-mask 样式）
+function openSeleneUserForm() {
+  let mask = document.createElement("div");
+  mask.className = "modal-mask";
+  mask.innerHTML = `<div class="modal">
+    <h3>新增 SeleneTV 用户</h3>
+    <div style="display:flex;flex-direction:column;gap:10px;margin:12px 0">
+      <label>用户名 <input id="suName" class="input" autocomplete="off" placeholder="登录名" style="padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:#fff"></label>
+      <label>密码 <input id="suPwd" type="password" class="input" autocomplete="new-password" placeholder="登录密码" style="padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:#fff"></label>
+      <label>角色 <select id="suRole" style="padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:#fff">
+        <option value="user">user（普通）</option><option value="owner">owner（所有者）</option>
+      </select></label>
+      <label class="switch"><input type="checkbox" id="suAdult"> 允许访问 18+ 源站资源</label>
+      <label class="switch"><input type="checkbox" id="suEnabled" checked> 启用该账号</label>
+    </div>
+    <div class="row" style="justify-content:flex-end">
+      <button class="sm" id="suCancel">取消</button>
+      <button class="sm primary" id="suSave">创建</button>
+    </div>
+  </div>`;
+  document.body.appendChild(mask);
+  const close = () => mask.remove();
+  mask.addEventListener("click", (e) => { if (e.target === mask) close(); });
+  $("#suCancel").addEventListener("click", close);
+  $("#suSave").addEventListener("click", async () => {
+    const username = $("#suName").value.trim();
+    const password = $("#suPwd").value;
+    if (!username || !password) { toast("用户名和密码不能为空", true); return; }
+    const btn = $("#suSave");
+    btn.disabled = true;
+    try {
+      await api(SELENE_USERS_API, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username, password, role: $("#suRole").value,
+          allow_adult: $("#suAdult").checked, enabled: $("#suEnabled").checked,
+        }),
+      });
+      toast(`已创建用户 ${username}`);
+      close();
+      await seleneUsersLoad();
+    } catch (e) { toast("创建失败：" + e.message, true); btn.disabled = false; }
+  });
+  $("#suName").focus();
+}
+$("#seleneUserAdd").addEventListener("click", openSeleneUserForm);
+$("#seleneUsersReload").addEventListener("click", () => seleneUsersLoad());
+
 // 可折叠区块（v1.14.1）：默认收起、首次展开才加载数据，缩短管理面板首屏时间。
 // - tables / stars：加载一次，不进轮询（编辑/翻页状态不能被覆盖，与之前行为一致）
 // - sources / logs：展开期间跟随 5 秒轮询；收起时不请求（这就是省流的关键）
@@ -3382,6 +3562,8 @@ const SEC_DEFS = {
   adfilter: { btn: "#adfilterToggle", wrap: "#adfilterWrap", load: () => adLoad() },
   // v1.17.0：指纹库不进轮询（状态变化少，且审核操作不能被刷新顶掉），展开时加载一次
   fp: { btn: "#fpToggle", wrap: "#fpWrap", load: () => fpLoad() },
+  // SeleneTV 用户管理：不进轮询（编辑中不能被自动刷新顶掉），展开时加载一次
+  seleneUsers: { btn: "#seleneUsersToggle", wrap: "#seleneUsersWrap", load: () => seleneUsersLoad() },
 };
 
 function secPaint(key) {

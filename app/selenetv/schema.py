@@ -17,6 +17,7 @@ SeleneTV 专用 API —— 独立数据表定义。
   - search_history: 单行 id=1，record = JSON 数组字符串
   - live_sources: key, name, url, epg, ua, disabled
   - live_playlist: key, name, url, content, channel_count, fetched_at（iptv 拉取缓存，只增）
+  - users       : id, username, password_hash, role, allow_adult, enabled（用户管理，只增）
 """
 from sqlalchemy import (
     BigInteger,
@@ -116,7 +117,26 @@ live_playlist = Table(
     Column("fetched_at", BigInteger, nullable=False, default=0, server_default="0", comment="成功拉取Unix毫秒"),
 )
 
+# ---------------------------------------------------------------------------
+# [用户管理] SeleneTV 专用用户表：支持面板增删改查 + 每用户 18+ 访问权限。
+# 只增表：不改动上面任何既有表/字段；密码只存 PBKDF2 hash（复用 vodsync.auth 格式）。
+# ---------------------------------------------------------------------------
+users = Table(
+    "selenetv_users",
+    selenetv_meta,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("username", String(64), nullable=False, unique=True, comment="登录名"),
+    Column("password_hash", String(256), nullable=False, default="", server_default="", comment="PBKDF2 hash，不存明文"),
+    Column("role", String(16), nullable=False, default="user", server_default="user", comment="owner/user，仅标记"),
+    Column("allow_adult", Integer, nullable=False, default=0, server_default="0", comment="1=可访问18+源，0=禁止"),
+    Column("enabled", Integer, nullable=False, default=1, server_default="1", comment="1=可登录"),
+    Column("created_at", BigInteger, nullable=False, default=0, server_default="0"),
+    Column("updated_at", BigInteger, nullable=False, default=0, server_default="0"),
+)
+
 # 对外暴露的表名清单（供自检/文档用）
 TABLE_NAMES = tuple(
-    t.name for t in (favorites, play_records, search_history, live_sources, live_playlist)
+    t.name for t in (
+        favorites, play_records, search_history, live_sources, live_playlist, users,
+    )
 )

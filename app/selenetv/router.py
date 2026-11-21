@@ -98,6 +98,11 @@ def _method_guard(request: Request, allowed: set) -> Response | None:
     return None
 
 
+def _allow_adult(request: Request) -> bool:
+    """当前用户是否允许访问 18+ 源（未登录由 _guard 先挡，这里只为过滤用）。"""
+    return security.allows_adult(request)
+
+
 # ---------------------------------------------------------------------------
 # ① POST /api/login —— 免鉴权
 # ---------------------------------------------------------------------------
@@ -137,7 +142,7 @@ async def search(request: Request):
     if not q:
         return _json({"results": []}, headers=_CACHE_HEADERS)
 
-    srcs = repo.list_sources(enabled_only=True)
+    srcs = repo.list_sources(enabled_only=True, allow_adult=_allow_adult(request))
     if not srcs:
         return _json({"results": []}, headers=_CACHE_HEADERS)
 
@@ -200,7 +205,7 @@ async def search_ws(request: Request):
             status_code=400,
             media_type="text/event-stream",
         )
-    srcs = repo.list_sources(enabled_only=True)
+    srcs = repo.list_sources(enabled_only=True, allow_adult=_allow_adult(request))
     if not srcs:
         return security.text_error(500, "No API sites configured")
 
@@ -273,7 +278,7 @@ async def search_resources(request: Request):
     sites = [
         {"key": s["slug"], "api": s["api_url"] or "", "name": s["name"] or "",
          "detail": s["homepage"] or ""}
-        for s in repo.list_sources(enabled_only=True)
+        for s in repo.list_sources(enabled_only=True, allow_adult=_allow_adult(request))
     ]
     return _json(sites)
 
@@ -289,7 +294,7 @@ async def search_suggestions(request: Request):
     q = (request.query_params.get("q") or "").strip()
     if not q:
         return _json({"suggestions": []})
-    srcs = repo.list_sources(enabled_only=True)
+    srcs = repo.list_sources(enabled_only=True, allow_adult=_allow_adult(request))
     if not srcs:
         return _json({"suggestions": []})
     # Helios 只查第一个配置站点
@@ -314,6 +319,12 @@ async def detail(request: Request):
     src = repo.get_source(source)
     if not src:
         return security.text_error(400, "无效的API来源")
+    # [用户管理] 18+ 权限守卫：无权限用户不得访问标记为 18+ 的源（404 不暴露存在性）
+    if not _allow_adult(request):
+        from .. import minor_mode
+
+        if minor_mode.is_adult(src.get("is_adult")):
+            return security.text_error(404, "无效的API来源")
     row = repo.get_detail(source, vid)
     if not row:
         return security.text_error(500, "获取视频详情失败: 未找到该影片")

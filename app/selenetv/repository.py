@@ -25,8 +25,14 @@ log = logging.getLogger("vodsync.selenetv.repo")
 # ---------------------------------------------------------------------------
 # 源站（对应 Helios APISite / resources）
 # ---------------------------------------------------------------------------
-def list_sources(enabled_only: bool = True) -> List[Dict[str, Any]]:
-    """返回 [{"slug","name","api_url","homepage","status","enabled","total_videos"}]。"""
+def list_sources(enabled_only: bool = True, allow_adult: bool = True) -> List[Dict[str, Any]]:
+    """
+    返回 [{"slug","name","api_url","homepage","status","enabled","total_videos","is_adult"}]。
+
+    allow_adult=False 时剔除标记为 18+ 的源站（复用 vodsync.minor_mode 的判定，
+    与面板 18+ 标记/未成年模式同源），供「用户无 18+ 权限」时调用。
+    默认 True 保持既有调用行为完全不变。
+    """
     stmt = select(
         sources_table.c.slug,
         sources_table.c.name,
@@ -35,9 +41,13 @@ def list_sources(enabled_only: bool = True) -> List[Dict[str, Any]]:
         sources_table.c.status,
         sources_table.c.enabled,
         sources_table.c.total_videos,
+        sources_table.c.is_adult,
     )
     if enabled_only:
         stmt = stmt.where(sources_table.c.enabled == 1)
+    if not allow_adult:
+        # 直接按 sources.is_adult 过滤，不依赖请求上下文（函数签名显式传参）。
+        stmt = stmt.where(func.coalesce(sources_table.c.is_adult, 0) == 0)
     stmt = stmt.order_by(sources_table.c.name)
     with database.engine.connect() as conn:
         return [dict(r) for r in conn.execute(stmt).mappings().all()]

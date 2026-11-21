@@ -69,17 +69,55 @@ def _decode_auth_cookie(value: str):
 
 def check_credentials(username: str, password: str) -> bool:
     """
-    校验登录凭据。username 仅非空校验（单租户，与 Helios 一致）；
-    password 用 vodsync 的 PBKDF2 校验（settings.admin_password_hash）。
+    校验登录凭据（用户表优先、表外回退面板密码，零影响存量用户）。
 
     注意：不检查 vodsync.auth.is_enabled() —— Helios 的 /api/login 永远校验口令，
     SeleneTV 也永远需要登录；vodsync 的"关闭鉴权"是它自己面板的开关，语义不同。
     """
-    if not username or not password:
+    ok, _, _ = resolve_user(username, password)
+    return ok
+
+
+def resolve_user(username: str, password: str):
+    """
+    解析凭据 → (ok, user_row_or_None, reason)。
+
+    统一走 users.verify：命中 selenetv_users 表则按用户密码校验并携带权限；
+    表外用户名回退到 vodsync 面板密码（兼容 owner，allow_adult=1）。
+    """
+    from . import users as users_repo
+
+    return users_repo.verify(username, password)
+
+
+def current_user(request: Request):
+    """
+    从 auth cookie 解析当前用户（登录后的权限判定入口）。
+
+    Returns:
+        user_row(dict) 命中用户表；None 表示兼容 owner（面板密码/未建表用户）。
+        未登录或凭据失效返回 False。
+    """
+    raw = request.cookies.get(COOKIE_NAME, "")
+    if not raw:
         return False
-    if not vodsync_auth.verify_password(password):
+    data = _decode_auth_cookie(raw)
+    if data is None:
         return False
-    return True
+    ok, user, _ = resolve_user(data.get("username", ""), data.get("password", ""))
+    if not ok:
+        return False
+    return user  # None = 兼容 owner，有权限判定函数按全开处理
+
+
+def allows_adult(request: Request) -> bool:
+    """当前请求用户是否允许访问 18+ 源站（未登录按禁止处理，安全侧收口）。"""
+    user = current_user(request)
+    if user is False:
+        return False
+    from . import users as users_repo
+
+    return users_repo.allows_adult(user)
 
 
 def issue_login_response(username: str, password: str) -> Response:
